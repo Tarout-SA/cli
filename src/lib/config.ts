@@ -113,11 +113,11 @@ export function getToken(): string | null {
 
 /**
  * Gets the API URL for the current profile.
- * @returns {string} The API URL, defaults to https://app.tarout.sa
+ * @returns {string} The API URL, defaults to https://tarout.sa
  */
 export function getApiUrl(): string {
   const profile = getCurrentProfile();
-  return profile?.apiUrl || "https://app.tarout.sa";
+  return profile?.apiUrl || "https://tarout.sa";
 }
 
 /**

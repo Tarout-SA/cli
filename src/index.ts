@@ -16,7 +16,7 @@ const program = new Command();
 program
   .name("tarout")
   .description("Tarout PaaS Command Line Interface")
-  .version("0.1.0")
+  .version("0.1.2")
   .option("--json", "Output as JSON (machine-readable)")
   .option("-y, --yes", "Skip all confirmation prompts")
   .option("-q, --quiet", "Minimal output")

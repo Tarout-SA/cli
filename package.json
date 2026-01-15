@@ -1,6 +1,6 @@
 {
   "name": "@tarout/cli",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Tarout PaaS Command Line Interface",
   "type": "module",
   "bin": {
@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@trpc/client": "^10.45.2",
+    "@trpc/server": "^10.45.2",
     "chalk": "^5.3.0",
     "cli-table3": "^0.6.5",
     "commander": "^12.1.0",

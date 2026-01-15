@@ -27,7 +27,7 @@ export function registerAuthCommands(program: Command) {
   program
     .command("login")
     .description("Authenticate with Tarout via browser")
-    .option("--api-url <url>", "Custom API URL", "https://app.tarout.sa")
+    .option("--api-url <url>", "Custom API URL", "https://tarout.sa")
     .action(async (options) => {
       try {
         if (isLoggedIn()) {
