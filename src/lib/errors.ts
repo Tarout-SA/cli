@@ -5,24 +5,23 @@
  * @module lib/errors
  */
 
-import { error } from "./output.js";
 import { ExitCode, exit } from "../utils/exit-codes.js";
-import { isJsonMode } from "./output.js";
 import { jsonError, outputJson } from "../utils/json.js";
+import { error, isJsonMode } from "./output.js";
 
 /**
  * Base CLI error class with exit code and optional suggestions.
  * @extends Error
  */
 export class CliError extends Error {
-  constructor(
-    message: string,
-    public code: number = ExitCode.GENERAL_ERROR,
-    public suggestions?: string[]
-  ) {
-    super(message);
-    this.name = "CliError";
-  }
+	constructor(
+		message: string,
+		public code: number = ExitCode.GENERAL_ERROR,
+		public suggestions?: string[],
+	) {
+		super(message);
+		this.name = "CliError";
+	}
 }
 
 /**
@@ -30,9 +29,9 @@ export class CliError extends Error {
  * Exit code: 3 (AUTH_ERROR)
  */
 export class AuthError extends CliError {
-  constructor(message: string = "Not logged in. Run 'tarout login' first.") {
-    super(message, ExitCode.AUTH_ERROR);
-  }
+	constructor(message = "Not logged in. Run 'tarout login' first.") {
+		super(message, ExitCode.AUTH_ERROR);
+	}
 }
 
 /**
@@ -40,9 +39,9 @@ export class AuthError extends CliError {
  * Exit code: 4 (NOT_FOUND)
  */
 export class NotFoundError extends CliError {
-  constructor(resource: string, id: string, suggestions?: string[]) {
-    super(`${resource} "${id}" not found`, ExitCode.NOT_FOUND, suggestions);
-  }
+	constructor(resource: string, id: string, suggestions?: string[]) {
+		super(`${resource} "${id}" not found`, ExitCode.NOT_FOUND, suggestions);
+	}
 }
 
 /**
@@ -50,9 +49,9 @@ export class NotFoundError extends CliError {
  * Exit code: 5 (PERMISSION_DENIED)
  */
 export class PermissionError extends CliError {
-  constructor(message: string = "Permission denied") {
-    super(message, ExitCode.PERMISSION_DENIED);
-  }
+	constructor(message = "Permission denied") {
+		super(message, ExitCode.PERMISSION_DENIED);
+	}
 }
 
 /**
@@ -60,9 +59,9 @@ export class PermissionError extends CliError {
  * Exit code: 2 (INVALID_ARGUMENTS)
  */
 export class InvalidArgumentError extends CliError {
-  constructor(message: string) {
-    super(message, ExitCode.INVALID_ARGUMENTS);
-  }
+	constructor(message: string) {
+		super(message, ExitCode.INVALID_ARGUMENTS);
+	}
 }
 
 /**
@@ -73,65 +72,61 @@ export class InvalidArgumentError extends CliError {
  * @returns {never} This function always exits the process
  */
 export function handleError(err: unknown): never {
-  if (err instanceof CliError) {
-    if (isJsonMode()) {
-      outputJson(
-        jsonError(
-          getErrorCode(err.code),
-          err.message,
-          err.suggestions
-        )
-      );
-    } else {
-      error(err.message, err.suggestions);
-    }
-    exit(err.code);
-  }
+	if (err instanceof CliError) {
+		if (isJsonMode()) {
+			outputJson(
+				jsonError(getErrorCode(err.code), err.message, err.suggestions),
+			);
+		} else {
+			error(err.message, err.suggestions);
+		}
+		exit(err.code);
+	}
 
-  // Handle tRPC errors
-  if (err && typeof err === "object" && "code" in err) {
-    const trpcError = err as { code: string; message: string };
-    const exitCode = mapTrpcErrorCode(trpcError.code);
+	// Handle tRPC errors
+	if (err && typeof err === "object" && "code" in err) {
+		const trpcError = err as { code: string; message: string };
+		const exitCode = mapTrpcErrorCode(trpcError.code);
 
-    if (isJsonMode()) {
-      outputJson(jsonError(trpcError.code, trpcError.message));
-    } else {
-      error(trpcError.message);
-    }
-    exit(exitCode);
-  }
+		if (isJsonMode()) {
+			outputJson(jsonError(trpcError.code, trpcError.message));
+		} else {
+			error(trpcError.message);
+		}
+		exit(exitCode);
+	}
 
-  // Generic error
-  const message = err instanceof Error ? err.message : String(err);
-  if (isJsonMode()) {
-    outputJson(jsonError("UNKNOWN_ERROR", message));
-  } else {
-    error(message);
-  }
-  exit(ExitCode.GENERAL_ERROR);
+	// Generic error
+	const message = err instanceof Error ? err.message : String(err);
+	if (isJsonMode()) {
+		outputJson(jsonError("UNKNOWN_ERROR", message));
+	} else {
+		error(message);
+	}
+	exit(ExitCode.GENERAL_ERROR);
 }
 
 function getErrorCode(exitCode: number): string {
-  const codes: Record<number, string> = {
-    [ExitCode.SUCCESS]: "SUCCESS",
-    [ExitCode.GENERAL_ERROR]: "ERROR",
-    [ExitCode.INVALID_ARGUMENTS]: "INVALID_ARGUMENTS",
-    [ExitCode.AUTH_ERROR]: "AUTH_ERROR",
-    [ExitCode.NOT_FOUND]: "NOT_FOUND",
-    [ExitCode.PERMISSION_DENIED]: "PERMISSION_DENIED",
-  };
-  return codes[exitCode] || "ERROR";
+	const codes: Record<number, string> = {
+		[ExitCode.SUCCESS]: "SUCCESS",
+		[ExitCode.GENERAL_ERROR]: "ERROR",
+		[ExitCode.INVALID_ARGUMENTS]: "INVALID_ARGUMENTS",
+		[ExitCode.AUTH_ERROR]: "AUTH_ERROR",
+		[ExitCode.NOT_FOUND]: "NOT_FOUND",
+		[ExitCode.PERMISSION_DENIED]: "PERMISSION_DENIED",
+	};
+	return codes[exitCode] || "ERROR";
 }
 
 function mapTrpcErrorCode(code: string): number {
-  const mapping: Record<string, number> = {
-    UNAUTHORIZED: ExitCode.AUTH_ERROR,
-    FORBIDDEN: ExitCode.PERMISSION_DENIED,
-    NOT_FOUND: ExitCode.NOT_FOUND,
-    BAD_REQUEST: ExitCode.INVALID_ARGUMENTS,
-    PARSE_ERROR: ExitCode.INVALID_ARGUMENTS,
-  };
-  return mapping[code] || ExitCode.GENERAL_ERROR;
+	const mapping: Record<string, number> = {
+		UNAUTHORIZED: ExitCode.AUTH_ERROR,
+		FORBIDDEN: ExitCode.PERMISSION_DENIED,
+		NOT_FOUND: ExitCode.NOT_FOUND,
+		BAD_REQUEST: ExitCode.INVALID_ARGUMENTS,
+		PARSE_ERROR: ExitCode.INVALID_ARGUMENTS,
+	};
+	return mapping[code] || ExitCode.GENERAL_ERROR;
 }
 
 /**
@@ -144,36 +139,40 @@ function mapTrpcErrorCode(code: string): number {
  * @example
  * findSimilar("my-ap", ["my-app", "your-app", "test"]) // ["my-app"]
  */
-export function findSimilar(target: string, candidates: string[], maxResults = 3): string[] {
-  const targetLower = target.toLowerCase();
+export function findSimilar(
+	target: string,
+	candidates: string[],
+	maxResults = 3,
+): string[] {
+	const targetLower = target.toLowerCase();
 
-  return candidates
-    .map((candidate) => ({
-      candidate,
-      score: similarity(targetLower, candidate.toLowerCase()),
-    }))
-    .filter(({ score }) => score > 0.3)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, maxResults)
-    .map(({ candidate }) => candidate);
+	return candidates
+		.map((candidate) => ({
+			candidate,
+			score: similarity(targetLower, candidate.toLowerCase()),
+		}))
+		.filter(({ score }) => score > 0.3)
+		.sort((a, b) => b.score - a.score)
+		.slice(0, maxResults)
+		.map(({ candidate }) => candidate);
 }
 
 // Simple similarity score (Dice coefficient)
 function similarity(s1: string, s2: string): number {
-  if (s1 === s2) return 1;
-  if (s1.length < 2 || s2.length < 2) return 0;
+	if (s1 === s2) return 1;
+	if (s1.length < 2 || s2.length < 2) return 0;
 
-  const bigrams1 = new Set<string>();
-  for (let i = 0; i < s1.length - 1; i++) {
-    bigrams1.add(s1.slice(i, i + 2));
-  }
+	const bigrams1 = new Set<string>();
+	for (let i = 0; i < s1.length - 1; i++) {
+		bigrams1.add(s1.slice(i, i + 2));
+	}
 
-  let intersection = 0;
-  for (let i = 0; i < s2.length - 1; i++) {
-    if (bigrams1.has(s2.slice(i, i + 2))) {
-      intersection++;
-    }
-  }
+	let intersection = 0;
+	for (let i = 0; i < s2.length - 1; i++) {
+		if (bigrams1.has(s2.slice(i, i + 2))) {
+			intersection++;
+		}
+	}
 
-  return (2 * intersection) / (s1.length - 1 + s2.length - 1);
+	return (2 * intersection) / (s1.length - 1 + s2.length - 1);
 }

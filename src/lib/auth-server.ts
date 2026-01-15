@@ -1,48 +1,48 @@
-import express from "express";
 import type { Server } from "node:http";
+import express from "express";
 
 export interface AuthCallbackData {
-  token: string;
-  userId: string;
-  userEmail: string;
-  userName?: string;
-  organizationId: string;
-  organizationName: string;
-  environmentId: string;
-  environmentName: string;
+	token: string;
+	userId: string;
+	userEmail: string;
+	userName?: string;
+	organizationId: string;
+	organizationName: string;
+	environmentId: string;
+	environmentName: string;
 }
 
 export function startAuthServer(): Promise<{
-  port: number;
-  waitForCallback: () => Promise<AuthCallbackData>;
-  close: () => void;
+	port: number;
+	waitForCallback: () => Promise<AuthCallbackData>;
+	close: () => void;
 }> {
-  return new Promise((resolve) => {
-    const app = express();
-    let server: Server;
-    let callbackResolver: (data: AuthCallbackData) => void;
-    let callbackRejecter: (error: Error) => void;
+	return new Promise((resolve) => {
+		const app = express();
+		let server: Server;
+		let callbackResolver: (data: AuthCallbackData) => void;
+		let callbackRejecter: (error: Error) => void;
 
-    const callbackPromise = new Promise<AuthCallbackData>((res, rej) => {
-      callbackResolver = res;
-      callbackRejecter = rej;
-    });
+		const callbackPromise = new Promise<AuthCallbackData>((res, rej) => {
+			callbackResolver = res;
+			callbackRejecter = rej;
+		});
 
-    app.get("/callback", (req, res) => {
-      const {
-        token,
-        userId,
-        userEmail,
-        userName,
-        organizationId,
-        organizationName,
-        environmentId,
-        environmentName,
-        error,
-      } = req.query;
+		app.get("/callback", (req, res) => {
+			const {
+				token,
+				userId,
+				userEmail,
+				userName,
+				organizationId,
+				organizationName,
+				environmentId,
+				environmentName,
+				error,
+			} = req.query;
 
-      if (error) {
-        res.send(`
+			if (error) {
+				res.send(`
           <!DOCTYPE html>
           <html>
             <head>
@@ -63,17 +63,27 @@ export function startAuthServer(): Promise<{
             </body>
           </html>
         `);
-        callbackRejecter(new Error(String(error)));
-        return;
-      }
+				callbackRejecter(new Error(String(error)));
+				return;
+			}
 
-      if (!token || !userId || !userEmail || !organizationId || !organizationName || !environmentId || !environmentName) {
-        res.status(400).send("Missing required parameters");
-        callbackRejecter(new Error("Missing required parameters from auth callback"));
-        return;
-      }
+			if (
+				!token ||
+				!userId ||
+				!userEmail ||
+				!organizationId ||
+				!organizationName ||
+				!environmentId ||
+				!environmentName
+			) {
+				res.status(400).send("Missing required parameters");
+				callbackRejecter(
+					new Error("Missing required parameters from auth callback"),
+				);
+				return;
+			}
 
-      res.send(`
+			res.send(`
         <!DOCTYPE html>
         <html>
           <head>
@@ -96,34 +106,39 @@ export function startAuthServer(): Promise<{
         </html>
       `);
 
-      callbackResolver({
-        token: String(token),
-        userId: String(userId),
-        userEmail: String(userEmail),
-        userName: userName ? String(userName) : undefined,
-        organizationId: String(organizationId),
-        organizationName: String(organizationName),
-        environmentId: String(environmentId),
-        environmentName: String(environmentName),
-      });
-    });
+			callbackResolver({
+				token: String(token),
+				userId: String(userId),
+				userEmail: String(userEmail),
+				userName: userName ? String(userName) : undefined,
+				organizationId: String(organizationId),
+				organizationName: String(organizationName),
+				environmentId: String(environmentId),
+				environmentName: String(environmentName),
+			});
+		});
 
-    // Find an available port
-    server = app.listen(0, () => {
-      const address = server.address();
-      const port = typeof address === "object" && address ? address.port : 0;
+		// Find an available port
+		server = app.listen(0, () => {
+			const address = server.address();
+			const port = typeof address === "object" && address ? address.port : 0;
 
-      resolve({
-        port,
-        waitForCallback: () => callbackPromise,
-        close: () => server.close(),
-      });
-    });
+			resolve({
+				port,
+				waitForCallback: () => callbackPromise,
+				close: () => server.close(),
+			});
+		});
 
-    // Timeout after 5 minutes
-    setTimeout(() => {
-      callbackRejecter(new Error("Authentication timed out. Please try again."));
-      server.close();
-    }, 5 * 60 * 1000);
-  });
+		// Timeout after 5 minutes
+		setTimeout(
+			() => {
+				callbackRejecter(
+					new Error("Authentication timed out. Please try again."),
+				);
+				server.close();
+			},
+			5 * 60 * 1000,
+		);
+	});
 }

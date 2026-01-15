@@ -27,24 +27,24 @@ let client: TaroutApiClient | null = null;
  * const apps = await client.application.all.query();
  */
 export function createApiClient(): TaroutApiClient {
-  if (!isLoggedIn()) {
-    throw new AuthError();
-  }
+	if (!isLoggedIn()) {
+		throw new AuthError();
+	}
 
-  const token = getToken();
-  const apiUrl = getApiUrl();
+	const token = getToken();
+	const apiUrl = getApiUrl();
 
-  return createTRPCProxyClient({
-    transformer: superjson,
-    links: [
-      httpBatchLink({
-        url: `${apiUrl}/api/trpc`,
-        headers: () => ({
-          "x-api-key": token,
-        }),
-      }),
-    ],
-  });
+	return createTRPCProxyClient({
+		transformer: superjson,
+		links: [
+			httpBatchLink({
+				url: `${apiUrl}/api/trpc`,
+				headers: () => ({
+					"x-api-key": token,
+				}),
+			}),
+		],
+	});
 }
 
 /**
@@ -57,10 +57,10 @@ export function createApiClient(): TaroutApiClient {
  * const user = await client.user.get.query();
  */
 export function getApiClient(): TaroutApiClient {
-  if (!client) {
-    client = createApiClient();
-  }
-  return client;
+	if (!client) {
+		client = createApiClient();
+	}
+	return client;
 }
 
 /**
@@ -70,5 +70,5 @@ export function getApiClient(): TaroutApiClient {
  * resetApiClient();
  */
 export function resetApiClient(): void {
-  client = null;
+	client = null;
 }

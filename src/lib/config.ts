@@ -11,15 +11,15 @@ import Conf from "conf";
  * @interface Profile
  */
 export interface Profile {
-  token: string;
-  apiUrl: string;
-  organizationId: string;
-  organizationName: string;
-  environmentId: string;
-  environmentName: string;
-  userId: string;
-  userEmail: string;
-  userName?: string;
+	token: string;
+	apiUrl: string;
+	organizationId: string;
+	organizationName: string;
+	environmentId: string;
+	environmentName: string;
+	userId: string;
+	userEmail: string;
+	userName?: string;
 }
 
 /**
@@ -27,19 +27,19 @@ export interface Profile {
  * @interface Config
  */
 export interface Config {
-  /** Name of the currently active profile */
-  currentProfile: string;
-  /** Map of profile names to profile data */
-  profiles: Record<string, Profile>;
+	/** Name of the currently active profile */
+	currentProfile: string;
+	/** Map of profile names to profile data */
+	profiles: Record<string, Profile>;
 }
 
 /** Configuration store using the Conf library. Persists to ~/.tarout/config.json */
 const config = new Conf<Config>({
-  projectName: "tarout",
-  defaults: {
-    currentProfile: "default",
-    profiles: {},
-  },
+	projectName: "tarout",
+	defaults: {
+		currentProfile: "default",
+		profiles: {},
+	},
 });
 
 /**
@@ -47,7 +47,7 @@ const config = new Conf<Config>({
  * @returns {Config} The full configuration
  */
 export function getConfig(): Config {
-  return config.store;
+	return config.store;
 }
 
 /**
@@ -55,8 +55,8 @@ export function getConfig(): Config {
  * @returns {Profile | null} The current profile or null if not logged in
  */
 export function getCurrentProfile(): Profile | null {
-  const cfg = getConfig();
-  return cfg.profiles[cfg.currentProfile] || null;
+	const cfg = getConfig();
+	return cfg.profiles[cfg.currentProfile] || null;
 }
 
 /**
@@ -65,7 +65,7 @@ export function getCurrentProfile(): Profile | null {
  * @param {Profile} profile - The profile data to save
  */
 export function setProfile(name: string, profile: Profile): void {
-  config.set(`profiles.${name}`, profile);
+	config.set(`profiles.${name}`, profile);
 }
 
 /**
@@ -73,7 +73,7 @@ export function setProfile(name: string, profile: Profile): void {
  * @param {string} name - The profile name to activate
  */
 export function setCurrentProfile(name: string): void {
-  config.set("currentProfile", name);
+	config.set("currentProfile", name);
 }
 
 /**
@@ -81,16 +81,16 @@ export function setCurrentProfile(name: string): void {
  * @param {string} name - The profile name to delete
  */
 export function deleteProfile(name: string): void {
-  const profiles = config.get("profiles");
-  delete profiles[name];
-  config.set("profiles", profiles);
+	const profiles = config.get("profiles");
+	delete profiles[name];
+	config.set("profiles", profiles);
 }
 
 /**
  * Clears all configuration data, effectively logging out all profiles.
  */
 export function clearConfig(): void {
-  config.clear();
+	config.clear();
 }
 
 /**
@@ -98,8 +98,8 @@ export function clearConfig(): void {
  * @returns {boolean} True if logged in, false otherwise
  */
 export function isLoggedIn(): boolean {
-  const profile = getCurrentProfile();
-  return profile !== null && !!profile.token;
+	const profile = getCurrentProfile();
+	return profile !== null && !!profile.token;
 }
 
 /**
@@ -107,8 +107,8 @@ export function isLoggedIn(): boolean {
  * @returns {string | null} The token or null if not logged in
  */
 export function getToken(): string | null {
-  const profile = getCurrentProfile();
-  return profile?.token || null;
+	const profile = getCurrentProfile();
+	return profile?.token || null;
 }
 
 /**
@@ -116,8 +116,8 @@ export function getToken(): string | null {
  * @returns {string} The API URL, defaults to https://tarout.sa
  */
 export function getApiUrl(): string {
-  const profile = getCurrentProfile();
-  return profile?.apiUrl || "https://tarout.sa";
+	const profile = getCurrentProfile();
+	return profile?.apiUrl || "https://tarout.sa";
 }
 
 /**
@@ -125,16 +125,16 @@ export function getApiUrl(): string {
  * @param {Partial<Profile>} updates - The fields to update
  */
 export function updateProfile(updates: Partial<Profile>): void {
-  const cfg = getConfig();
-  const currentProfileName = cfg.currentProfile;
-  const currentProfile = cfg.profiles[currentProfileName];
+	const cfg = getConfig();
+	const currentProfileName = cfg.currentProfile;
+	const currentProfile = cfg.profiles[currentProfileName];
 
-  if (currentProfile) {
-    config.set(`profiles.${currentProfileName}`, {
-      ...currentProfile,
-      ...updates,
-    });
-  }
+	if (currentProfile) {
+		config.set(`profiles.${currentProfileName}`, {
+			...currentProfile,
+			...updates,
+		});
+	}
 }
 
 /**
@@ -142,5 +142,5 @@ export function updateProfile(updates: Partial<Profile>): void {
  * @returns {string[]} Array of profile names
  */
 export function listProfiles(): string[] {
-  return Object.keys(config.get("profiles"));
+	return Object.keys(config.get("profiles"));
 }

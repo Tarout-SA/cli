@@ -1,62 +1,62 @@
 {
-  "name": "@tarout/cli",
-  "version": "0.1.3",
-  "description": "Tarout PaaS Command Line Interface",
-  "type": "module",
-  "bin": {
-    "tarout": "./bin/tarout"
-  },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": [
-    "bin",
-    "dist"
-  ],
-  "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --clean",
-    "dev": "tsup src/index.ts --format esm --watch",
-    "typecheck": "tsc --noEmit",
-    "lint": "biome check src/",
-    "start": "node dist/index.js",
-    "prepublishOnly": "bun run build"
-  },
-  "dependencies": {
-    "@trpc/client": "^10.45.2",
-    "@trpc/server": "^10.45.2",
-    "chalk": "^5.3.0",
-    "cli-table3": "^0.6.5",
-    "commander": "^12.1.0",
-    "conf": "^13.0.1",
-    "express": "^4.21.0",
-    "inquirer": "^12.0.0",
-    "open": "^10.1.0",
-    "ora": "^8.1.1",
-    "superjson": "^2.2.2"
-  },
-  "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/node": "^22.0.0",
-    "tsup": "^8.3.0",
-    "typescript": "^5.6.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/tarout/platform"
-  },
-  "bugs": {
-    "url": "https://github.com/tarout/platform/issues"
-  },
-  "homepage": "https://tarout.sa",
-  "keywords": [
-    "tarout",
-    "paas",
-    "cloud",
-    "deployment",
-    "cli"
-  ],
-  "author": "Tarout",
-  "license": "MIT"
+	"name": "@tarout/cli",
+	"version": "0.1.3",
+	"description": "Tarout PaaS Command Line Interface",
+	"type": "module",
+	"bin": {
+		"tarout": "./bin/tarout"
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"files": [
+		"bin",
+		"dist"
+	],
+	"scripts": {
+		"build": "tsup src/index.ts --format esm --dts --clean",
+		"dev": "tsup src/index.ts --format esm --watch",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check src/",
+		"start": "node dist/index.js",
+		"prepublishOnly": "bun run build"
+	},
+	"dependencies": {
+		"@trpc/client": "^10.45.2",
+		"@trpc/server": "^10.45.2",
+		"chalk": "^5.3.0",
+		"cli-table3": "^0.6.5",
+		"commander": "^12.1.0",
+		"conf": "^13.0.1",
+		"express": "^4.21.0",
+		"inquirer": "^12.0.0",
+		"open": "^10.1.0",
+		"ora": "^8.1.1",
+		"superjson": "^2.2.2"
+	},
+	"devDependencies": {
+		"@types/express": "^4.17.21",
+		"@types/node": "^22.0.0",
+		"tsup": "^8.3.0",
+		"typescript": "^5.6.0"
+	},
+	"engines": {
+		"node": ">=18.0.0"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/tarout/platform"
+	},
+	"bugs": {
+		"url": "https://github.com/tarout/platform/issues"
+	},
+	"homepage": "https://tarout.sa",
+	"keywords": [
+		"tarout",
+		"paas",
+		"cloud",
+		"deployment",
+		"cli"
+	],
+	"author": "Tarout",
+	"license": "MIT"
 }
