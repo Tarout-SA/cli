@@ -3,7 +3,10 @@ import { getApiClient } from "../lib/api.js";
 import { isLoggedIn } from "../lib/config.js";
 import {
 	AuthError,
-	CliError,
+	analyzeDeploymentError,
+	BuildFailedError,
+	DeploymentFailedError,
+	DeploymentTimeoutError,
 	findSimilar,
 	handleError,
 	NotFoundError,
@@ -17,10 +20,11 @@ import {
 	quietOutput,
 	table,
 } from "../lib/output.js";
-import { ExitCode } from "../utils/exit-codes.js";
+import { streamDeploymentLogs } from "../lib/websocket.js";
 import {
 	failSpinner,
 	startSpinner,
+	stopSpinner,
 	succeedSpinner,
 	updateSpinner,
 } from "../utils/spinner.js";
@@ -32,7 +36,7 @@ export function registerDeployCommands(program: Command) {
 		.argument("<app>", "Application ID or name")
 		.description("Deploy an application")
 		.option("-r, --region <region>", "Deployment region", "me-central1")
-		.option("-w, --wait", "Wait for deployment to complete")
+		.option("-w, --wait", "Wait for deployment to complete and stream logs")
 		.action(async (appIdentifier, options) => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
@@ -62,58 +66,16 @@ export function registerDeployCommands(program: Command) {
 				});
 
 				if (options.wait) {
-					// Poll for completion
-					let attempts = 0;
-					const maxAttempts = 120; // 10 minutes with 5s intervals
-
-					while (attempts < maxAttempts) {
-						await sleep(5000);
-						attempts++;
-
-						const fullApp = await client.application.one.query({
-							applicationId: app.applicationId,
-						});
-
-						updateSpinner(`Deploying ${app.name}... (${attempts * 5}s)`);
-
-						if (
-							fullApp.applicationStatus === "done" ||
-							fullApp.applicationStatus === "running"
-						) {
-							succeedSpinner("Deployment successful!");
-
-							if (isJsonMode()) {
-								outputData({
-									deploymentId: result.deploymentId,
-									status: fullApp.applicationStatus,
-									url: fullApp.cloudServiceUrl,
-								});
-							} else {
-								quietOutput(fullApp.cloudServiceUrl || result.deploymentId);
-								log("");
-								log(
-									`URL: ${colors.cyan(fullApp.cloudServiceUrl || "Pending...")}`,
-								);
-								log("");
-							}
-							return;
-						}
-
-						if (fullApp.applicationStatus === "error") {
-							failSpinner("Deployment failed");
-							throw new CliError(
-								"Deployment failed. Check logs for details.",
-								ExitCode.GENERAL_ERROR,
-							);
-						}
-					}
-
-					failSpinner("Deployment timed out");
-					throw new CliError(
-						"Deployment timed out after 10 minutes",
-						ExitCode.GENERAL_ERROR,
+					// Stream logs and wait for completion
+					await streamDeploymentWithLogs(
+						client,
+						result.deploymentId,
+						app.name,
+						app.applicationId,
 					);
+					return;
 				}
+
 				succeedSpinner("Deployment started!");
 
 				if (isJsonMode()) {
@@ -131,7 +93,7 @@ export function registerDeployCommands(program: Command) {
 						`Check status: ${colors.dim(`tarout deploy:status ${app.applicationId.slice(0, 8)}`)}`,
 					);
 					log(
-						`View logs: ${colors.dim(`tarout logs ${app.applicationId.slice(0, 8)}`)}`,
+						`View logs: ${colors.dim(`tarout deploy:logs ${result.deploymentId.slice(0, 8)}`)}`,
 					);
 					log("");
 				}
@@ -316,6 +278,178 @@ export function registerDeployCommands(program: Command) {
 						`${limitedDeployments.length} deployment${limitedDeployments.length === 1 ? "" : "s"}`,
 					),
 				);
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Deploy logs command - view logs for a specific deployment
+	program
+		.command("deploy:logs")
+		.argument("<deployment-id>", "Deployment ID")
+		.description("View deployment logs")
+		.option(
+			"-f, --follow",
+			"Stream logs in real-time (for running deployments)",
+		)
+		.option("--no-stream", "Fetch logs via HTTP instead of WebSocket")
+		.action(async (deploymentId, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+
+				const client = getApiClient();
+
+				// Get deployment details
+				const _spinner = startSpinner("Fetching deployment...");
+				let deployment: any;
+				try {
+					deployment = await client.deployment.one.query({ deploymentId });
+				} catch {
+					// Deployment not found
+					failSpinner();
+					throw new NotFoundError("Deployment", deploymentId);
+				}
+
+				succeedSpinner();
+
+				const isRunning = deployment.status === "running";
+
+				// Determine whether to stream or fetch
+				const shouldStream =
+					options.follow || (isRunning && options.stream !== false);
+
+				if (shouldStream && deployment.logPath) {
+					// Stream logs via WebSocket
+					log("");
+					log(
+						colors.dim(
+							`Streaming logs for deployment ${colors.cyan(deployment.deploymentId.slice(0, 8))}...`,
+						),
+					);
+					log(colors.dim("Press Ctrl+C to stop"));
+					log("");
+
+					const logLines: string[] = [];
+					const errors: string[] = [];
+					let finalStatus = deployment.status;
+
+					const { cleanup, done } = streamDeploymentLogs(deployment.logPath, {
+						onData: (line) => {
+							logLines.push(line);
+							if (isErrorLine(line)) {
+								errors.push(line);
+							}
+							if (!isJsonMode()) {
+								printLogLine(line);
+							}
+						},
+						onError: (error) => {
+							if (!isJsonMode()) {
+								log(colors.error(`WebSocket error: ${error.message}`));
+							}
+						},
+					});
+
+					// Handle Ctrl+C gracefully
+					process.on("SIGINT", () => {
+						cleanup();
+						if (!isJsonMode()) {
+							log("");
+							log(colors.dim("Log streaming stopped"));
+						}
+						process.exit(0);
+					});
+
+					// Wait for stream to end (deployment complete or error)
+					await done;
+
+					// Get final deployment status
+					const finalDeployment = await client.deployment.one.query({
+						deploymentId,
+					});
+					finalStatus = finalDeployment.status;
+
+					// Output JSON result if in JSON mode
+					if (isJsonMode()) {
+						const analysis =
+							finalStatus === "error"
+								? analyzeDeploymentError(logLines, finalDeployment.errorMessage)
+								: undefined;
+
+						outputData({
+							deploymentId: deployment.deploymentId,
+							status: finalStatus,
+							logs: logLines,
+							errors: errors.length > 0 ? errors : undefined,
+							errorAnalysis: analysis,
+							application: deployment.application,
+						});
+					} else {
+						log("");
+						log(
+							`Final status: ${getStatusBadge(finalStatus)} ${finalStatus === "error" && finalDeployment.errorMessage ? `- ${finalDeployment.errorMessage}` : ""}`,
+						);
+					}
+				} else {
+					// Fetch logs via HTTP
+					const logsResult = await client.deployment.getDeploymentLogs.query({
+						deploymentId,
+						offset: 0,
+						limit: 5000,
+					});
+
+					if (isJsonMode()) {
+						const errors = logsResult.lines.filter(isErrorLine);
+						const analysis =
+							deployment.status === "error"
+								? analyzeDeploymentError(
+										logsResult.lines,
+										deployment.errorMessage,
+									)
+								: undefined;
+
+						outputData({
+							deploymentId: deployment.deploymentId,
+							status: deployment.status,
+							logs: logsResult.lines,
+							totalLines: logsResult.totalLines,
+							errors: errors.length > 0 ? errors : undefined,
+							errorAnalysis: analysis,
+							application: deployment.application,
+						});
+						return;
+					}
+
+					if (logsResult.lines.length === 0) {
+						log("");
+						log("No logs available for this deployment.");
+						return;
+					}
+
+					log("");
+					log(
+						colors.dim(
+							`Logs for deployment ${colors.cyan(deployment.deploymentId.slice(0, 8))} (${logsResult.totalLines} lines):`,
+						),
+					);
+					log("");
+
+					for (const line of logsResult.lines) {
+						printLogLine(line);
+					}
+
+					if (logsResult.hasMore) {
+						log("");
+						log(
+							colors.dim(
+								`Showing ${logsResult.lines.length} of ${logsResult.totalLines} lines`,
+							),
+						);
+					}
+
+					log("");
+					log(`Status: ${getStatusBadge(deployment.status)}`);
+				}
 			} catch (err) {
 				handleError(err);
 			}
@@ -519,4 +653,259 @@ function printLogEntry(entry: {
 	const level = entry.severity.padEnd(5);
 
 	console.log(`${colors.dim(timeStr)}  ${colorFn(level)}  ${entry.message}`);
+}
+
+/**
+ * Stream deployment logs and wait for completion.
+ * Used by `deploy --wait` to show real-time logs.
+ */
+async function streamDeploymentWithLogs(
+	client: any,
+	deploymentId: string,
+	appName: string,
+	applicationId: string,
+): Promise<void> {
+	// Get deployment details to get logPath
+	stopSpinner();
+
+	let deployment: any;
+	try {
+		deployment = await client.deployment.one.query({ deploymentId });
+	} catch {
+		throw new NotFoundError("Deployment", deploymentId);
+	}
+
+	const logLines: string[] = [];
+	const errors: string[] = [];
+	const startTime = Date.now();
+	let wsConnected = false;
+	let lastStatus = deployment.status;
+
+	if (!isJsonMode()) {
+		log("");
+		log(
+			`${colors.bold(appName)} - Deployment ${colors.cyan(deploymentId.slice(0, 8))}`,
+		);
+		log(colors.dim("─".repeat(50)));
+		log("");
+	}
+
+	// Start streaming logs if logPath is available
+	let cleanup: (() => void) | null = null;
+
+	if (deployment.logPath) {
+		const stream = streamDeploymentLogs(deployment.logPath, {
+			onData: (line) => {
+				logLines.push(line);
+				if (isErrorLine(line)) {
+					errors.push(line);
+				}
+				if (!isJsonMode()) {
+					printLogLine(line);
+				}
+			},
+			onOpen: () => {
+				wsConnected = true;
+			},
+			onError: () => {
+				// WebSocket errors are not fatal - we'll fall back to polling
+				if (!isJsonMode() && wsConnected) {
+					log(colors.dim("[WebSocket reconnecting...]"));
+				}
+			},
+		});
+		cleanup = stream.cleanup;
+	}
+
+	// Poll for deployment status
+	const maxWaitMs = 600000; // 10 minutes
+	const pollIntervalMs = 3000;
+
+	try {
+		while (Date.now() - startTime < maxWaitMs) {
+			await sleep(pollIntervalMs);
+
+			// Get updated deployment status
+			const updatedDeployment = await client.deployment.one.query({
+				deploymentId,
+			});
+			lastStatus = updatedDeployment.status;
+
+			if (lastStatus === "done") {
+				// Give WebSocket a moment to flush remaining logs
+				await sleep(500);
+				cleanup?.();
+
+				// Get final application info for URL
+				const finalApp = await client.application.one.query({ applicationId });
+				const duration = Math.round((Date.now() - startTime) / 1000);
+
+				if (isJsonMode()) {
+					outputData({
+						success: true,
+						data: {
+							deploymentId,
+							status: "done",
+							url: finalApp.cloudServiceUrl,
+							duration,
+							logs: logLines,
+						},
+					});
+				} else {
+					log("");
+					log(colors.dim("─".repeat(50)));
+					log(colors.success("✓ Deployment successful!"));
+					log("");
+					log(`URL: ${colors.cyan(finalApp.cloudServiceUrl || "Pending...")}`);
+					log(`Duration: ${colors.dim(`${duration}s`)}`);
+					log("");
+				}
+				return;
+			}
+
+			if (lastStatus === "error" || lastStatus === "cancelled") {
+				cleanup?.();
+
+				const errorAnalysis = analyzeDeploymentError(
+					logLines,
+					updatedDeployment.errorMessage,
+				);
+				const duration = Math.round((Date.now() - startTime) / 1000);
+
+				if (isJsonMode()) {
+					outputData({
+						success: false,
+						error: {
+							code:
+								errorAnalysis.category === "build_script" ||
+								errorAnalysis.category === "npm_install" ||
+								errorAnalysis.category === "typescript"
+									? "BUILD_FAILED"
+									: "DEPLOYMENT_FAILED",
+							message: updatedDeployment.errorMessage || "Deployment failed",
+							deploymentId,
+							duration,
+							logs: logLines,
+							errors: errors.length > 0 ? errors : undefined,
+							errorAnalysis,
+						},
+					});
+				} else {
+					log("");
+					log(colors.dim("─".repeat(50)));
+					log(colors.error("✗ Deployment failed"));
+					log("");
+
+					if (updatedDeployment.errorMessage) {
+						log(`Error: ${colors.error(updatedDeployment.errorMessage)}`);
+					}
+
+					if (errorAnalysis.category !== "unknown") {
+						log("");
+						log(colors.bold("Error Analysis:"));
+						log(`  Category: ${errorAnalysis.category}`);
+						log(`  Type: ${errorAnalysis.type}`);
+						log("");
+						log(colors.bold("Possible Causes:"));
+						for (const cause of errorAnalysis.possibleCauses.slice(0, 3)) {
+							log(`  • ${cause}`);
+						}
+						log("");
+						log(colors.bold("Suggested Fixes:"));
+						for (const fix of errorAnalysis.suggestedFixes.slice(0, 3)) {
+							log(`  • ${fix}`);
+						}
+					}
+					log("");
+				}
+
+				// Throw appropriate error for exit code
+				if (
+					errorAnalysis.category === "build_script" ||
+					errorAnalysis.category === "npm_install" ||
+					errorAnalysis.category === "typescript" ||
+					errorAnalysis.category === "docker_build"
+				) {
+					throw new BuildFailedError(
+						updatedDeployment.errorMessage || "Build failed",
+						deploymentId,
+						errorAnalysis,
+					);
+				}
+				throw new DeploymentFailedError(
+					updatedDeployment.errorMessage || "Deployment failed",
+					deploymentId,
+					errorAnalysis,
+				);
+			}
+		}
+
+		// Timeout
+		cleanup?.();
+		const duration = Math.round((Date.now() - startTime) / 1000);
+
+		if (isJsonMode()) {
+			outputData({
+				success: false,
+				error: {
+					code: "DEPLOYMENT_TIMEOUT",
+					message: "Deployment timed out",
+					deploymentId,
+					duration,
+					logs: logLines,
+					errors: errors.length > 0 ? errors : undefined,
+				},
+			});
+		} else {
+			log("");
+			log(colors.dim("─".repeat(50)));
+			log(colors.warn("⚠ Deployment timed out"));
+			log("");
+			log(
+				`The deployment is still running. Check status with: ${colors.dim(`tarout deploy:status ${applicationId.slice(0, 8)}`)}`,
+			);
+			log("");
+		}
+
+		throw new DeploymentTimeoutError(
+			"Deployment timed out after 10 minutes",
+			deploymentId,
+		);
+	} finally {
+		// Ensure cleanup is called
+		cleanup?.();
+	}
+}
+
+/**
+ * Check if a log line contains an error indicator.
+ */
+function isErrorLine(line: string): boolean {
+	const errorPatterns = [
+		/error/i,
+		/ERR!/i,
+		/failed/i,
+		/fatal/i,
+		/exception/i,
+		/ENOENT/i,
+		/EACCES/i,
+		/EPERM/i,
+	];
+	return errorPatterns.some((pattern) => pattern.test(line));
+}
+
+/**
+ * Print a log line with appropriate formatting.
+ */
+function printLogLine(line: string): void {
+	// Detect log level from content
+	if (isErrorLine(line)) {
+		console.log(colors.error(line));
+	} else if (/warn/i.test(line)) {
+		console.log(colors.warn(line));
+	} else if (/step|stage|building|installing|deploying/i.test(line)) {
+		console.log(colors.info(line));
+	} else {
+		console.log(line);
+	}
 }
