@@ -138,17 +138,33 @@ export function registerDevCommand(program: Command) {
 
 				// Detect framework for display
 				const framework = detectFramework(pkg);
+				const frameworkName = framework?.name || "Unknown";
+				const metadata = {
+					applicationId,
+					appName,
+					command: devCommand,
+					port,
+					framework: frameworkName,
+					envVarCount: Object.keys(envVars).length,
+					packageManager: pm,
+				};
 
 				if (isJsonMode()) {
+					const startTime = Date.now();
+					const result = await runCommand(devCommand, envVars);
+					const duration = Math.round((Date.now() - startTime) / 1000);
+
 					outputData({
-						applicationId,
-						appName,
-						command: devCommand,
-						port,
-						framework: framework?.name || "Unknown",
-						envVarCount: Object.keys(envVars).length,
-						packageManager: pm,
+						...metadata,
+						success: result.exitCode === 0 && !result.signal,
+						exitCode: result.exitCode,
+						signal: result.signal,
+						duration,
 					});
+
+					if (result.exitCode !== 0 && !result.signal) {
+						process.exit(result.exitCode);
+					}
 					return;
 				}
 
@@ -156,7 +172,7 @@ export function registerDevCommand(program: Command) {
 				log("");
 				log(colors.bold(`Running dev server for ${colors.cyan(appName)}`));
 				log("");
-				log(`  Framework:       ${colors.dim(framework?.name || "Unknown")}`);
+				log(`  Framework:       ${colors.dim(frameworkName)}`);
 				log(`  Package Manager: ${colors.dim(pm)}`);
 				log(`  Command:         ${colors.dim(devCommand)}`);
 				log(`  Port:            ${colors.dim(String(port))}`);

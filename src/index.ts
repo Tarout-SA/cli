@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
+import packageJson from "../package.json" assert { type: "json" };
+
 import { registerAppsCommands } from "./commands/apps.js";
 import { registerAuthCommands } from "./commands/auth.js";
 import { registerBuildCommand } from "./commands/build.js";
@@ -22,7 +24,7 @@ const program = new Command();
 program
 	.name("tarout")
 	.description("Tarout PaaS Command Line Interface")
-	.version("0.1.3")
+	.version(packageJson.version)
 	.option("--json", "Output as JSON (machine-readable)")
 	.option("-y, --yes", "Skip all confirmation prompts")
 	.option("-q, --quiet", "Minimal output")
