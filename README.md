@@ -157,9 +157,6 @@ tarout db create mydb --type postgres
 # Create MySQL database
 tarout db create mydb --type mysql
 
-# Create Redis instance
-tarout db create cache --type redis
-
 # Get connection string
 tarout db info mydb
 

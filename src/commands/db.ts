@@ -24,7 +24,7 @@ import { ExitCode } from "../utils/exit-codes.js";
 import { confirm, input, select } from "../utils/prompts.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
 
-type DatabaseType = "postgres" | "mysql" | "redis";
+type DatabaseType = "postgres" | "mysql";
 
 export function registerDbCommands(program: Command) {
 	const db = program.command("db").description("Manage databases");
@@ -33,7 +33,7 @@ export function registerDbCommands(program: Command) {
 	db.command("list")
 		.alias("ls")
 		.description("List all databases")
-		.option("-t, --type <type>", "Filter by type (postgres, mysql, redis)")
+		.option("-t, --type <type>", "Filter by type (postgres, mysql)")
 		.action(async (options) => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
@@ -42,10 +42,9 @@ export function registerDbCommands(program: Command) {
 				const _spinner = startSpinner("Fetching databases...");
 
 				// Fetch all database types
-				const [postgres, mysql, redis] = await Promise.all([
+				const [postgres, mysql] = await Promise.all([
 					client.postgres.allByOrganization.query(),
 					client.mysql.allByOrganization.query(),
-					client.redis.allByOrganization.query(),
 				]);
 
 				succeedSpinner();
@@ -77,18 +76,6 @@ export function registerDbCommands(program: Command) {
 							id: db.mysqlId,
 							name: db.name,
 							type: "mysql" as DatabaseType,
-							status: db.applicationStatus,
-							created: db.createdAt,
-						})),
-					);
-				}
-
-				if (!options.type || options.type === "redis") {
-					databases = databases.concat(
-						redis.map((db: any) => ({
-							id: db.redisId,
-							name: db.name,
-							type: "redis" as DatabaseType,
 							status: db.applicationStatus,
 							created: db.createdAt,
 						})),
@@ -136,7 +123,7 @@ export function registerDbCommands(program: Command) {
 		.description("Create a new database")
 		.option(
 			"-t, --type <type>",
-			"Database type (postgres, mysql, redis)",
+			"Database type (postgres, mysql)",
 			"postgres",
 		)
 		.option("-d, --description <description>", "Database description")
@@ -159,7 +146,6 @@ export function registerDbCommands(program: Command) {
 					dbType = await select("Database type:", [
 						{ name: "PostgreSQL", value: "postgres" },
 						{ name: "MySQL", value: "mysql" },
-						{ name: "Redis", value: "redis" },
 					]);
 				}
 
@@ -190,15 +176,6 @@ export function registerDbCommands(program: Command) {
 							description: options.description,
 						});
 						break;
-					case "redis":
-						database = await client.redis.create.mutate({
-							name: dbName,
-							appName: slug,
-							dockerImage: "redis:7",
-							organizationId: profile.organizationId,
-							description: options.description,
-						});
-						break;
 					default:
 						throw new CliError(
 							`Unsupported database type: ${dbType}`,
@@ -209,7 +186,7 @@ export function registerDbCommands(program: Command) {
 				succeedSpinner("Database created!");
 
 				const dbId =
-					database.postgresId || database.mysqlId || database.redisId;
+					database.postgresId || database.mysqlId;
 
 				if (isJsonMode()) {
 					outputData(database);
@@ -289,9 +266,6 @@ export function registerDbCommands(program: Command) {
 					case "mysql":
 						await client.mysql.remove.mutate({ mysqlId: dbInfo.id });
 						break;
-					case "redis":
-						await client.redis.remove.mutate({ redisId: dbInfo.id });
-						break;
 				}
 
 				succeedSpinner("Database deleted!");
@@ -341,9 +315,6 @@ export function registerDbCommands(program: Command) {
 					case "mysql":
 						dbDetails = await client.mysql.one.query({ mysqlId: dbSummary.id });
 						break;
-					case "redis":
-						dbDetails = await client.redis.one.query({ redisId: dbSummary.id });
-						break;
 				}
 
 				succeedSpinner();
@@ -366,18 +337,7 @@ export function registerDbCommands(program: Command) {
 
 				// Connection info
 				log(`${colors.bold("Connection")}`);
-				if (dbSummary.type === "redis") {
-					if (dbDetails.cloudHost) {
-						log(`  Host: ${colors.cyan(dbDetails.cloudHost)}`);
-						log(`  Port: ${dbDetails.cloudPort || 6379}`);
-						if (dbDetails.cloudPassword) {
-							log(`  Password: ${colors.dim("********")}`);
-						}
-					} else {
-						log(`  ${colors.dim("Not yet deployed")}`);
-					}
-				} else {
-					if (dbDetails.cloudInstanceId || dbDetails.databaseName) {
+				if (dbDetails.cloudInstanceId || dbDetails.databaseName) {
 						log(`  Host: ${colors.cyan(dbDetails.cloudHost || "localhost")}`);
 						log(
 							`  Port: ${dbDetails.cloudPort || (dbSummary.type === "postgres" ? 5432 : 3306)}`,
@@ -447,9 +407,6 @@ export function registerDbCommands(program: Command) {
 					case "mysql":
 						dbDetails = await client.mysql.one.query({ mysqlId: dbSummary.id });
 						break;
-					case "redis":
-						dbDetails = await client.redis.one.query({ redisId: dbSummary.id });
-						break;
 				}
 
 				succeedSpinner();
@@ -490,10 +447,9 @@ export function registerDbCommands(program: Command) {
 
 // Helper functions
 async function getAllDatabases(client: ReturnType<typeof getApiClient>) {
-	const [postgres, mysql, redis] = await Promise.all([
+	const [postgres, mysql] = await Promise.all([
 		client.postgres.allByOrganization.query(),
 		client.mysql.allByOrganization.query(),
-		client.redis.allByOrganization.query(),
 	]);
 
 	const databases: Array<{
@@ -517,15 +473,6 @@ async function getAllDatabases(client: ReturnType<typeof getApiClient>) {
 			id: db.mysqlId,
 			name: db.name,
 			type: "mysql",
-			status: db.applicationStatus,
-		});
-	}
-
-	for (const db of redis as any[]) {
-		databases.push({
-			id: db.redisId,
-			name: db.name,
-			type: "redis",
 			status: db.applicationStatus,
 		});
 	}
@@ -564,7 +511,6 @@ function getTypeLabel(type: DatabaseType): string {
 	const labels: Record<DatabaseType, string> = {
 		postgres: colors.info("PostgreSQL"),
 		mysql: colors.warn("MySQL"),
-		redis: colors.error("Redis"),
 	};
 	return labels[type] || type;
 }
@@ -582,10 +528,6 @@ function getConnectionString(type: DatabaseType, details: any): string {
 		case "mysql": {
 			const myPort = details.cloudPort || 3306;
 			return `mysql://${user}:****@${host}:${myPort}/${dbName}`;
-		}
-		case "redis": {
-			const redisPort = details.cloudPort || 6379;
-			return `redis://:****@${host}:${redisPort}`;
 		}
 		default:
 			return "";
@@ -629,18 +571,6 @@ function getConnectCommand(
 					user,
 					`-p${password}`,
 					dbName,
-				],
-				env: {},
-			};
-		case "redis":
-			return {
-				command: "redis-cli",
-				args: [
-					"-h",
-					host,
-					"-p",
-					String(details.cloudPort || 6379),
-					...(password ? ["-a", password] : []),
 				],
 				env: {},
 			};
