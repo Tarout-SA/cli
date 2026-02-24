@@ -131,10 +131,9 @@ export function registerDeployCommands(program: Command) {
 					applicationId: appSummary.applicationId,
 				});
 
-				const cloudStatus =
-					await client.application.getCloudDeploymentStatus.query({
-						applicationId: appSummary.applicationId,
-					});
+				const cloudStatus = await client.application.getDeploymentStatus.query({
+					applicationId: appSummary.applicationId,
+				});
 
 				succeedSpinner();
 
@@ -143,7 +142,11 @@ export function registerDeployCommands(program: Command) {
 						applicationId: app.applicationId,
 						name: app.name,
 						status: app.applicationStatus,
-						url: app.cloudServiceUrl,
+						url: app.appSubdomain
+							? `https://${app.appSubdomain}`
+							: app.domain?.[0]?.host
+								? `https://${app.domain[0].host}`
+								: null,
 						cloudStatus,
 					});
 					return;
@@ -154,8 +157,13 @@ export function registerDeployCommands(program: Command) {
 				log("");
 				log(`Status: ${getStatusBadge(app.applicationStatus)}`);
 
-				if (app.cloudServiceUrl) {
-					log(`URL: ${colors.cyan(app.cloudServiceUrl)}`);
+				const appUrl = app.appSubdomain
+					? `https://${app.appSubdomain}`
+					: app.domain?.[0]?.host
+						? `https://${app.domain[0].host}`
+						: null;
+				if (appUrl) {
+					log(`URL: ${colors.cyan(appUrl)}`);
 				}
 
 				if (cloudStatus) {
@@ -632,114 +640,11 @@ export function registerLogsCommand(program: Command) {
 		.option("-f, --follow", "Stream logs continuously")
 		.option("-n, --limit <number>", "Number of logs to show", "100")
 		.option("--since <duration>", "Show logs since (e.g., 1h, 30m, 2d)")
-		.action(async (appIdentifier, options) => {
-			try {
-				if (!isLoggedIn()) throw new AuthError();
-
-				const client = getApiClient();
-
-				// Find the application
-				const _spinner = startSpinner("Fetching logs...");
-				const apps = await client.application.allByOrganization.query();
-				const app = findApp(apps, appIdentifier);
-
-				if (!app) {
-					failSpinner();
-					const suggestions = findSimilar(
-						appIdentifier,
-						apps.map((a) => a.name),
-					);
-					throw new NotFoundError("Application", appIdentifier, suggestions);
-				}
-
-				// Parse time range
-				let timeRange: { start: string | null; end: string | null } | undefined;
-				if (options.since) {
-					const since = parseDuration(options.since);
-					if (since) {
-						timeRange = {
-							start: new Date(Date.now() - since).toISOString(),
-							end: null,
-						};
-					}
-				}
-
-				const logs = await client.logs.getCloudRunLogs.query({
-					applicationId: app.applicationId,
-					level: options.level.toUpperCase() as
-						| "ALL"
-						| "ERROR"
-						| "WARN"
-						| "INFO"
-						| "DEBUG",
-					limit: Number.parseInt(options.limit, 10),
-					timeRange,
-				});
-
-				succeedSpinner();
-
-				if (isJsonMode()) {
-					outputData(logs);
-					return;
-				}
-
-				if (!logs.entries || logs.entries.length === 0) {
-					log("");
-					log("No logs found.");
-					return;
-				}
-
-				log("");
-
-				for (const entry of logs.entries) {
-					printLogEntry(entry);
-				}
-
-				// Follow mode - poll for new logs
-				if (options.follow) {
-					log("");
-					log(colors.dim("Streaming logs... (Ctrl+C to stop)"));
-					log("");
-
-					let lastTimestamp =
-						logs.entries.length > 0
-							? new Date(
-									logs.entries[logs.entries.length - 1].timestamp,
-								).getTime()
-							: Date.now();
-
-					while (true) {
-						await sleep(2000);
-
-						const newLogs = await client.logs.getCloudRunLogs.query({
-							applicationId: app.applicationId,
-							level: options.level.toUpperCase() as
-								| "ALL"
-								| "ERROR"
-								| "WARN"
-								| "INFO"
-								| "DEBUG",
-							limit: 50,
-							timeRange: {
-								start: new Date(lastTimestamp + 1).toISOString(),
-								end: null,
-							},
-						});
-
-						if (newLogs.entries && newLogs.entries.length > 0) {
-							for (const entry of newLogs.entries) {
-								const entryTime = new Date(entry.timestamp).getTime();
-								if (entryTime > lastTimestamp) {
-									printLogEntry(entry);
-									lastTimestamp = entryTime;
-								}
-							}
-						}
-					}
-				}
-			} catch (err) {
-				handleError(err);
-			}
+		.action(async () => {
+			log("");
+			log("Application logs are available in the dashboard.");
+			log("CLI log streaming is not yet supported for Coolify deployments.");
+			log("");
 		});
 }
 
@@ -771,50 +676,6 @@ function formatDate(date: Date | string): string {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function parseDuration(duration: string): number | null {
-	const match = duration.match(/^(\d+)(s|m|h|d)$/);
-	if (!match) return null;
-
-	const value = Number.parseInt(match[1], 10);
-	const unit = match[2];
-
-	const multipliers: Record<string, number> = {
-		s: 1000,
-		m: 60 * 1000,
-		h: 60 * 60 * 1000,
-		d: 24 * 60 * 60 * 1000,
-	};
-
-	return value * (multipliers[unit] || 0);
-}
-
-function printLogEntry(entry: {
-	timestamp: string;
-	severity: string;
-	message: string;
-}) {
-	const time = new Date(entry.timestamp);
-	const timeStr = time.toLocaleTimeString("en-US", {
-		hour12: false,
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-	});
-
-	const levelColors: Record<string, (s: string) => string> = {
-		ERROR: colors.error,
-		WARN: colors.warn,
-		INFO: colors.info,
-		DEBUG: colors.dim,
-		DEFAULT: colors.dim,
-	};
-
-	const colorFn = levelColors[entry.severity] || levelColors.DEFAULT;
-	const level = entry.severity.padEnd(5);
-
-	console.log(`${colors.dim(timeStr)}  ${colorFn(level)}  ${entry.message}`);
 }
 
 /**
@@ -902,13 +763,19 @@ async function streamDeploymentWithLogs(
 				const finalApp = await client.application.one.query({ applicationId });
 				const duration = Math.round((Date.now() - startTime) / 1000);
 
+				const deployUrl = finalApp.appSubdomain
+					? `https://${finalApp.appSubdomain}`
+					: finalApp.domain?.[0]?.host
+						? `https://${finalApp.domain[0].host}`
+						: null;
+
 				if (isJsonMode()) {
 					outputData({
 						success: true,
 						data: {
 							deploymentId,
 							status: "done",
-							url: finalApp.cloudServiceUrl,
+							url: deployUrl,
 							duration,
 							logs: logLines,
 						},
@@ -918,7 +785,7 @@ async function streamDeploymentWithLogs(
 					log(colors.dim("─".repeat(50)));
 					log(colors.success("✓ Deployment successful!"));
 					log("");
-					log(`URL: ${colors.cyan(finalApp.cloudServiceUrl || "Pending...")}`);
+					log(`URL: ${colors.cyan(deployUrl || "Pending...")}`);
 					log(`Duration: ${colors.dim(`${duration}s`)}`);
 					log("");
 				}

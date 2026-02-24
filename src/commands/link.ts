@@ -264,7 +264,7 @@ export function registerLinkCommands(program: Command) {
 								applicationId: config.applicationId,
 								name: config.name,
 								status: app.applicationStatus,
-								url: app.cloudServiceUrl,
+								url: app.appSubdomain ? `https://${app.appSubdomain}` : null,
 								linkedAt: config.linkedAt,
 							});
 							return;
@@ -276,8 +276,8 @@ export function registerLinkCommands(program: Command) {
 						log(`Application: ${colors.cyan(app.name)}`);
 						log(`ID: ${colors.dim(config.applicationId)}`);
 						log(`Status: ${getStatusIndicator(app.applicationStatus)}`);
-						if (app.cloudServiceUrl) {
-							log(`URL: ${colors.cyan(app.cloudServiceUrl)}`);
+						if (app.appSubdomain) {
+							log(`URL: ${colors.cyan(`https://${app.appSubdomain}`)}`);
 						}
 						log(`Linked: ${new Date(config.linkedAt).toLocaleString()}`);
 						log("");

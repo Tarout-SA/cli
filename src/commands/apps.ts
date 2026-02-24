@@ -292,13 +292,11 @@ export function registerAppsCommands(program: Command) {
 				}
 				log("");
 
-				// Cloud
-				if (app.cloudServiceUrl) {
-					log(`${colors.bold("Cloud")}`);
-					log(`  URL: ${app.cloudServiceUrl}`);
-					if (app.cloudRegion) {
-						log(`  Region: ${app.cloudRegion}`);
-					}
+				// URL
+				const appUrl = app.appSubdomain ? `https://${app.appSubdomain}` : null;
+				if (appUrl) {
+					log(`${colors.bold("URL")}`);
+					log(`  ${appUrl}`);
 					log("");
 				}
 
@@ -346,8 +344,8 @@ export function registerAppsCommands(program: Command) {
 
 				if (app.domain && app.domain.length > 0) {
 					url = `https://${app.domain[0].host}`;
-				} else if (app.cloudServiceUrl) {
-					url = app.cloudServiceUrl;
+				} else if (app.appSubdomain) {
+					url = `https://${app.appSubdomain}`;
 				}
 
 				if (!url) {
