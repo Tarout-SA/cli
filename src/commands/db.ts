@@ -121,11 +121,7 @@ export function registerDbCommands(program: Command) {
 	db.command("create")
 		.argument("[name]", "Database name")
 		.description("Create a new database")
-		.option(
-			"-t, --type <type>",
-			"Database type (postgres, mysql)",
-			"postgres",
-		)
+		.option("-t, --type <type>", "Database type (postgres, mysql)", "postgres")
 		.option("-d, --description <description>", "Database description")
 		.action(async (name, options) => {
 			try {
@@ -185,8 +181,7 @@ export function registerDbCommands(program: Command) {
 
 				succeedSpinner("Database created!");
 
-				const dbId =
-					database.postgresId || database.mysqlId;
+				const dbId = database.postgresId || database.mysqlId;
 
 				if (isJsonMode()) {
 					outputData(database);
@@ -338,20 +333,19 @@ export function registerDbCommands(program: Command) {
 				// Connection info
 				log(`${colors.bold("Connection")}`);
 				if (dbDetails.cloudInstanceId || dbDetails.databaseName) {
-						log(`  Host: ${colors.cyan(dbDetails.cloudHost || "localhost")}`);
-						log(
-							`  Port: ${dbDetails.cloudPort || (dbSummary.type === "postgres" ? 5432 : 3306)}`,
-						);
-						log(
-							`  Database: ${dbDetails.cloudDatabaseName || dbDetails.databaseName}`,
-						);
-						log(
-							`  Username: ${dbDetails.cloudUsername || dbDetails.databaseUser}`,
-						);
-						log(`  Password: ${colors.dim("********")}`);
-					} else {
-						log(`  ${colors.dim("Not yet deployed")}`);
-					}
+					log(`  Host: ${colors.cyan(dbDetails.cloudHost || "localhost")}`);
+					log(
+						`  Port: ${dbDetails.cloudPort || (dbSummary.type === "postgres" ? 5432 : 3306)}`,
+					);
+					log(
+						`  Database: ${dbDetails.cloudDatabaseName || dbDetails.databaseName}`,
+					);
+					log(
+						`  Username: ${dbDetails.cloudUsername || dbDetails.databaseUser}`,
+					);
+					log(`  Password: ${colors.dim("********")}`);
+				} else {
+					log(`  ${colors.dim("Not yet deployed")}`);
 				}
 				log("");
 
