@@ -51,8 +51,8 @@ tarout logs my-app --follow
 | `tarout whoami` | Show current user, organization, and environment |
 
 ```bash
-# Login with custom API URL (for self-hosted)
-tarout login --api-url https://your-tarout-instance.com
+# Login with a custom API URL (e.g. staging)
+tarout login --api-url https://staging.tarout.sa
 ```
 
 ### Applications
