@@ -15,6 +15,15 @@ export interface Profile {
 	apiUrl: string;
 	organizationId: string;
 	organizationName: string;
+	/**
+	 * Active project for this profile. Added in the env redesign (May 2026)
+	 * — projects sit between organization and environment. Optional for
+	 * legacy profiles created before the redesign; the CLI falls back to the
+	 * org's default project when missing.
+	 */
+	projectId?: string;
+	projectName?: string;
+	projectSlug?: string;
 	environmentId: string;
 	environmentName: string;
 	userId: string;

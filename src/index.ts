@@ -16,6 +16,7 @@ import { registerDomainsCommands } from "./commands/domains.js";
 import { registerEnvCommands } from "./commands/env.js";
 import { registerLinkCommands } from "./commands/link.js";
 import { registerEnvsCommands, registerOrgsCommands } from "./commands/orgs.js";
+import { registerProjectsCommands } from "./commands/projects.js";
 import { setGlobalOptions } from "./lib/output.js";
 
 const program = new Command();
@@ -50,6 +51,7 @@ registerEnvCommands(program);
 registerDbCommands(program);
 registerDomainsCommands(program);
 registerOrgsCommands(program);
+registerProjectsCommands(program);
 registerEnvsCommands(program);
 registerLinkCommands(program);
 registerDevCommand(program);
