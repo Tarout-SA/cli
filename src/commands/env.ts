@@ -349,6 +349,355 @@ export function registerEnvCommands(program: Command) {
 				handleError(err);
 			}
 		});
+
+	// View env variable audit log
+	env
+		.command("audit")
+		.description("Show audit log for environment variables")
+		.option("-k, --key <key>", "Filter by variable key")
+		.option("-n, --limit <n>", "Number of entries to show", "50")
+		.action(async (options: any, command: any) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+
+				const appIdentifier = command.parent.args[0];
+				if (!appIdentifier) {
+					throw new Error("Usage: tarout env <app> audit");
+				}
+
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching audit log...");
+
+				const apps = await client.application.allByOrganization.query();
+				const app = findApp(apps as any[], appIdentifier);
+
+				if (!app) {
+					failSpinner();
+					throw new NotFoundError("Application", appIdentifier);
+				}
+
+				const entries = await client.envVariable.audit.query({
+					applicationId: (app as any).applicationId,
+					key: options.key,
+					limit: Number.parseInt(options.limit) || 50,
+				} as any);
+
+				succeedSpinner();
+
+				if (isJsonMode()) {
+					outputData(entries);
+					return;
+				}
+
+				const list = Array.isArray(entries) ? entries : [];
+
+				if (!list.length) {
+					log("");
+					log("No audit log entries found.");
+					return;
+				}
+
+				log("");
+				log(colors.bold("Environment Variable Audit Log"));
+				log("");
+				table(
+					["DATE", "KEY", "ACTION", "USER"],
+					list.map((e: any) => [
+						new Date(e.createdAt || e.timestamp || "").toLocaleString(),
+						colors.cyan(e.variableKey || e.key || "-"),
+						e.action || "-",
+						e.user?.email || e.userId || "-",
+					]),
+				);
+				log("");
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Reveal a specific env variable value
+	env
+		.command("reveal")
+		.argument("<key>", "Variable key to reveal")
+		.description(
+			"Reveal the plaintext value of an environment variable (logged)",
+		)
+		.action(async (key: string, _options: any, command: any) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+
+				const appIdentifier = command.parent.parent.args[0];
+				if (!appIdentifier) {
+					throw new Error("Usage: tarout env <app> reveal <KEY>");
+				}
+
+				const client = getApiClient();
+				const _spinner = startSpinner("Revealing variable...");
+
+				const apps = await client.application.allByOrganization.query();
+				const app = findApp(apps as any[], appIdentifier);
+
+				if (!app) {
+					failSpinner();
+					throw new NotFoundError("Application", appIdentifier);
+				}
+
+				const variable = await client.envVariable.reveal.mutate({
+					applicationId: (app as any).applicationId,
+					key,
+				} as any);
+
+				succeedSpinner();
+
+				if (isJsonMode()) {
+					outputData(variable);
+					return;
+				}
+
+				const v = variable as any;
+				log("");
+				log(`${colors.bold(key)}: ${v.value || String(variable)}`);
+				log(colors.dim("This reveal has been recorded in the audit log."));
+				log("");
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Get a single env variable by key
+	env
+		.command("get")
+		.argument("<app>", "App ID or name")
+		.argument("<key>", "Variable key")
+		.description("Get a specific environment variable value")
+		.action(async (appIdentifier, key) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching...");
+				const apps = await client.application.allByOrganization.query();
+				const app = findApp(
+					Array.isArray(apps) ? apps : (apps as any)?.applications || [],
+					appIdentifier,
+				);
+				if (!app) {
+					failSpinner();
+					throw new NotFoundError("Application", appIdentifier);
+				}
+				const v = await client.envVariable.get.query({
+					applicationId: (app as any).applicationId,
+					key,
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(v);
+					return;
+				}
+				const val = v as any;
+				log(`\n${colors.bold(key)}: ${maskValue(val.value || String(v))}\n`);
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Get env variable as a string
+	env
+		.command("get-string")
+		.argument("<app>", "App ID or name")
+		.argument("<key>", "Variable key")
+		.description("Get an environment variable formatted as a string")
+		.action(async (appIdentifier, key) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching...");
+				const apps = await client.application.allByOrganization.query();
+				const app = findApp(
+					Array.isArray(apps) ? apps : (apps as any)?.applications || [],
+					appIdentifier,
+				);
+				if (!app) {
+					failSpinner();
+					throw new NotFoundError("Application", appIdentifier);
+				}
+				const v = await client.envVariable.getAsString.query({
+					applicationId: (app as any).applicationId,
+					key,
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) outputData(v);
+				else log(typeof v === "string" ? v : JSON.stringify(v));
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// List env vars across all environments
+	env
+		.command("list-all-envs")
+		.argument("<app>", "App ID or name")
+		.description("List environment variables across all environments")
+		.action(async (appIdentifier) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching...");
+				const apps = await client.application.allByOrganization.query();
+				const app = findApp(
+					Array.isArray(apps) ? apps : (apps as any)?.applications || [],
+					appIdentifier,
+				);
+				if (!app) {
+					failSpinner();
+					throw new NotFoundError("Application", appIdentifier);
+				}
+				const result = await client.envVariable.listAcrossEnvs.query({
+					applicationId: (app as any).applicationId,
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(result);
+					return;
+				}
+				const list = Array.isArray(result)
+					? result
+					: (result as any)?.variables || [];
+				log("");
+				table(
+					["KEY", "ENV", "VALUE"],
+					list.map((v: any) => [
+						colors.cyan(v.key || "-"),
+						v.environmentName || v.environment || "-",
+						maskValue(v.value),
+					]),
+				);
+				log("");
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Bulk upsert env variables from JSON file
+	env
+		.command("bulk-set")
+		.argument("<app>", "App ID or name")
+		.description("Bulk create/update environment variables from a JSON object")
+		.option("--vars <json>", "JSON object of key-value pairs")
+		.action(async (appIdentifier, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const apps = await client.application.allByOrganization.query();
+				const app = findApp(
+					Array.isArray(apps) ? apps : (apps as any)?.applications || [],
+					appIdentifier,
+				);
+				if (!app) throw new NotFoundError("Application", appIdentifier);
+				let vars: Record<string, string>;
+				if (options.vars) {
+					vars = JSON.parse(options.vars);
+				} else {
+					const _raw = await import("node:process");
+					log('Enter JSON key-value object (e.g. {"KEY":"value"}):');
+					const input2 = await (await import("../utils/prompts.js")).input(
+						"JSON:",
+					);
+					vars = JSON.parse(input2);
+				}
+				const _spinner = startSpinner("Bulk setting variables...");
+				await client.envVariable.bulkUpsert.mutate({
+					applicationId: (app as any).applicationId,
+					variables: Object.entries(vars).map(([key, value]) => ({
+						key,
+						value,
+					})),
+				} as any);
+				succeedSpinner(`Bulk set ${Object.keys(vars).length} variable(s)!`);
+				if (isJsonMode()) outputData({ updated: Object.keys(vars).length });
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Bulk delete env variables
+	env
+		.command("bulk-delete")
+		.argument("<app>", "App ID or name")
+		.argument("<keys...>", "Keys to delete")
+		.description("Delete multiple environment variables by key")
+		.action(async (appIdentifier, keys) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				if (!shouldSkipConfirmation()) {
+					const { confirm: confirmFn } = await import("../utils/prompts.js");
+					const ok = await confirmFn(
+						`Delete ${keys.length} variable(s)?`,
+						false,
+					);
+					if (!ok) {
+						log("Cancelled.");
+						return;
+					}
+				}
+				const client = getApiClient();
+				const apps = await client.application.allByOrganization.query();
+				const app = findApp(
+					Array.isArray(apps) ? apps : (apps as any)?.applications || [],
+					appIdentifier,
+				);
+				if (!app) throw new NotFoundError("Application", appIdentifier);
+				const _spinner = startSpinner("Deleting variables...");
+				await client.envVariable.bulkDelete.mutate({
+					applicationId: (app as any).applicationId,
+					keys,
+				} as any);
+				succeedSpinner(`Deleted ${keys.length} variable(s)!`);
+				if (isJsonMode()) outputData({ deleted: keys.length });
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Copy env variables between environments
+	env
+		.command("copy")
+		.argument("<app>", "App ID or name")
+		.argument("<from-env>", "Source environment ID")
+		.argument("<to-env>", "Target environment ID")
+		.description("Copy environment variables from one environment to another")
+		.action(async (appIdentifier, fromEnvId, toEnvId) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const apps = await client.application.allByOrganization.query();
+				const app = findApp(
+					Array.isArray(apps) ? apps : (apps as any)?.applications || [],
+					appIdentifier,
+				);
+				if (!app) throw new NotFoundError("Application", appIdentifier);
+				if (!shouldSkipConfirmation()) {
+					const { confirm: confirmFn } = await import("../utils/prompts.js");
+					const ok = await confirmFn(
+						`Copy env vars from ${fromEnvId} to ${toEnvId}?`,
+						false,
+					);
+					if (!ok) {
+						log("Cancelled.");
+						return;
+					}
+				}
+				const _spinner = startSpinner("Copying variables...");
+				await client.envVariable.copy.mutate({
+					applicationId: (app as any).applicationId,
+					fromEnvironmentId: fromEnvId,
+					toEnvironmentId: toEnvId,
+				} as any);
+				succeedSpinner("Variables copied!");
+				if (isJsonMode()) outputData({ copied: true });
+			} catch (err) {
+				handleError(err);
+			}
+		});
 }
 
 // Helper functions

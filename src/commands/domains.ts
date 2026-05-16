@@ -185,7 +185,7 @@ export function registerDomainsCommands(program: Command) {
 		.command("add-external")
 		.argument("<domain>", "Domain name (e.g., example.com)")
 		.description(
-			"Add an externally-registered domain and get Cloudflare nameservers",
+			"Add an externally-registered domain via CNAME (no nameserver change needed)",
 		)
 		.action(async (domainName) => {
 			try {
@@ -220,15 +220,12 @@ export function registerDomainsCommands(program: Command) {
 					`Domain ID: ${colors.dim(result.domain.domainId)}`,
 				]);
 
-				if (
-					result.cloudflareNameservers &&
-					result.cloudflareNameservers.length > 0
-				) {
-					log("Change your domain's nameservers at your registrar to:");
+				if (result.cnameTarget) {
+					log("Add a CNAME record at your DNS provider:");
 					log("");
-					for (const ns of result.cloudflareNameservers) {
-						log(`  ${colors.cyan(ns)}`);
-					}
+					log(`  Type:   ${colors.cyan("CNAME")}`);
+					log(`  Name:   ${colors.cyan("@")}`);
+					log(`  Target: ${colors.cyan(result.cnameTarget)}`);
 					log("");
 					log(
 						`Then verify: ${colors.dim(`tarout domains verify ${result.domain.domainId.slice(0, 8)}`)}`,
@@ -236,7 +233,7 @@ export function registerDomainsCommands(program: Command) {
 					log("");
 					log(
 						colors.dim(
-							"Nameserver changes can take up to 48 hours to propagate.",
+							"SSL is provisioned automatically once the CNAME propagates (usually a few minutes).",
 						),
 					);
 				}
@@ -245,11 +242,13 @@ export function registerDomainsCommands(program: Command) {
 			}
 		});
 
-	// ── Verify external domain nameservers ──
+	// ── Verify external domain CNAME / nameservers ──
 	domains
 		.command("verify")
 		.argument("<domain>", "Domain ID or domain name")
-		.description("Verify nameserver change for an external domain")
+		.description(
+			"Verify CNAME record (or nameserver change) for an external domain",
+		)
 		.action(async (domainIdentifier) => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
@@ -269,7 +268,10 @@ export function registerDomainsCommands(program: Command) {
 					throw new NotFoundError("Domain", domainIdentifier, suggestions);
 				}
 
-				updateSpinner("Verifying nameservers...");
+				const isCfSaas = !!domain.cloudflareCustomHostnameId;
+				updateSpinner(
+					isCfSaas ? "Verifying CNAME record..." : "Verifying nameservers...",
+				);
 
 				const result = await client.domainRegistrar.verifyExternalDomain.mutate(
 					{
@@ -290,12 +292,36 @@ export function registerDomainsCommands(program: Command) {
 					success(`Domain ${colors.cyan(domain.domainName)} is verified!`);
 					log("");
 					log(
-						"Nameservers are correctly configured. DNS management is now active.",
+						isCfSaas
+							? "CNAME is active and SSL is provisioned."
+							: "Nameservers are correctly configured. DNS management is now active.",
 					);
 				} else {
-					error(`Nameserver change not yet detected for ${domain.domainName}`);
+					error(
+						isCfSaas
+							? `CNAME not yet detected for ${domain.domainName}`
+							: `Nameserver change not yet detected for ${domain.domainName}`,
+					);
 					log("");
-					if (
+					if (isCfSaas && domain.cnameTarget) {
+						log("Ensure you have added a CNAME record at your DNS provider:");
+						log("");
+						log(`  Type:   ${colors.cyan("CNAME")}`);
+						log(`  Name:   ${colors.cyan("@")}`);
+						log(`  Target: ${colors.cyan(domain.cnameTarget)}`);
+						if (result.sslStatus && result.sslStatus !== "active") {
+							log("");
+							log(
+								`  SSL status: ${colors.dim(result.sslStatus.replace(/_/g, " "))}`,
+							);
+						}
+						log("");
+						log(
+							colors.dim(
+								"CNAME changes propagate in minutes. SSL is provisioned automatically.",
+							),
+						);
+					} else if (
 						domain.cloudflareNameservers &&
 						domain.cloudflareNameservers.length > 0
 					) {
@@ -304,13 +330,13 @@ export function registerDomainsCommands(program: Command) {
 						for (const ns of domain.cloudflareNameservers) {
 							log(`  ${colors.cyan(ns)}`);
 						}
+						log("");
+						log(
+							colors.dim(
+								"Nameserver changes can take up to 48 hours to propagate.",
+							),
+						);
 					}
-					log("");
-					log(
-						colors.dim(
-							"Nameserver changes can take up to 48 hours to propagate.",
-						),
-					);
 				}
 				log("");
 			} catch (err) {
@@ -710,6 +736,1482 @@ export function registerDomainsCommands(program: Command) {
 
 				log("");
 			} catch (err) {
+				handleError(err);
+			}
+		});
+	// ── Registrar readiness ──────────────────────────────────────────────────────
+	domains
+		.command("registrar-status")
+		.description("Check if the domain registrar is configured and ready")
+		.action(async () => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Checking registrar...");
+				const data = await client.domainRegistrar.registrarReadiness.query();
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const r = data as any;
+				log(
+					`Registrar ready: ${r.ready ? colors.success("yes") : colors.error("no")}`,
+				);
+				if (r.message) log(colors.dim(r.message));
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Search multiple domains ───────────────────────────────────────────────────
+	domains
+		.command("search-multiple")
+		.argument("<domains>", "Comma-separated domain names to check")
+		.description("Check availability for multiple domains at once")
+		.action(async (domainsArg: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const domainNames = domainsArg.split(",").map((d: string) => d.trim());
+				const client = getApiClient();
+				const _spinner = startSpinner("Checking availability...");
+				const results = await client.domainRegistrar.searchMultiple.query({
+					domainNames,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(results);
+					return;
+				}
+				const list = Array.isArray(results) ? results : [];
+				log("");
+				table(
+					["DOMAIN", "AVAILABLE", "PRICE"],
+					list.map((r: any) => [
+						colors.cyan(r.domainName || r.domain || "-"),
+						r.available ? colors.success("yes") : colors.dim("no"),
+						r.price ? `${r.price} SAR/yr` : "-",
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Search by keyword ─────────────────────────────────────────────────────────
+	domains
+		.command("search")
+		.argument("<keyword>", "Keyword to search domain suggestions")
+		.description("Search domain suggestions by keyword")
+		.action(async (keyword: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Searching domains...");
+				const results = await client.domainRegistrar.searchByKeyword.query({
+					keyword,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(results);
+					return;
+				}
+				const list = Array.isArray(results) ? results : [];
+				log("");
+				table(
+					["DOMAIN", "AVAILABLE", "PRICE"],
+					list.map((r: any) => [
+						colors.cyan(r.domainName || r.domain || "-"),
+						r.available ? colors.success("yes") : colors.dim("no"),
+						r.price ? `${r.price} SAR/yr` : "-",
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Get domain by ID ──────────────────────────────────────────────────────────
+	domains
+		.command("info")
+		.argument("<domain>", "Domain ID or name")
+		.description("Show registered domain details")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const data = await client.domainRegistrar.getById.query({
+					domainId: domain.domainId,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const d = data as any;
+				log("");
+				log(colors.bold(d.domainName || domainIdentifier));
+				log(`  Status:      ${formatStatus(d.status || "-")}`);
+				log(
+					`  Privacy:     ${d.privacyEnabled ? colors.success("enabled") : "disabled"}`,
+				);
+				log(`  Auto-renew:  ${d.autoRenew ? colors.success("yes") : "no"}`);
+				log(`  Locked:      ${d.locked ? colors.warn("yes") : "no"}`);
+				log(
+					`  Expires:     ${d.expiresAt ? new Date(d.expiresAt).toLocaleDateString() : "-"}`,
+				);
+				log(`  ID:          ${colors.dim(d.domainId || "-")}`);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Renew domain ──────────────────────────────────────────────────────────────
+	domains
+		.command("renew")
+		.argument("<domain>", "Domain ID or name")
+		.description("Renew a registered domain")
+		.option("-y, --years <n>", "Number of years to renew", "1")
+		.action(async (domainIdentifier: string, options: { years?: string }) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const _renewSpinner = startSpinner("Creating renewal payment...");
+				const result = await client.domainRegistrar.createRenewalPayment.mutate(
+					{
+						domainId: domain.domainId,
+						years: Number.parseInt(options.years || "1"),
+					},
+				);
+				succeedSpinner("Renewal payment created.");
+				if (isJsonMode()) {
+					outputData(result);
+					return;
+				}
+				const r = result as any;
+				log("");
+				log(colors.bold("Renewal Payment Created"));
+				if (r.checkoutUrl) log(`  Checkout: ${colors.cyan(r.checkoutUrl)}`);
+				if (r.orderId) log(`  Order ID: ${colors.dim(r.orderId)}`);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Confirm domain payment ────────────────────────────────────────────────────
+	domains
+		.command("confirm-payment")
+		.description("Confirm a domain registration or renewal payment")
+		.option("--order-id <id>", "Order ID")
+		.option("--transaction-id <id>", "Transaction ID")
+		.action(async (options: { orderId?: string; transactionId?: string }) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Confirming payment...");
+				const result = await client.domainRegistrar.confirmDomainPayment.mutate(
+					{
+						orderId: options.orderId,
+						transactionId: options.transactionId,
+					} as any,
+				);
+				succeedSpinner("Payment confirmed.");
+				if (isJsonMode()) outputData(result);
+				else {
+					log("");
+					log(colors.success("Domain payment confirmed."));
+					log("");
+				}
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Domain zone controls ──────────────────────────────────────────────────────
+	domains
+		.command("zone-controls")
+		.argument("<domain>", "Domain ID or name")
+		.description("Show zone control settings for a domain")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching zone controls...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const data = await client.domainRegistrar.getZoneControls.query({
+					domainId: domain.domainId,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const settings = Array.isArray(data)
+					? data
+					: (data as any)?.settings || [];
+				log("");
+				log(colors.bold("Zone Controls"));
+				table(
+					["SETTING", "VALUE", "ID"],
+					settings.map((s: any) => [
+						s.name || s.id || "-",
+						String(s.value ?? "-"),
+						colors.dim(s.settingId || s.id || "-"),
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Update zone setting ───────────────────────────────────────────────────────
+	domains
+		.command("zone-setting")
+		.argument("<domain>", "Domain ID or name")
+		.argument("<setting-id>", "Setting ID to update")
+		.argument("<value>", "New value")
+		.description("Update a zone control setting")
+		.action(
+			async (domainIdentifier: string, settingId: string, value: string) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const client = getApiClient();
+					const _spinner = startSpinner("Fetching domain...");
+					const allDomains: any[] = await client.domainRegistrar.getAll.query();
+					const domain = findRegisteredDomain(allDomains, domainIdentifier);
+					if (!domain) {
+						failSpinner();
+						throw new NotFoundError("Domain", domainIdentifier);
+					}
+					const _updateSpinner = startSpinner("Updating setting...");
+					await client.domainRegistrar.updateZoneSetting.mutate({
+						domainId: domain.domainId,
+						settingId,
+						value,
+					});
+					succeedSpinner("Zone setting updated.");
+					if (isJsonMode()) outputData({ updated: true, settingId, value });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	// ── DNSSEC ────────────────────────────────────────────────────────────────────
+	domains
+		.command("dnssec")
+		.argument("<domain>", "Domain ID or name")
+		.description("Enable or disable DNSSEC for a domain")
+		.option("--enable", "Enable DNSSEC")
+		.option("--disable", "Disable DNSSEC")
+		.action(
+			async (
+				domainIdentifier: string,
+				options: { enable?: boolean; disable?: boolean },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const enabled = options.enable ? true : !options.disable;
+					const client = getApiClient();
+					const _spinner = startSpinner("Fetching domain...");
+					const allDomains: any[] = await client.domainRegistrar.getAll.query();
+					const domain = findRegisteredDomain(allDomains, domainIdentifier);
+					if (!domain) {
+						failSpinner();
+						throw new NotFoundError("Domain", domainIdentifier);
+					}
+					const _dnssecSpinner = startSpinner(
+						`${enabled ? "Enabling" : "Disabling"} DNSSEC...`,
+					);
+					await client.domainRegistrar.updateDNSSEC.mutate({
+						domainId: domain.domainId,
+						enabled,
+					});
+					succeedSpinner(`DNSSEC ${enabled ? "enabled" : "disabled"}.`);
+					if (isJsonMode()) outputData({ updated: true, dnssec: enabled });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	// ── Delete registered domain ──────────────────────────────────────────────────
+	domains
+		.command("delete")
+		.argument("<domain>", "Domain ID or name")
+		.description("Delete a registered domain from the platform")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				if (!shouldSkipConfirmation()) {
+					const confirmed = await confirm(
+						`Delete domain "${domainIdentifier}"?`,
+						false,
+					);
+					if (!confirmed) {
+						log("Cancelled.");
+						return;
+					}
+				}
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const _deleteSpinner = startSpinner("Deleting domain...");
+				await client.domainRegistrar.delete.mutate({
+					domainId: domain.domainId,
+				});
+				succeedSpinner("Domain deleted.");
+				if (isJsonMode())
+					outputData({ deleted: true, domainId: domain.domainId });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Sync domain ───────────────────────────────────────────────────────────────
+	domains
+		.command("sync")
+		.argument("<domain>", "Domain ID or name")
+		.description("Sync domain status with the registrar")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const _syncSpinner = startSpinner("Syncing domain...");
+				await client.domainRegistrar.sync.mutate({ domainId: domain.domainId });
+				succeedSpinner("Domain synced.");
+				if (isJsonMode())
+					outputData({ synced: true, domainId: domain.domainId });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Toggle privacy ────────────────────────────────────────────────────────────
+	domains
+		.command("privacy")
+		.argument("<domain>", "Domain ID or name")
+		.description("Toggle WHOIS privacy for a domain")
+		.option("--enable", "Enable privacy")
+		.option("--disable", "Disable privacy")
+		.action(
+			async (
+				domainIdentifier: string,
+				options: { enable?: boolean; disable?: boolean },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const enabled = options.enable ? true : !options.disable;
+					const client = getApiClient();
+					const _spinner = startSpinner("Fetching domain...");
+					const allDomains: any[] = await client.domainRegistrar.getAll.query();
+					const domain = findRegisteredDomain(allDomains, domainIdentifier);
+					if (!domain) {
+						failSpinner();
+						throw new NotFoundError("Domain", domainIdentifier);
+					}
+					const _privacySpinner = startSpinner(
+						`${enabled ? "Enabling" : "Disabling"} privacy...`,
+					);
+					await client.domainRegistrar.togglePrivacy.mutate({
+						domainId: domain.domainId,
+						enabled,
+					});
+					succeedSpinner(`Privacy ${enabled ? "enabled" : "disabled"}.`);
+					if (isJsonMode()) outputData({ privacy: enabled });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	// ── Toggle auto-renew ─────────────────────────────────────────────────────────
+	domains
+		.command("auto-renew")
+		.argument("<domain>", "Domain ID or name")
+		.description("Toggle auto-renewal for a domain")
+		.option("--enable", "Enable auto-renewal")
+		.option("--disable", "Disable auto-renewal")
+		.action(
+			async (
+				domainIdentifier: string,
+				options: { enable?: boolean; disable?: boolean },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const enabled = options.enable ? true : !options.disable;
+					const client = getApiClient();
+					const _spinner = startSpinner("Fetching domain...");
+					const allDomains: any[] = await client.domainRegistrar.getAll.query();
+					const domain = findRegisteredDomain(allDomains, domainIdentifier);
+					if (!domain) {
+						failSpinner();
+						throw new NotFoundError("Domain", domainIdentifier);
+					}
+					await client.domainRegistrar.toggleAutoRenew.mutate({
+						domainId: domain.domainId,
+						enabled,
+					});
+					succeedSpinner(`Auto-renew ${enabled ? "enabled" : "disabled"}.`);
+					if (isJsonMode()) outputData({ autoRenew: enabled });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	// ── Transfer out ──────────────────────────────────────────────────────────────
+	domains
+		.command("transfer-out")
+		.argument("<domain>", "Domain ID or name")
+		.description("Request a transfer-out to another registrar")
+		.option("--registrar <name>", "Target registrar")
+		.option("--email <email>", "Account email at target registrar")
+		.action(
+			async (
+				domainIdentifier: string,
+				options: { registrar?: string; email?: string },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const client = getApiClient();
+					const _spinner = startSpinner("Fetching domain...");
+					const allDomains: any[] = await client.domainRegistrar.getAll.query();
+					const domain = findRegisteredDomain(allDomains, domainIdentifier);
+					if (!domain) {
+						failSpinner();
+						throw new NotFoundError("Domain", domainIdentifier);
+					}
+					const targetRegistrar =
+						options.registrar || (await input("Target registrar name:"));
+					const _transferSpinner = startSpinner("Requesting transfer out...");
+					await client.domainRegistrar.requestTransferOut.mutate({
+						domainId: domain.domainId,
+						targetRegistrar,
+						accountEmail: options.email,
+					});
+					succeedSpinner("Transfer out requested.");
+					if (isJsonMode())
+						outputData({ requested: true, domainId: domain.domainId });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	// ── Toggle lock ────────────────────────────────────────────────────────────────
+	domains
+		.command("lock")
+		.argument("<domain>", "Domain ID or name")
+		.description("Toggle transfer lock for a domain")
+		.option("--enable", "Enable transfer lock")
+		.option("--disable", "Disable transfer lock")
+		.action(
+			async (
+				domainIdentifier: string,
+				options: { enable?: boolean; disable?: boolean },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const locked = options.enable ? true : !options.disable;
+					const client = getApiClient();
+					const _spinner = startSpinner("Fetching domain...");
+					const allDomains: any[] = await client.domainRegistrar.getAll.query();
+					const domain = findRegisteredDomain(allDomains, domainIdentifier);
+					if (!domain) {
+						failSpinner();
+						throw new NotFoundError("Domain", domainIdentifier);
+					}
+					await client.domainRegistrar.toggleLock.mutate({
+						domainId: domain.domainId,
+						locked,
+					});
+					succeedSpinner(`Transfer lock ${locked ? "enabled" : "disabled"}.`);
+					if (isJsonMode()) outputData({ locked });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	// ── Get auth code ─────────────────────────────────────────────────────────────
+	domains
+		.command("auth-code")
+		.argument("<domain>", "Domain ID or name")
+		.description("Get the EPP/authorization code for domain transfer")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const data = await client.domainRegistrar.getAuthCode.query({
+					domainId: domain.domainId,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const r = data as any;
+				log("");
+				log(colors.bold("Authorization Code"));
+				log(`  Code: ${colors.cyan(r.authCode || r.code || String(data))}`);
+				log(
+					colors.dim("Use this code when transferring to another registrar."),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Set nameservers ───────────────────────────────────────────────────────────
+	domains
+		.command("set-nameservers")
+		.argument("<domain>", "Domain ID or name")
+		.argument("<nameservers>", "Comma-separated nameserver list")
+		.description("Set custom nameservers for a domain")
+		.action(async (domainIdentifier: string, nameserversArg: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const nameservers = nameserversArg
+					.split(",")
+					.map((ns: string) => ns.trim());
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const _nsSpinner = startSpinner("Setting nameservers...");
+				await client.domainRegistrar.setNameservers.mutate({
+					domainId: domain.domainId,
+					nameservers,
+				});
+				succeedSpinner("Nameservers updated.");
+				if (isJsonMode()) outputData({ updated: true, nameservers });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── SSL status ────────────────────────────────────────────────────────────────
+	domains
+		.command("ssl")
+		.argument("<domain>", "Domain ID or name")
+		.description("Check SSL certificate status for a registered domain")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const data = await client.domainRegistrar.getSSLStatus.query({
+					domainId: domain.domainId,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const s = data as any;
+				log("");
+				log(colors.bold("SSL Certificate Status"));
+				log(
+					`  Status: ${s.valid || s.status === "active" ? colors.success("valid") : colors.error("invalid/missing")}`,
+				);
+				if (s.expiresAt)
+					log(`  Expires: ${new Date(s.expiresAt).toLocaleDateString()}`);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Retry SSL ─────────────────────────────────────────────────────────────────
+	domains
+		.command("retry-ssl")
+		.argument("<domain>", "Domain ID or name")
+		.description("Retry SSL certificate issuance for a domain")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const _retrySpinner = startSpinner("Retrying SSL...");
+				await client.domainRegistrar.retrySSL.mutate({
+					domainId: domain.domainId,
+				});
+				succeedSpinner("SSL retry initiated.");
+				if (isJsonMode()) outputData({ retried: true });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Transaction history ────────────────────────────────────────────────────────
+	domains
+		.command("transactions")
+		.argument("<domain>", "Domain ID or name")
+		.description("Show payment transaction history for a domain")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const data = await client.domainRegistrar.transactionHistory.query({
+					domainId: domain.domainId,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const list = Array.isArray(data) ? data : [];
+				if (list.length === 0) {
+					log("No transactions found.");
+					return;
+				}
+				log("");
+				table(
+					["DATE", "TYPE", "AMOUNT", "STATUS"],
+					list.map((t: any) => [
+						t.createdAt ? new Date(t.createdAt).toLocaleDateString() : "-",
+						t.type || "-",
+						t.amount ? `${t.amount} SAR` : "-",
+						t.status || "-",
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── Registrar firewall rules ───────────────────────────────────────────────────
+	const registrarFw = domains
+		.command("firewall")
+		.description("Manage domain Cloudflare firewall rules");
+
+	registrarFw
+		.command("list")
+		.argument("<domain>", "Domain ID or name")
+		.description("List firewall rules for a domain")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const zoneData = await client.domainRegistrar.getZoneControls.query({
+					domainId: domain.domainId,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(zoneData);
+					return;
+				}
+				const rules = (zoneData as any)?.firewallRules || [];
+				if (rules.length === 0) {
+					log("No firewall rules found.");
+					return;
+				}
+				log("");
+				table(
+					["NAME", "ACTION", "ENABLED", "ID"],
+					rules.map((r: any) => [
+						r.name || "-",
+						r.action || "-",
+						r.enabled ? colors.success("yes") : "no",
+						colors.dim(r.ruleId || r.id || "-"),
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	registrarFw
+		.command("add")
+		.argument("<domain>", "Domain ID or name")
+		.description("Add a Cloudflare firewall rule to a domain")
+		.option("-n, --name <name>", "Rule name")
+		.option("-e, --expression <expr>", "Firewall expression")
+		.option(
+			"-a, --action <action>",
+			"Action (block, allow, challenge)",
+			"block",
+		)
+		.action(
+			async (
+				domainIdentifier: string,
+				options: { name?: string; expression?: string; action?: string },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const client = getApiClient();
+					const _spinner = startSpinner("Fetching domain...");
+					const allDomains: any[] = await client.domainRegistrar.getAll.query();
+					const domain = findRegisteredDomain(allDomains, domainIdentifier);
+					if (!domain) {
+						failSpinner();
+						throw new NotFoundError("Domain", domainIdentifier);
+					}
+					const name = options.name || (await input("Rule name:"));
+					const expression =
+						options.expression || (await input("Firewall expression:"));
+					const action = options.action || "block";
+					const _createSpinner = startSpinner("Creating firewall rule...");
+					const result = await client.domainRegistrar.createFirewallRule.mutate(
+						{
+							domainId: domain.domainId,
+							name,
+							expression,
+							action,
+							enabled: true,
+						},
+					);
+					succeedSpinner("Firewall rule created.");
+					if (isJsonMode()) outputData(result);
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	registrarFw
+		.command("update <rule-id>")
+		.argument("<domain>", "Domain ID or name")
+		.description("Update a Cloudflare firewall rule")
+		.option("-n, --name <name>", "New name")
+		.option("-e, --expression <expr>", "New expression")
+		.option("-a, --action <action>", "New action")
+		.option("--enable", "Enable the rule")
+		.option("--disable", "Disable the rule")
+		.action(async (ruleId: string, domainIdentifier: string, options: any) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const enabled = options.enable
+					? true
+					: options.disable
+						? false
+						: undefined;
+				const _updateSpinner = startSpinner("Updating firewall rule...");
+				await client.domainRegistrar.updateFirewallRule.mutate({
+					domainId: domain.domainId,
+					ruleId,
+					name: options.name,
+					expression: options.expression,
+					action: options.action,
+					enabled,
+				} as any);
+				succeedSpinner("Firewall rule updated.");
+				if (isJsonMode()) outputData({ updated: true, ruleId });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	registrarFw
+		.command("delete <rule-id>")
+		.argument("<domain>", "Domain ID or name")
+		.description("Delete a Cloudflare firewall rule")
+		.action(async (ruleId: string, domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const _deleteSpinner = startSpinner("Deleting firewall rule...");
+				await client.domainRegistrar.deleteFirewallRule.mutate({
+					domainId: domain.domainId,
+					ruleId,
+				});
+				succeedSpinner("Firewall rule deleted.");
+				if (isJsonMode()) outputData({ deleted: true, ruleId });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── DNS update, getById, sync, setupCommonRecords, updateNameservers, checkPropagation ──
+	// Extend the existing dns subgroup:
+	const dnsCmd = domains
+		.command("dns-ext")
+		.description("Extended DNS operations");
+
+	dnsCmd
+		.command("update <record-id>")
+		.description("Update a DNS record")
+		.option("--name <name>", "Record name")
+		.option("--content <content>", "Record content/value")
+		.option("--ttl <seconds>", "TTL in seconds")
+		.action(
+			async (
+				recordId: string,
+				options: { name?: string; content?: string; ttl?: string },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const client = getApiClient();
+					const _spinner = startSpinner("Updating DNS record...");
+					await client.dns.update.mutate({
+						recordId,
+						name: options.name,
+						value: options.content,
+						ttl: options.ttl ? Number.parseInt(options.ttl) : undefined,
+					} as any);
+					succeedSpinner("DNS record updated.");
+					if (isJsonMode()) outputData({ updated: true, recordId });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	dnsCmd
+		.command("get <record-id>")
+		.description("Show a specific DNS record")
+		.action(async (recordId: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching record...");
+				const data = await client.dns.getById.query({ recordId });
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const r = data as any;
+				log("");
+				log(colors.bold(r.name || recordId));
+				log(`  Type:    ${colors.cyan(r.type || "-")}`);
+				log(`  Content: ${r.content || r.value || "-"}`);
+				log(`  TTL:     ${r.ttl || "-"}`);
+				log(`  ID:      ${colors.dim(r.id || r.recordId || "-")}`);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	dnsCmd
+		.command("sync <domain>")
+		.description("Sync DNS records with the provider for a domain")
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const _syncSpinner = startSpinner("Syncing DNS...");
+				await client.dns.sync.mutate({ registeredDomainId: domain.domainId });
+				succeedSpinner("DNS synced.");
+				if (isJsonMode()) outputData({ synced: true });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	dnsCmd
+		.command("setup-records <domain>")
+		.description("Setup common DNS records (A, MX, etc.) for a domain")
+		.option("--ip <ip>", "IP address for A records")
+		.action(async (domainIdentifier: string, options: { ip?: string }) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const ipAddress = options.ip || (await input("IP address:"));
+				const _setupSpinner = startSpinner("Setting up DNS records...");
+				await client.dns.setupCommonRecords.mutate({
+					registeredDomainId: domain.domainId,
+					ipAddress,
+				});
+				succeedSpinner("Common DNS records created.");
+				if (isJsonMode()) outputData({ setup: true });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	dnsCmd
+		.command("update-nameservers <domain>")
+		.argument("<nameservers>", "Comma-separated nameservers")
+		.description("Update nameservers for a domain via DNS")
+		.action(async (domainIdentifier: string, nameserversArg: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const nameservers = nameserversArg
+					.split(",")
+					.map((ns: string) => ns.trim());
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const allDomains: any[] = await client.domainRegistrar.getAll.query();
+				const domain = findRegisteredDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					throw new NotFoundError("Domain", domainIdentifier);
+				}
+				const _nsSpinner = startSpinner("Updating nameservers...");
+				await client.dns.updateNameservers.mutate({
+					domainId: domain.domainId,
+					nameservers,
+				});
+				succeedSpinner("Nameservers updated.");
+				if (isJsonMode()) outputData({ updated: true, nameservers });
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	dnsCmd
+		.command("propagation <record-id>")
+		.description("Check DNS propagation for a specific record")
+		.action(async (recordId: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Checking propagation...");
+				const data = await client.dns.checkPropagation.query({ recordId });
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const r = data as any;
+				log("");
+				log(colors.bold("DNS Propagation Status"));
+				log(
+					`  Propagated: ${r.propagated ? colors.success("yes") : colors.warn("no (still propagating)")}`,
+				);
+				if (r.regions) {
+					for (const [region, status] of Object.entries(r.regions)) {
+						log(
+							`  ${region}: ${status === "propagated" ? colors.success("✓") : colors.dim("○")}`,
+						);
+					}
+				}
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	// ── App domain management ──────────────────────────────────────────────────────
+	const appDomains = domains
+		.command("app")
+		.description("Manage app-level custom domains");
+
+	appDomains
+		.command("list")
+		.description("List all app domains in the organization")
+		.option("--unlinked", "Include unlinked domains")
+		.action(async (options: { unlinked?: boolean }) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domains...");
+				const data = await client.domain.all.query({
+					includeUnlinked: options.unlinked || false,
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const list = Array.isArray(data) ? data : [];
+				if (list.length === 0) {
+					log("No domains found.");
+					return;
+				}
+				log("");
+				table(
+					["HOST", "APP", "HTTPS", "STATUS", "ID"],
+					list.map((d: any) => [
+						colors.cyan(d.host || "-"),
+						d.applicationId || d.application?.name || "-",
+						d.https ? colors.success("yes") : "no",
+						d.status || "-",
+						colors.dim(d.domainId || d.id || "-"),
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	appDomains
+		.command("get <domain-id>")
+		.description("Show a specific app domain")
+		.action(async (domainId: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domain...");
+				const data = await client.domain.one.query({ domainId });
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const d = data as any;
+				log("");
+				log(colors.bold(d.host || domainId));
+				log(`  App:     ${d.applicationId || "-"}`);
+				log(`  Port:    ${d.port || "-"}`);
+				log(`  HTTPS:   ${d.https ? colors.success("yes") : "no"}`);
+				log(`  Status:  ${d.status || "-"}`);
+				log(`  ID:      ${colors.dim(d.domainId || d.id || "-")}`);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	appDomains
+		.command("update <domain-id>")
+		.description("Update an app domain")
+		.option("--host <host>", "New hostname")
+		.option("--port <port>", "New port")
+		.option("--https", "Enable HTTPS")
+		.option("--no-https", "Disable HTTPS")
+		.action(
+			async (
+				domainId: string,
+				options: { host?: string; port?: string; https?: boolean },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const client = getApiClient();
+					const _spinner = startSpinner("Updating domain...");
+					await client.domain.update.mutate({
+						domainId,
+						host: options.host,
+						port: options.port ? Number.parseInt(options.port) : undefined,
+						https: options.https,
+					} as any);
+					succeedSpinner("Domain updated.");
+					if (isJsonMode()) outputData({ updated: true, domainId });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	appDomains
+		.command("validate <hostname>")
+		.description("Validate a domain hostname")
+		.option("--ip <ip>", "Server IP to validate against")
+		.option("--domain-id <id>", "Existing domain ID to re-validate")
+		.action(
+			async (domain: string, options: { ip?: string; domainId?: string }) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const client = getApiClient();
+					const _spinner = startSpinner("Validating domain...");
+					const result = await client.domain.validateDomain.mutate({
+						domain,
+						serverIp: options.ip,
+						domainId: options.domainId,
+					} as any);
+					succeedSpinner();
+					if (isJsonMode()) {
+						outputData(result);
+						return;
+					}
+					const r = result as any;
+					const valid = r.valid ?? r.isValid ?? true;
+					log(
+						`Domain "${domain}": ${valid ? colors.success("valid") : colors.error("invalid")}`,
+					);
+					if (r.message) log(colors.dim(r.message));
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	appDomains
+		.command("link-registered")
+		.description("Create an app domain from a registered domain")
+		.option("--registered-domain <id>", "Registered domain ID")
+		.option("--subdomain <subdomain>", "Subdomain (e.g. 'www', 'app')")
+		.option("--app <app-id>", "Application ID")
+		.action(
+			async (options: {
+				registeredDomain?: string;
+				subdomain?: string;
+				app?: string;
+			}) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const registeredDomainId =
+						options.registeredDomain || (await input("Registered domain ID:"));
+					const subdomain =
+						options.subdomain || (await input("Subdomain (e.g. www):"));
+					const applicationId = options.app || (await input("Application ID:"));
+					const client = getApiClient();
+					const _spinner = startSpinner("Creating domain...");
+					const result = await client.domain.createWithRegisteredDomain.mutate({
+						registeredDomainId,
+						subdomain,
+						applicationId,
+					} as any);
+					succeedSpinner("Domain created.");
+					if (isJsonMode()) outputData(result);
+					else quietOutput((result as any).domainId || "created");
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	appDomains
+		.command("available-registered")
+		.description("List registered domains available to use for apps")
+		.action(async () => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching registered domains...");
+				const data = await client.domain.getAvailableRegisteredDomains.query();
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const list = Array.isArray(data) ? data : [];
+				if (list.length === 0) {
+					log("No registered domains available.");
+					return;
+				}
+				log("");
+				table(
+					["DOMAIN", "STATUS", "ID"],
+					list.map((d: any) => [
+						colors.cyan(d.domainName || d.name || "-"),
+						d.status || "-",
+						colors.dim(d.domainId || d.id || "-"),
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	appDomains
+		.command("server-ip")
+		.argument("<app-id>", "Application ID")
+		.description("Get the server IP for a deployed application")
+		.action(async (applicationId: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching server IP...");
+				const data = await client.domain.getServerIP.query({ applicationId });
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const r = data as any;
+				log(`Server IP: ${colors.cyan(r.ip || String(data))}`);
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	appDomains
+		.command("setup-instructions <domain-id>")
+		.description("Get DNS setup instructions for an app domain")
+		.action(async (domainId: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching instructions...");
+				const data = await client.domain.getSetupInstructions.query({
+					domainId,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const r = data as any;
+				log("");
+				log(colors.bold("DNS Setup Instructions"));
+				if (r.records) {
+					table(
+						["TYPE", "NAME", "VALUE"],
+						(r.records as any[]).map((rec: any) => [
+							colors.cyan(rec.type || "-"),
+							rec.name || "@",
+							(rec.value || rec.content || "-").slice(0, 60),
+						]),
+					);
+				} else {
+					log(JSON.stringify(r, null, 2));
+				}
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	appDomains
+		.command("by-app <app-id>")
+		.description("List all domains linked to an application")
+		.action(async (applicationId: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching domains...");
+				const data = await client.domain.byApplicationId.query({
+					applicationId,
+				});
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const list = Array.isArray(data) ? data : [];
+				if (list.length === 0) {
+					log("No domains linked to this application.");
+					return;
+				}
+				log("");
+				table(
+					["HOST", "HTTPS", "STATUS", "ID"],
+					list.map((d: any) => [
+						colors.cyan(d.host || "-"),
+						d.https ? colors.success("yes") : "no",
+						d.status || "-",
+						colors.dim(d.domainId || d.id || "-"),
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	appDomains
+		.command("available")
+		.description("List available (unlinked) domains")
+		.action(async () => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching available domains...");
+				const data = await client.domain.getAvailable.query();
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const list = Array.isArray(data) ? data : [];
+				if (list.length === 0) {
+					log("No available domains.");
+					return;
+				}
+				log("");
+				table(
+					["HOST", "HTTPS", "ID"],
+					list.map((d: any) => [
+						colors.cyan(d.host || "-"),
+						d.https ? colors.success("yes") : "no",
+						colors.dim(d.domainId || d.id || "-"),
+					]),
+				);
+				log("");
+			} catch (err) {
+				failSpinner();
+				handleError(err);
+			}
+		});
+
+	appDomains
+		.command("link-to-app")
+		.description("Link an existing domain to an application")
+		.option("--domain-id <id>", "Domain ID")
+		.option("--app-id <id>", "Application ID")
+		.option("--force", "Force link even if already linked")
+		.action(
+			async (options: {
+				domainId?: string;
+				appId?: string;
+				force?: boolean;
+			}) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const domainId = options.domainId || (await input("Domain ID:"));
+					const applicationId =
+						options.appId || (await input("Application ID:"));
+					const client = getApiClient();
+					const _spinner = startSpinner("Linking domain...");
+					await client.domain.linkToApplication.mutate({
+						domainId,
+						applicationId,
+						force: options.force,
+					} as any);
+					succeedSpinner("Domain linked to application.");
+					if (isJsonMode())
+						outputData({ linked: true, domainId, applicationId });
+				} catch (err) {
+					failSpinner();
+					handleError(err);
+				}
+			},
+		);
+
+	appDomains
+		.command("unlink-from-app")
+		.argument("<domain-id>", "Domain ID to unlink")
+		.description("Unlink a domain from its application")
+		.action(async (domainId: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Unlinking domain...");
+				await client.domain.unlinkFromApplication.mutate({ domainId });
+				succeedSpinner("Domain unlinked.");
+				if (isJsonMode()) outputData({ unlinked: true, domainId });
+			} catch (err) {
+				failSpinner();
 				handleError(err);
 			}
 		});

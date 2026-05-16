@@ -650,6 +650,65 @@ export function registerDeployCommands(program: Command) {
 				handleError(err);
 			}
 		});
+
+	// List deployments filtered by type
+	program
+		.command("deploy:list-by-type")
+		.argument("<app>", "App ID or name")
+		.argument("<type>", "Deployment type: git, upload, docker")
+		.option("-n, --limit <n>", "Number of deployments", "20")
+		.description("List deployments filtered by source type")
+		.action(async (appIdentifier, type, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching apps...");
+				const apps = await client.application.allByOrganization.query();
+				const appList = Array.isArray(apps)
+					? apps
+					: (apps as any)?.applications || [];
+				const app = findApp(appList, appIdentifier);
+				if (!app) {
+					failSpinner();
+					throw new NotFoundError("Application", appIdentifier);
+				}
+				const _depSpinner = startSpinner("Fetching deployments...");
+				const result = await client.deployment.allByType.query({
+					applicationId: app.applicationId,
+					type,
+					limit: Number.parseInt(options.limit || "20"),
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(result);
+					return;
+				}
+				const list = Array.isArray(result)
+					? result
+					: (result as any)?.deployments || [];
+				if (!list.length) {
+					log(`\nNo ${type} deployments found.\n`);
+					return;
+				}
+				log("");
+				table(
+					["ID", "STATUS", "BRANCH", "CREATED"],
+					list.map((d: any) => [
+						colors.cyan((d.deploymentId || d.id || "").slice(0, 8)),
+						d.status === "done"
+							? colors.success(d.status)
+							: d.status === "error"
+								? colors.error(d.status)
+								: colors.warn(d.status || "-"),
+						d.buildSourceBranch || d.branch || "-",
+						d.createdAt ? new Date(d.createdAt).toLocaleDateString() : "-",
+					]),
+				);
+				log("");
+			} catch (err) {
+				handleError(err);
+			}
+		});
 }
 
 // Register logs command separately

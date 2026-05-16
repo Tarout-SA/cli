@@ -374,6 +374,180 @@ export function registerDbCommands(program: Command) {
 			}
 		});
 
+	// Restart database
+	db.command("restart")
+		.argument("<db>", "Database ID or name")
+		.description("Restart a database")
+		.action(async (dbIdentifier) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+
+				const client = getApiClient();
+
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbInfo = findDatabase(allDbs, dbIdentifier);
+
+				if (!dbInfo) {
+					failSpinner();
+					const suggestions = findSimilar(
+						dbIdentifier,
+						allDbs.map((d) => d.name),
+					);
+					throw new NotFoundError("Database", dbIdentifier, suggestions);
+				}
+
+				const _restartSpinner = startSpinner(`Restarting ${dbInfo.name}...`);
+
+				switch (dbInfo.type) {
+					case "postgres":
+						await client.postgres.restart.mutate({ postgresId: dbInfo.id });
+						break;
+					case "mysql":
+						await client.mysql.restart.mutate({ mysqlId: dbInfo.id });
+						break;
+				}
+
+				succeedSpinner(`${dbInfo.name} restarting`);
+
+				if (isJsonMode()) {
+					outputData({ restarted: true, id: dbInfo.id });
+				}
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Stop database
+	db.command("stop")
+		.argument("<db>", "Database ID or name")
+		.description("Stop a database")
+		.action(async (dbIdentifier) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+
+				const client = getApiClient();
+
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbInfo = findDatabase(allDbs, dbIdentifier);
+
+				if (!dbInfo) {
+					failSpinner();
+					const suggestions = findSimilar(
+						dbIdentifier,
+						allDbs.map((d) => d.name),
+					);
+					throw new NotFoundError("Database", dbIdentifier, suggestions);
+				}
+
+				if (!shouldSkipConfirmation()) {
+					const confirmed = await confirm(
+						`Stop database "${dbInfo.name}"?`,
+						false,
+					);
+					if (!confirmed) {
+						log("Cancelled.");
+						return;
+					}
+				}
+
+				const _stopSpinner = startSpinner(`Stopping ${dbInfo.name}...`);
+
+				switch (dbInfo.type) {
+					case "postgres":
+						await client.postgres.stop.mutate({ postgresId: dbInfo.id });
+						break;
+					case "mysql":
+						await client.mysql.stop.mutate({ mysqlId: dbInfo.id });
+						break;
+				}
+
+				succeedSpinner(`${dbInfo.name} stopped`);
+
+				if (isJsonMode()) {
+					outputData({ stopped: true, id: dbInfo.id });
+				}
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// List database backups
+	db.command("backups")
+		.argument("<db>", "Database ID or name")
+		.description("List database backups")
+		.action(async (dbIdentifier) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+
+				const client = getApiClient();
+
+				const _spinner = startSpinner("Fetching backups...");
+				const allDbs = await getAllDatabases(client);
+				const dbInfo = findDatabase(allDbs, dbIdentifier);
+
+				if (!dbInfo) {
+					failSpinner();
+					const suggestions = findSimilar(
+						dbIdentifier,
+						allDbs.map((d) => d.name),
+					);
+					throw new NotFoundError("Database", dbIdentifier, suggestions);
+				}
+
+				let backups: any[] = [];
+				switch (dbInfo.type) {
+					case "postgres":
+						backups = await client.postgres.getBackups.query({
+							postgresId: dbInfo.id,
+						});
+						break;
+					case "mysql":
+						backups = await client.mysql.getBackups.query({
+							mysqlId: dbInfo.id,
+						});
+						break;
+				}
+
+				succeedSpinner();
+
+				if (isJsonMode()) {
+					outputData(backups);
+					return;
+				}
+
+				if (!backups || backups.length === 0) {
+					log("");
+					log(`No backups found for ${colors.cyan(dbInfo.name)}.`);
+					return;
+				}
+
+				log("");
+				log(`Backups for ${colors.cyan(dbInfo.name)}:`);
+				log("");
+				table(
+					["ID", "STATUS", "SIZE", "CREATED"],
+					backups.map((b: any) => [
+						colors.cyan((b.backupId || b.id || "").slice(0, 8)),
+						b.status || colors.dim("-"),
+						b.sizeBytes
+							? `${(b.sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+							: colors.dim("-"),
+						formatDate(b.createdAt),
+					]),
+				);
+				log("");
+				log(
+					colors.dim(
+						`${backups.length} backup${backups.length === 1 ? "" : "s"}`,
+					),
+				);
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
 	// Connect to database shell
 	db.command("connect")
 		.argument("<db>", "Database ID or name")
@@ -445,6 +619,479 @@ export function registerDbCommands(program: Command) {
 				child.on("exit", (code) => {
 					process.exit(code || 0);
 				});
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Update database ──────────────────────────────────────────────────────────
+	db.command("update")
+		.argument("<db>", "Database ID or name")
+		.description("Update database settings")
+		.option("-n, --name <name>", "New name")
+		.option("--description <text>", "New description")
+		.action(async (dbIdentifier, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				const _updateSpinner = startSpinner("Updating database...");
+				if (dbSummary.type === "postgres") {
+					await client.postgres.update.mutate({
+						postgresId: dbSummary.id,
+						name: options.name,
+						description: options.description,
+					} as any);
+				} else {
+					await client.mysql.update.mutate({
+						mysqlId: dbSummary.id,
+						name: options.name,
+						description: options.description,
+					} as any);
+				}
+				succeedSpinner("Database updated.");
+				if (isJsonMode()) outputData({ updated: true, id: dbSummary.id });
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Reactivate database ──────────────────────────────────────────────────────
+	db.command("reactivate")
+		.argument("<db>", "Database ID or name")
+		.description("Reactivate a suspended database")
+		.action(async (dbIdentifier) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				const _reactivateSpinner = startSpinner("Reactivating database...");
+				if (dbSummary.type === "postgres") {
+					await client.postgres.reactivate.mutate({
+						postgresId: dbSummary.id,
+					} as any);
+				} else {
+					await client.mysql.reactivate.mutate({
+						mysqlId: dbSummary.id,
+					} as any);
+				}
+				succeedSpinner("Database reactivated.");
+				if (isJsonMode()) outputData({ reactivated: true, id: dbSummary.id });
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Upgrade database ─────────────────────────────────────────────────────────
+	db.command("upgrade")
+		.argument("<db>", "Database ID or name")
+		.description("Upgrade database to a higher plan")
+		.option("--plan <plan>", "Target plan (standard, pro)")
+		.action(async (dbIdentifier, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				const targetPlan = options.plan || (await input("Target plan:"));
+				const _upgradeSpinner = startSpinner(`Upgrading to ${targetPlan}...`);
+				if (dbSummary.type === "postgres") {
+					await client.postgres.upgrade.mutate({
+						postgresId: dbSummary.id,
+						targetPlan,
+					} as any);
+				} else {
+					await client.mysql.upgrade.mutate({
+						mysqlId: dbSummary.id,
+						targetPlan,
+					} as any);
+				}
+				succeedSpinner(`Database upgraded to ${targetPlan}.`);
+				if (isJsonMode())
+					outputData({ upgraded: true, id: dbSummary.id, targetPlan });
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Attach to application ────────────────────────────────────────────────────
+	db.command("attach")
+		.argument("<db>", "Database ID or name")
+		.argument("<app-id>", "Application ID")
+		.description("Attach database to an application")
+		.action(async (dbIdentifier, applicationId) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				const _attachSpinner = startSpinner("Attaching database...");
+				if (dbSummary.type === "postgres") {
+					await client.postgres.attachToApplication.mutate({
+						postgresId: dbSummary.id,
+						applicationId,
+					} as any);
+				} else {
+					await client.mysql.attachToApplication.mutate({
+						mysqlId: dbSummary.id,
+						applicationId,
+					} as any);
+				}
+				succeedSpinner("Database attached to application.");
+				if (isJsonMode())
+					outputData({ attached: true, id: dbSummary.id, applicationId });
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Detach from application ──────────────────────────────────────────────────
+	db.command("detach")
+		.argument("<db>", "Database ID or name")
+		.argument("<app-id>", "Application ID")
+		.description("Detach database from an application")
+		.action(async (dbIdentifier, applicationId) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				const _detachSpinner = startSpinner("Detaching database...");
+				if (dbSummary.type === "postgres") {
+					await client.postgres.detachFromApplication.mutate({
+						postgresId: dbSummary.id,
+						applicationId,
+					} as any);
+				} else {
+					await client.mysql.detachFromApplication.mutate({
+						mysqlId: dbSummary.id,
+						applicationId,
+					} as any);
+				}
+				succeedSpinner("Database detached from application.");
+				if (isJsonMode())
+					outputData({ detached: true, id: dbSummary.id, applicationId });
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── External access (Postgres) ────────────────────────────────────────────────
+	db.command("external-access")
+		.argument("<db>", "Postgres database ID or name")
+		.description("Configure external access CIDRs (Postgres only)")
+		.option("--enable", "Enable external access")
+		.option("--disable", "Disable external access")
+		.option("--cidrs <list>", "Comma-separated list of allowed CIDRs")
+		.action(async (dbIdentifier, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				if (dbSummary.type !== "postgres") {
+					throw new CliError(
+						"External access is only supported for PostgreSQL databases.",
+						ExitCode.INVALID_ARGUMENTS,
+					);
+				}
+				const enabled = options.enable ? true : !options.disable;
+				const allowedCidrs = options.cidrs
+					? options.cidrs.split(",").map((c: string) => c.trim())
+					: undefined;
+				const _updateSpinner = startSpinner("Updating external access...");
+				await client.postgres.updateExternalAccess.mutate({
+					postgresId: dbSummary.id,
+					enabled,
+					allowedCidrs,
+				} as any);
+				succeedSpinner("External access updated.");
+				if (isJsonMode())
+					outputData({ updated: true, id: dbSummary.id, enabled });
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── List tables (Postgres) ────────────────────────────────────────────────────
+	db.command("tables")
+		.argument("<db>", "Postgres database ID or name")
+		.description("List tables in a PostgreSQL database")
+		.action(async (dbIdentifier) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				if (dbSummary.type !== "postgres") {
+					throw new CliError(
+						"Table listing is only supported for PostgreSQL databases.",
+						ExitCode.INVALID_ARGUMENTS,
+					);
+				}
+				const _tablesSpinner = startSpinner("Fetching tables...");
+				const tables = await client.postgres.listTables.query({
+					postgresId: dbSummary.id,
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(tables);
+					return;
+				}
+				const list = Array.isArray(tables) ? tables : [];
+				if (list.length === 0) {
+					log("No tables found.");
+					return;
+				}
+				log("");
+				table(
+					["SCHEMA", "TABLE", "ROWS"],
+					list.map((t: any) => [
+						t.schema || "public",
+						colors.cyan(t.name || t.table || "-"),
+						String(t.rowCount || t.rows || "-"),
+					]),
+				);
+				log("");
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Preview table (Postgres) ──────────────────────────────────────────────────
+	db.command("preview")
+		.argument("<db>", "Postgres database ID or name")
+		.argument("<table>", "Table name")
+		.description("Preview rows from a PostgreSQL table")
+		.option("--schema <schema>", "Schema name", "public")
+		.option("-n, --limit <n>", "Number of rows to preview", "20")
+		.action(async (dbIdentifier, tableName, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				if (dbSummary.type !== "postgres") {
+					throw new CliError(
+						"Table preview is only supported for PostgreSQL databases.",
+						ExitCode.INVALID_ARGUMENTS,
+					);
+				}
+				const _previewSpinner = startSpinner(`Previewing ${tableName}...`);
+				const result = await client.postgres.previewTable.mutate({
+					postgresId: dbSummary.id,
+					schema: options.schema || "public",
+					table: tableName,
+					limit: Number.parseInt(options.limit || "20"),
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(result);
+					return;
+				}
+				const rows = Array.isArray(result)
+					? result
+					: (result as any)?.rows || [];
+				if (rows.length === 0) {
+					log("No rows found.");
+					return;
+				}
+				const cols = Object.keys(rows[0]);
+				log("");
+				table(
+					cols,
+					rows.map((row: any) =>
+						cols.map((c) => String(row[c] ?? "-").slice(0, 30)),
+					),
+				);
+				log("");
+				log(colors.dim(`${rows.length} row${rows.length === 1 ? "" : "s"}`));
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Execute SQL (Postgres) ─────────────────────────────────────────────────────
+	db.command("sql")
+		.argument("<db>", "Postgres database ID or name")
+		.argument("<query>", "SQL query to execute")
+		.description("Execute a SQL query on a PostgreSQL database")
+		.action(async (dbIdentifier, sql) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				if (dbSummary.type !== "postgres") {
+					throw new CliError(
+						"SQL execution is only supported for PostgreSQL databases.",
+						ExitCode.INVALID_ARGUMENTS,
+					);
+				}
+				const _sqlSpinner = startSpinner("Executing SQL...");
+				const result = await client.postgres.executeSql.mutate({
+					postgresId: dbSummary.id,
+					sql,
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(result);
+					return;
+				}
+				const rows = Array.isArray(result)
+					? result
+					: (result as any)?.rows || [];
+				if (rows.length === 0) {
+					log("Query executed (no rows returned).");
+					return;
+				}
+				const cols = Object.keys(rows[0]);
+				log("");
+				table(
+					cols,
+					rows.map((row: any) =>
+						cols.map((c) => String(row[c] ?? "NULL").slice(0, 40)),
+					),
+				);
+				log("");
+				log(colors.dim(`${rows.length} row${rows.length === 1 ? "" : "s"}`));
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Analytics (Postgres) ──────────────────────────────────────────────────────
+	db.command("analytics")
+		.argument("<db>", "Postgres database ID or name")
+		.description("Show analytics and metrics for a PostgreSQL database")
+		.action(async (dbIdentifier) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				if (dbSummary.type !== "postgres") {
+					throw new CliError(
+						"Analytics are only available for PostgreSQL databases.",
+						ExitCode.INVALID_ARGUMENTS,
+					);
+				}
+				const _analyticsSpinner = startSpinner("Fetching analytics...");
+				const data = await client.postgres.getAnalytics.query({
+					postgresId: dbSummary.id,
+				} as any);
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const d = data as any;
+				log("");
+				log(colors.bold("Database Analytics"));
+				if (d.connections !== undefined)
+					log(`  Connections:     ${colors.cyan(String(d.connections))}`);
+				if (d.dbSize) log(`  Size:            ${d.dbSize}`);
+				if (d.cacheHitRatio !== undefined)
+					log(`  Cache Hit Ratio: ${d.cacheHitRatio}%`);
+				log("");
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Shared stats ───────────────────────────────────────────────────────────────
+	db.command("stats")
+		.argument("<db>", "Database ID or name")
+		.description("Show shared database pool statistics")
+		.action(async (dbIdentifier) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				const _statsSpinner = startSpinner("Fetching stats...");
+				let data: any;
+				if (dbSummary.type === "postgres") {
+					data = await client.postgres.sharedStats.query({
+						postgresId: dbSummary.id,
+					} as any);
+				} else {
+					data = await client.mysql.sharedStats.query({
+						mysqlId: dbSummary.id,
+					} as any);
+				}
+				succeedSpinner();
+				if (isJsonMode()) {
+					outputData(data);
+					return;
+				}
+				const s = data as any;
+				log("");
+				log(colors.bold("Database Stats"));
+				if (s.usedStorage !== undefined)
+					log(`  Used Storage:  ${s.usedStorage}`);
+				if (s.storageLimit !== undefined)
+					log(`  Storage Limit: ${s.storageLimit}`);
+				if (s.connections !== undefined)
+					log(`  Connections:   ${s.connections}`);
+				log("");
 			} catch (err) {
 				handleError(err);
 			}
