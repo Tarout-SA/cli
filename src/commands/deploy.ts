@@ -1,6 +1,20 @@
+import { execFile } from "node:child_process";
+import { createReadStream, mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { promisify } from "node:util";
 import type { Command } from "commander";
+import open from "open";
 import { getApiClient } from "../lib/api.js";
-import { isLoggedIn } from "../lib/config.js";
+import { startAuthServer } from "../lib/auth-server.js";
+import {
+	getCurrentProfile,
+	getProjectConfig,
+	isLoggedIn,
+	setCurrentProfile,
+	setProfile,
+	setProjectConfig,
+} from "../lib/config.js";
 import {
 	AuthError,
 	analyzeDeploymentError,
@@ -9,30 +23,40 @@ import {
 	DeploymentTimeoutError,
 	findSimilar,
 	handleError,
+	InvalidArgumentError,
 	NotFoundError,
 } from "../lib/errors.js";
 import {
+	box,
 	colors,
 	getStatusBadge,
 	isJsonMode,
 	log,
 	outputData,
 	quietOutput,
+	shouldSkipConfirmation,
+	success,
 	table,
 } from "../lib/output.js";
 import { streamDeploymentLogs } from "../lib/websocket.js";
+import { confirm, input, select } from "../utils/prompts.js";
 import {
 	failSpinner,
 	startSpinner,
 	stopSpinner,
 	succeedSpinner,
-	updateSpinner,
 } from "../utils/spinner.js";
+
+const DEFAULT_REGION = "me-central2";
+const DROP_UPLOAD_CONTENT_TYPE = "application/zip";
+
+const execFileAsync = promisify(execFile);
 
 interface AppSummary {
 	appName?: string;
 	applicationId: string;
 	name: string;
+	sourceType?: string | null;
 }
 
 interface DeploymentSummary {
@@ -42,44 +66,469 @@ interface DeploymentSummary {
 	title?: string | null;
 }
 
+async function ensureLoggedInForDeploy(): Promise<void> {
+	if (isLoggedIn()) return;
+
+	if (isJsonMode()) {
+		throw new AuthError();
+	}
+
+	log("");
+	log("Tarout needs an authenticated account before deploying.");
+	const authAction = await select<"login" | "register">("Continue with:", [
+		{ name: "Log in to an existing account", value: "login" },
+		{ name: "Create a free Tarout account", value: "register" },
+	]);
+
+	await authenticateViaBrowser(authAction);
+}
+
+async function authenticateViaBrowser(action: "login" | "register") {
+	const apiUrl = "https://tarout.sa";
+	const authServer = await startAuthServer();
+	const callbackUrl = `http://localhost:${authServer.port}/callback`;
+	const authUrl =
+		action === "register"
+			? `${apiUrl}/cli-auth?action=register&callback=${encodeURIComponent(callbackUrl)}`
+			: `${apiUrl}/cli-auth?callback=${encodeURIComponent(callbackUrl)}`;
+
+	log("");
+	log(
+		action === "register"
+			? "Opening browser to create your account..."
+			: "Opening browser to authenticate...",
+	);
+	await open(authUrl);
+
+	const _spinner = startSpinner(
+		action === "register"
+			? "Waiting for account creation..."
+			: "Waiting for authentication...",
+	);
+
+	try {
+		const authData = await authServer.waitForCallback();
+		succeedSpinner(
+			action === "register"
+				? "Account created and authenticated!"
+				: "Authentication successful!",
+		);
+		authServer.close();
+
+		setProfile("default", {
+			token: authData.token,
+			apiUrl,
+			userId: authData.userId,
+			userEmail: authData.userEmail,
+			userName: authData.userName,
+			organizationId: authData.organizationId,
+			organizationName: authData.organizationName,
+			environmentId: authData.environmentId,
+			environmentName: authData.environmentName,
+		});
+		setCurrentProfile("default");
+
+		log("");
+		success(`Logged in as ${colors.cyan(authData.userEmail)}`);
+		box("Account", [
+			`Organization: ${colors.bold(authData.organizationName)}`,
+			`Environment: ${colors.bold(authData.environmentName)}`,
+		]);
+	} catch (err) {
+		failSpinner(
+			action === "register"
+				? "Account creation failed"
+				: "Authentication failed",
+		);
+		authServer.close();
+		throw err;
+	}
+}
+
+async function confirmRegion(region: string | undefined): Promise<void> {
+	const requestedRegion = region || DEFAULT_REGION;
+	if (requestedRegion === DEFAULT_REGION) return;
+
+	const message = `Tarout currently deploys only to ${DEFAULT_REGION} (Dammam, Saudi Arabia). The requested region "${requestedRegion}" would move workloads outside the active Saudi region when additional regions are enabled.`;
+
+	if (isJsonMode()) {
+		throw new InvalidArgumentError(message);
+	}
+
+	log("");
+	log(colors.warn(message));
+
+	if (shouldSkipConfirmation()) {
+		log(colors.dim(`Continuing with ${DEFAULT_REGION}.`));
+		return;
+	}
+
+	const proceed = await confirm(`Continue with ${DEFAULT_REGION}?`, false);
+	if (!proceed) {
+		throw new InvalidArgumentError("Deployment cancelled.");
+	}
+}
+
+async function resolveDeploymentTarget(
+	client: any,
+	appIdentifier?: string,
+): Promise<{ app: AppSummary; shouldUploadSource: boolean }> {
+	const _spinner = startSpinner("Finding application...");
+	const apps: AppSummary[] = await client.application.allByOrganization.query();
+	succeedSpinner();
+
+	if (appIdentifier) {
+		const app = findApp(apps, appIdentifier);
+		if (!app) {
+			const suggestions = findSimilar(
+				appIdentifier,
+				apps.map((a) => a.name),
+			);
+			throw new NotFoundError("Application", appIdentifier, suggestions);
+		}
+
+		const details = await getApplicationDetails(client, app.applicationId);
+		return {
+			app,
+			shouldUploadSource: shouldUseLocalSource(details, {
+				explicitApp: true,
+			}),
+		};
+	}
+
+	const linkedProject = getProjectConfig();
+	if (linkedProject) {
+		const app =
+			findApp(apps, linkedProject.applicationId) ??
+			findApp(apps, linkedProject.name);
+
+		if (app) {
+			const details = await getApplicationDetails(client, app.applicationId);
+			return {
+				app,
+				shouldUploadSource: shouldUseLocalSource(details, {
+					linkedProject: true,
+				}),
+			};
+		}
+
+		if (!isJsonMode()) {
+			log("");
+			log(
+				colors.warn(
+					`Linked application "${linkedProject.name}" was not found in this organization.`,
+				),
+			);
+		}
+	}
+
+	if (isJsonMode()) {
+		throw new InvalidArgumentError(
+			"No linked application. Run 'tarout link', pass an app name, or run without --json to choose interactively.",
+		);
+	}
+
+	if (apps.length === 0) {
+		const app = await createAppFromCurrentDirectory(client);
+		return { app, shouldUploadSource: true };
+	}
+
+	const createValue = "__create__";
+	const selected = await select<string>("Select an application to deploy:", [
+		{
+			name: `Create a new app from ${colors.cyan(basename(process.cwd()) || "this directory")}`,
+			value: createValue,
+		},
+		...apps.map((app) => ({
+			name: `${app.name} ${colors.dim(`(${app.applicationId.slice(0, 8)})`)}`,
+			value: app.applicationId,
+		})),
+	]);
+
+	if (selected === createValue) {
+		const app = await createAppFromCurrentDirectory(client);
+		return { app, shouldUploadSource: true };
+	}
+
+	const app = findApp(apps, selected);
+	if (!app) {
+		throw new NotFoundError("Application", selected);
+	}
+
+	const profile = getCurrentProfile();
+	if (profile) {
+		setProjectConfig({
+			applicationId: app.applicationId,
+			name: app.name,
+			organizationId: profile.organizationId,
+			linkedAt: new Date().toISOString(),
+		});
+	}
+
+	const details = await getApplicationDetails(client, app.applicationId);
+	return {
+		app,
+		shouldUploadSource: await promptForLocalSourceIfNeeded(details),
+	};
+}
+
+async function createAppFromCurrentDirectory(client: any): Promise<AppSummary> {
+	const profile = getCurrentProfile();
+	if (!profile) throw new AuthError();
+
+	const defaultName = basename(process.cwd()) || "tarout-app";
+	let appName = defaultName;
+
+	if (!shouldSkipConfirmation()) {
+		appName = await input("Application name:", defaultName);
+	}
+
+	const slug = generateSlug(appName);
+	const _spinner = startSpinner("Creating application...");
+	const application = await client.application.create.mutate({
+		name: appName,
+		appName: slug,
+		organizationId: profile.organizationId,
+		region: DEFAULT_REGION,
+	});
+	succeedSpinner("Application created!");
+
+	setProjectConfig({
+		applicationId: application.applicationId,
+		name: application.name,
+		organizationId: profile.organizationId,
+		linkedAt: new Date().toISOString(),
+	});
+
+	if (!isJsonMode()) {
+		box("Project Linked", [
+			`Application: ${colors.cyan(application.name)}`,
+			`ID: ${colors.dim(application.applicationId)}`,
+			`Directory: ${colors.dim(process.cwd())}`,
+		]);
+	}
+
+	return {
+		applicationId: application.applicationId,
+		name: application.name,
+		appName: application.appName,
+		sourceType: application.sourceType,
+	};
+}
+
+async function getApplicationDetails(client: any, applicationId: string) {
+	return client.application.one.query({ applicationId });
+}
+
+function shouldUseLocalSource(
+	app: any,
+	context: { explicitApp?: boolean; linkedProject?: boolean },
+): boolean {
+	if (app?.sourceType === "drop") return true;
+	if (!hasConfiguredSource(app)) return true;
+
+	// Explicit app deployments should respect the app's configured source.
+	if (context.explicitApp) return false;
+
+	// Linked non-drop projects usually represent dashboard/git deployments.
+	if (context.linkedProject) return false;
+
+	return false;
+}
+
+async function promptForLocalSourceIfNeeded(app: any): Promise<boolean> {
+	if (app?.sourceType === "drop" || !hasConfiguredSource(app)) return true;
+
+	if (shouldSkipConfirmation()) return false;
+
+	log("");
+	log(
+		`${colors.bold(app.name)} already has a ${colors.cyan(app.sourceType)} source configured.`,
+	);
+	return confirm(
+		"Use the current directory as the deployment source instead?",
+		false,
+	);
+}
+
+function hasConfiguredSource(app: any): boolean {
+	switch (app?.sourceType) {
+		case "drop":
+			return Boolean(app.dropSourceObjectName);
+		case "github":
+			return Boolean(
+				(app.owner && app.repository) ||
+					app.github?.repository ||
+					app.github?.owner,
+			);
+		case "gitlab":
+			return Boolean(app.gitlabRepository || app.gitlab?.gitlabRepository);
+		case "bitbucket":
+			return Boolean(
+				app.bitbucketRepository || app.bitbucket?.bitbucketRepository,
+			);
+		case "gitea":
+			return Boolean(app.giteaRepository || app.gitea?.giteaRepository);
+		case "git":
+			return Boolean(app.customGitUrl || app.gitUrl);
+		case "dockerfileUpload":
+			return Boolean(app.dockerfileContent);
+		case "dockerhub":
+			return Boolean(app.dockerHubImage);
+		default:
+			return false;
+	}
+}
+
+async function uploadCurrentDirectorySource(
+	client: any,
+	applicationId: string,
+	appName: string,
+): Promise<void> {
+	const archivePath = await createSourceArchive();
+	const archiveDir = dirname(archivePath);
+
+	try {
+		const { size } = statSync(archivePath);
+		const fileName = `${generateSlug(appName)}.zip`;
+
+		const _uploadUrlSpinner = startSpinner("Preparing source upload...");
+		const upload = await client.application.getDropUploadUrl.mutate({
+			applicationId,
+			fileName,
+			fileSize: size,
+			contentType: DROP_UPLOAD_CONTENT_TYPE,
+		});
+		succeedSpinner();
+
+		const _uploadSpinner = startSpinner(
+			`Uploading source archive (${formatBytes(size)})...`,
+		);
+		const response = await fetch(upload.uploadUrl, {
+			method: "PUT",
+			body: createReadStream(archivePath) as any,
+			headers: {
+				"Content-Length": String(size),
+			},
+			duplex: "half",
+		} as any);
+
+		if (!response.ok) {
+			const body = await response.text().catch(() => "");
+			throw new Error(`Upload failed (${response.status}): ${body}`);
+		}
+		succeedSpinner("Source uploaded!");
+
+		const _completeSpinner = startSpinner("Finalizing source...");
+		await client.application.completeDropUpload.mutate({
+			applicationId,
+			objectName: upload.objectName,
+			fileName,
+			fileSize: size,
+			dropBuildPath: "/",
+		});
+		succeedSpinner("Source ready for deployment.");
+	} finally {
+		rmSync(archiveDir, { recursive: true, force: true });
+	}
+}
+
+async function createSourceArchive(): Promise<string> {
+	const tempDir = mkdtempSync(join(tmpdir(), "tarout-source-"));
+	const archivePath = join(tempDir, "source.zip");
+
+	const excludes = [
+		".git/*",
+		".tarout/*",
+		".next/*",
+		"dist/*",
+		"build/*",
+		"coverage/*",
+		"node_modules/*",
+		"*/node_modules/*",
+		".env",
+		".env.*",
+		"*.log",
+	];
+
+	const _spinner = startSpinner("Packaging current directory...");
+	try {
+		await execFileAsync("zip", ["-qry", archivePath, ".", "-x", ...excludes], {
+			cwd: process.cwd(),
+			maxBuffer: 1024 * 1024,
+		});
+		succeedSpinner("Source packaged.");
+		return archivePath;
+	} catch (err) {
+		failSpinner("Failed to package source.");
+		rmSync(tempDir, { recursive: true, force: true });
+
+		if (
+			err instanceof Error &&
+			("code" in err ? (err as { code?: string }).code === "ENOENT" : false)
+		) {
+			throw new InvalidArgumentError(
+				"The 'zip' command is required to upload a local directory. Install zip or connect a Git source in the Tarout dashboard.",
+			);
+		}
+
+		throw err;
+	}
+}
+
+function generateSlug(name: string): string {
+	const slug = name
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.replace(/-+/g, "-");
+
+	if (/^[a-z][a-z0-9-]*[a-z0-9]$/.test(slug)) return slug;
+	return `app-${slug || "tarout-app"}`.replace(/-+$/g, "");
+}
+
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function registerDeployCommands(program: Command) {
 	// Deploy command
 	program
 		.command("deploy")
-		.argument("<app>", "Application ID or name")
+		.argument("[app]", "Application ID or name")
 		.description("Deploy an application")
-		.option("-r, --region <region>", "Deployment region", "me-central2")
+		.option("-r, --region <region>", "Deployment region", DEFAULT_REGION)
 		.option("-w, --wait", "Wait for deployment to complete and stream logs")
+		.option("--watch", "Alias for --wait")
 		.action(async (appIdentifier, options) => {
 			try {
-				if (!isLoggedIn()) throw new AuthError();
+				await ensureLoggedInForDeploy();
+				await confirmRegion(options.region);
 
 				const client = getApiClient();
+				const { app, shouldUploadSource } = await resolveDeploymentTarget(
+					client,
+					appIdentifier,
+				);
 
-				// Find the application
-				const _spinner = startSpinner("Finding application...");
-				const apps: AppSummary[] =
-					await client.application.allByOrganization.query();
-				const app = findApp(apps, appIdentifier);
-
-				if (!app) {
-					failSpinner();
-					const suggestions = findSimilar(
-						appIdentifier,
-						apps.map((a) => a.name),
+				if (shouldUploadSource) {
+					await uploadCurrentDirectorySource(
+						client,
+						app.applicationId,
+						app.name,
 					);
-					throw new NotFoundError("Application", appIdentifier, suggestions);
 				}
 
-				updateSpinner(`Deploying ${app.name}...`);
+				const _deploySpinner = startSpinner(`Deploying ${app.name}...`);
 
 				// Trigger deployment
 				const result = await client.application.deployToCloud.mutate({
 					applicationId: app.applicationId,
-					region: options.region,
 				});
 
-				if (options.wait) {
+				if (options.wait || options.watch) {
 					// Stream logs and wait for completion
 					await streamDeploymentWithLogs(
 						client,

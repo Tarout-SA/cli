@@ -20,7 +20,7 @@ import {
 	success,
 	table,
 } from "../lib/output.js";
-import { confirm } from "../utils/prompts.js";
+import { confirm, input } from "../utils/prompts.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
 
 export function registerDomainsCommands(program: Command) {

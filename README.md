@@ -3,17 +3,20 @@
 [![npm version](https://img.shields.io/npm/v/@tarout/cli.svg)](https://www.npmjs.com/package/@tarout/cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-The official command-line interface for [Tarout](https://tarout.sa) - a Platform-as-a-Service for deploying applications, databases, and more.
+The official command-line interface for [Tarout](https://tarout.sa) — the Saudi cloud platform built for coding agents. Your agent writes code and defines infrastructure; Tarout provisions it instantly.
 
 ## Installation
 
 ```bash
-npm install -g @tarout/cli
+curl -fsSL https://tarout.sa/install.sh | sh
 ```
 
 Or with other package managers:
 
 ```bash
+# Using npm
+npm install -g @tarout/cli
+
 # Using yarn
 yarn global add @tarout/cli
 
@@ -30,14 +33,10 @@ bun add -g @tarout/cli
 # 1. Login via browser (opens authentication page)
 tarout login
 
-# 2. List your applications
-tarout apps list
+# 2. Deploy from your project root
+tarout deploy --wait
 
-# 3. Deploy an application
-tarout deploy my-app
-
-# 4. View logs
-tarout logs my-app --follow
+# The first deploy prompts to create or link an app when needed.
 ```
 
 ## Commands
@@ -80,14 +79,14 @@ tarout apps delete my-api --yes
 
 | Command | Description |
 |---------|-------------|
-| `tarout deploy <app>` | Deploy an application |
+| `tarout deploy [app]` | Deploy an application |
 | `tarout deploy:status <app>` | Check deployment status |
 | `tarout deploy:cancel <app>` | Cancel running deployment |
 | `tarout deploy:list <app>` | List recent deployments |
 
 ```bash
-# Deploy specific branch
-tarout deploy my-app --branch feature/new-feature
+# Deploy the linked application
+tarout deploy --wait
 
 # Deploy and wait for completion
 tarout deploy my-app --wait
@@ -283,7 +282,7 @@ Configuration is stored at `~/.tarout/config.json`:
 
 ## Support
 
-- Documentation: [docs.tarout.sa](https://docs.tarout.sa)
+- Documentation: [tarout.sa/docs](https://tarout.sa/docs)
 - Issues: [GitHub Issues](https://github.com/tarout/platform/issues)
 - Discord: [Join our community](https://discord.gg/2tBnJ3jDJc)
 

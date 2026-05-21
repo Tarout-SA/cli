@@ -108,7 +108,7 @@ export function clearConfig(): void {
  */
 export function isLoggedIn(): boolean {
 	const profile = getCurrentProfile();
-	return profile !== null && !!profile.token;
+	return (profile !== null && !!profile.token) || !!process.env.TAROUT_TOKEN;
 }
 
 /**
@@ -117,7 +117,7 @@ export function isLoggedIn(): boolean {
  */
 export function getToken(): string | null {
 	const profile = getCurrentProfile();
-	return profile?.token || null;
+	return profile?.token || process.env.TAROUT_TOKEN || null;
 }
 
 /**
