@@ -8,6 +8,7 @@ import { createTRPCProxyClient, httpBatchLink } from "@trpc/client";
 import superjson from "superjson";
 import { getApiUrl, getToken, isLoggedIn } from "./config.js";
 import { AuthError } from "./errors.js";
+import { platformFetch } from "./password-gate.js";
 
 // The API client uses 'any' type since we can't easily import types
 // from the parent platform package. This is fine for a CLI that
@@ -40,6 +41,7 @@ export function createApiClient(): TaroutApiClient {
 			httpBatchLink({
 				url: `${apiUrl}/api/trpc`,
 				headers: () => (token ? { "x-api-key": token } : {}),
+				fetch: platformFetch,
 			}),
 		],
 	});

@@ -1,15 +1,30 @@
 import { execFile } from "node:child_process";
-import { createReadStream, mkdtempSync, rmSync, statSync } from "node:fs";
+import {
+	createReadStream,
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { Command } from "commander";
 import open from "open";
-import { getApiClient } from "../lib/api.js";
+import { getApiClient, resetApiClient } from "../lib/api.js";
 import { startAuthServer } from "../lib/auth-server.js";
 import {
+	isCredentialError,
+	resolveProfileFromCredential,
+} from "../lib/auth-profile.js";
+import {
+	type Profile,
+	getApiUrl,
 	getCurrentProfile,
 	getProjectConfig,
+	getToken,
 	isLoggedIn,
 	setCurrentProfile,
 	setProfile,
@@ -39,7 +54,7 @@ import {
 	table,
 } from "../lib/output.js";
 import { streamDeploymentLogs } from "../lib/websocket.js";
-import { confirm, input, select } from "../utils/prompts.js";
+import { confirm, input, password, select } from "../utils/prompts.js";
 import {
 	failSpinner,
 	startSpinner,
@@ -56,6 +71,7 @@ interface AppSummary {
 	appName?: string;
 	applicationId: string;
 	name: string;
+	plan?: string | null;
 	sourceType?: string | null;
 }
 
@@ -66,31 +82,138 @@ interface DeploymentSummary {
 	title?: string | null;
 }
 
-async function ensureLoggedInForDeploy(): Promise<void> {
-	if (isLoggedIn()) return;
+interface DeployOptions {
+	apiUrl?: string;
+	database?: string;
+	databasePlan?: string;
+	plan?: string;
+	region?: string;
+	source?: string;
+	storage?: boolean;
+	storagePlan?: string;
+	token?: string;
+	wait?: boolean;
+	watch?: boolean;
+}
 
+type AppPlan = "FREE" | "SHARED" | "DEDICATED";
+type ResourcePlan = "FREE" | "STARTER" | "STANDARD" | "PRO";
+type DatabaseKind = "none" | "postgres" | "mysql";
+type SourcePreference = "auto" | "upload" | "configured" | "connect";
+
+interface ProjectInspection {
+	database: DatabaseKind;
+	databaseReasons: string[];
+	git: {
+		hasGit: boolean;
+		provider?: string;
+		remoteUrl?: string;
+	};
+	storage: boolean;
+	storageReasons: string[];
+}
+
+interface DeploymentTarget {
+	app: AppSummary;
+	createdApp: boolean;
+	hasConfiguredSource: boolean;
+	shouldUploadSource: boolean;
+}
+
+async function ensureAuthenticatedForDeploy(
+	options: DeployOptions,
+): Promise<Profile> {
+	const apiUrl = (options.apiUrl || getApiUrl()).replace(/\/+$/, "");
+	const optionToken = options.token?.trim();
+	if (optionToken) {
+		return authenticateViaApiToken(optionToken, apiUrl, {
+			showSuccess: true,
+			persist: true,
+		});
+	}
+
+	if (!isLoggedIn()) {
+		if (isJsonMode()) {
+			throw new AuthError(
+				"Not logged in. Run 'tarout login', 'tarout token <api-token>', or set TAROUT_TOKEN.",
+			);
+		}
+			return promptForCredentials(
+				apiUrl,
+				"Tarout needs an authenticated account before deploying.",
+			);
+	}
+
+	const token = getToken();
+	if (!token) throw new AuthError();
+
+	const existingProfile = getCurrentProfile();
+	try {
+		const profile = await resolveProfileFromCredential({
+			token,
+			apiUrl,
+			fallback: existingProfile,
+		});
+		if (existingProfile) {
+			setProfile("default", profile);
+			setCurrentProfile("default");
+			resetApiClient();
+		}
+		return profile;
+	} catch (err) {
+		if (!isCredentialError(err)) throw err;
+		if (isJsonMode()) {
+			throw new AuthError(
+				"Stored credentials are invalid or expired. Run 'tarout login' or provide TAROUT_TOKEN.",
+			);
+		}
+		return promptForCredentials(
+			apiUrl,
+			"Your Tarout credentials are invalid or expired.",
+		);
+	}
+}
+
+async function promptForCredentials(
+	apiUrl: string,
+	message: string,
+): Promise<Profile> {
 	if (isJsonMode()) {
 		throw new AuthError();
 	}
 
 	log("");
-	log("Tarout needs an authenticated account before deploying.");
-	const authAction = await select<"login" | "register">("Continue with:", [
-		{ name: "Log in to an existing account", value: "login" },
-		{ name: "Create a free Tarout account", value: "register" },
-	]);
+	log(message);
+	const authAction = await select<"login" | "token" | "register">(
+		"Continue with:",
+		[
+			{ name: "Log in to an existing account", value: "login" },
+			{ name: "Paste an API token", value: "token" },
+			{ name: "Create a free Tarout account", value: "register" },
+		],
+	);
 
-	await authenticateViaBrowser(authAction);
+	if (authAction === "token") {
+		const apiToken = await password("Tarout API token:");
+		return authenticateViaApiToken(apiToken.trim(), apiUrl, {
+			showSuccess: true,
+			persist: true,
+		});
+	}
+
+	return authenticateViaBrowser(authAction, apiUrl);
 }
 
-async function authenticateViaBrowser(action: "login" | "register") {
-	const apiUrl = "https://tarout.sa";
+async function authenticateViaBrowser(
+	action: "login" | "register",
+	apiUrl: string,
+): Promise<Profile> {
 	const authServer = await startAuthServer();
 	const callbackUrl = `http://localhost:${authServer.port}/callback`;
 	const authUrl =
 		action === "register"
-			? `${apiUrl}/cli-auth?action=register&callback=${encodeURIComponent(callbackUrl)}`
-			: `${apiUrl}/cli-auth?callback=${encodeURIComponent(callbackUrl)}`;
+			? `${apiUrl}/cli-authorize?action=register&callback=${encodeURIComponent(callbackUrl)}`
+			: `${apiUrl}/cli-authorize?callback=${encodeURIComponent(callbackUrl)}`;
 
 	log("");
 	log(
@@ -107,15 +230,15 @@ async function authenticateViaBrowser(action: "login" | "register") {
 	);
 
 	try {
-		const authData = await authServer.waitForCallback();
-		succeedSpinner(
-			action === "register"
-				? "Account created and authenticated!"
-				: "Authentication successful!",
-		);
+			const authData = await authServer.waitForCallback();
+			succeedSpinner(
+				action === "register"
+					? "Account created and CLI authorized."
+					: "CLI authorized.",
+			);
 		authServer.close();
 
-		setProfile("default", {
+		const fallbackProfile = {
 			token: authData.token,
 			apiUrl,
 			userId: authData.userId,
@@ -123,17 +246,28 @@ async function authenticateViaBrowser(action: "login" | "register") {
 			userName: authData.userName,
 			organizationId: authData.organizationId,
 			organizationName: authData.organizationName,
+			projectId: authData.projectId,
+			projectName: authData.projectName,
+			projectSlug: authData.projectSlug,
 			environmentId: authData.environmentId,
 			environmentName: authData.environmentName,
-		});
+		};
+		const profile = await resolveProfileFromCredential({
+			token: authData.token,
+			apiUrl,
+			fallback: fallbackProfile,
+		}).catch(() => fallbackProfile);
+		setProfile("default", profile);
 		setCurrentProfile("default");
+		resetApiClient();
 
 		log("");
-		success(`Logged in as ${colors.cyan(authData.userEmail)}`);
+		success(`Logged in as ${colors.cyan(profile.userEmail)}`);
 		box("Account", [
-			`Organization: ${colors.bold(authData.organizationName)}`,
-			`Environment: ${colors.bold(authData.environmentName)}`,
+			`Organization: ${colors.bold(profile.organizationName)}`,
+			`Environment: ${colors.bold(profile.environmentName)}`,
 		]);
+		return profile;
 	} catch (err) {
 		failSpinner(
 			action === "register"
@@ -141,6 +275,47 @@ async function authenticateViaBrowser(action: "login" | "register") {
 				: "Authentication failed",
 		);
 		authServer.close();
+		throw err;
+	}
+}
+
+async function authenticateViaApiToken(
+	apiToken: string,
+	apiUrl: string,
+	options: { persist: boolean; showSuccess: boolean },
+): Promise<Profile> {
+	if (!apiToken) throw new AuthError("An API token is required.");
+
+	const _spinner = startSpinner("Verifying token...");
+	try {
+		const profile = await resolveProfileFromCredential({
+			token: apiToken,
+			apiUrl,
+			fallback: getCurrentProfile(),
+		});
+		succeedSpinner("Token verified!");
+
+		if (options.persist) {
+			setProfile("default", profile);
+			setCurrentProfile("default");
+			resetApiClient();
+		}
+
+		if (options.showSuccess && !isJsonMode()) {
+			log("");
+			success(`Authenticated as ${colors.cyan(profile.userEmail)}`);
+			box("Account", [
+				`Organization: ${colors.bold(profile.organizationName)}`,
+				`Environment: ${colors.bold(profile.environmentName)}`,
+			]);
+		}
+
+		return profile;
+	} catch (err) {
+		failSpinner("Token verification failed");
+		if (isCredentialError(err)) {
+			throw new AuthError("Invalid or expired Tarout credential.");
+		}
 		throw err;
 	}
 }
@@ -169,10 +344,345 @@ async function confirmRegion(region: string | undefined): Promise<void> {
 	}
 }
 
+export function inspectCurrentProject(cwd = process.cwd()): ProjectInspection {
+	const packageJson = readJsonFile(join(cwd, "package.json"));
+	const dependencies = new Set(
+		Object.keys({
+			...(packageJson?.dependencies ?? {}),
+			...(packageJson?.devDependencies ?? {}),
+			...(packageJson?.optionalDependencies ?? {}),
+			...(packageJson?.peerDependencies ?? {}),
+		}).map((dependency) => dependency.toLowerCase()),
+	);
+	const files = collectInspectableFiles(cwd);
+	const snippets = files.map((file) => ({
+		file,
+		content: readTextFile(file, 256 * 1024),
+	}));
+	const database = detectDatabase(dependencies, snippets, cwd);
+	const storage = detectStorage(dependencies, snippets);
+
+	return {
+		database: database.kind,
+		databaseReasons: database.reasons,
+		git: detectGitSource(cwd),
+		storage: storage.detected,
+		storageReasons: storage.reasons,
+	};
+}
+
+function printProjectInspection(inspection: ProjectInspection): void {
+	if (isJsonMode()) return;
+
+	const lines: string[] = [];
+	if (inspection.database !== "none") {
+		lines.push(
+			`Database: ${colors.cyan(formatDatabaseKind(inspection.database))} detected (${inspection.databaseReasons.slice(0, 3).join("; ")})`,
+		);
+	}
+	if (inspection.storage) {
+		lines.push(
+			`File storage: ${colors.cyan("detected")} (${inspection.storageReasons.slice(0, 3).join("; ")})`,
+		);
+	}
+	if (inspection.git.hasGit) {
+		lines.push(
+			inspection.git.provider
+				? `Git: ${colors.cyan(inspection.git.provider)} repository detected`
+				: "Git: repository detected",
+		);
+	}
+	if (lines.length > 0) {
+		box("Project Inspection", lines);
+	}
+}
+
+function readJsonFile(path: string): any | null {
+	try {
+		if (!existsSync(path)) return null;
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+function readTextFile(path: string, maxBytes: number): string {
+	try {
+		const stat = statSync(path);
+		if (stat.size > maxBytes) return "";
+		return readFileSync(path, "utf8");
+	} catch {
+		return "";
+	}
+}
+
+function collectInspectableFiles(root: string): string[] {
+	const files: string[] = [];
+	const excludedDirs = new Set([
+		".git",
+		".next",
+		".nuxt",
+		".svelte-kit",
+		"build",
+		"coverage",
+		"dist",
+		"node_modules",
+		"out",
+		"target",
+		"vendor",
+	]);
+	const includedNames = new Set([
+		".env.example",
+		".env.sample",
+		"drizzle.config.js",
+		"drizzle.config.mjs",
+		"drizzle.config.ts",
+		"package.json",
+		"schema.prisma",
+	]);
+	const includedExtensions = [
+		".cjs",
+		".go",
+		".js",
+		".jsx",
+		".json",
+		".mjs",
+		".php",
+		".prisma",
+		".py",
+		".rb",
+		".ts",
+		".tsx",
+		".yml",
+		".yaml",
+	];
+
+	const walk = (dir: string, depth: number) => {
+		if (files.length >= 400 || depth > 5) return;
+
+		let entries: Array<{
+			name: string;
+			isDirectory(): boolean;
+			isFile(): boolean;
+		}>;
+		try {
+			entries = readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+
+		for (const entry of entries) {
+			if (files.length >= 400) return;
+			const fullPath = join(dir, entry.name);
+			if (entry.isDirectory()) {
+				if (!excludedDirs.has(entry.name)) walk(fullPath, depth + 1);
+				continue;
+			}
+			if (!entry.isFile()) continue;
+
+			const lowerName = entry.name.toLowerCase();
+			if (
+				includedNames.has(lowerName) ||
+				includedExtensions.some((extension) =>
+					lowerName.endsWith(extension),
+				)
+			) {
+				files.push(fullPath);
+			}
+		}
+	};
+
+	walk(root, 0);
+	return files;
+}
+
+function detectDatabase(
+	dependencies: Set<string>,
+	files: Array<{ file: string; content: string }>,
+	cwd: string,
+): { kind: DatabaseKind; reasons: string[] } {
+	const postgresReasons: string[] = [];
+	const mysqlReasons: string[] = [];
+	const genericReasons: string[] = [];
+
+	for (const dependency of [
+		"@neondatabase/serverless",
+		"@supabase/supabase-js",
+		"pg",
+		"postgres",
+		"postgres.js",
+	]) {
+		if (dependencies.has(dependency)) {
+			postgresReasons.push(`dependency ${dependency}`);
+			break;
+		}
+	}
+
+	for (const dependency of ["mariadb", "mysql", "mysql2"]) {
+		if (dependencies.has(dependency)) {
+			mysqlReasons.push(`dependency ${dependency}`);
+			break;
+		}
+	}
+
+	for (const dependency of [
+		"@prisma/client",
+		"drizzle-orm",
+		"knex",
+		"sequelize",
+		"typeorm",
+	]) {
+		if (dependencies.has(dependency)) {
+			genericReasons.push(`database ORM dependency ${dependency}`);
+			break;
+		}
+	}
+
+	const prismaSchema = readTextFile(
+		join(cwd, "prisma", "schema.prisma"),
+		256 * 1024,
+	);
+	if (/provider\s*=\s*"postgresql"/i.test(prismaSchema)) {
+		postgresReasons.push("Prisma provider postgresql");
+	}
+	if (/provider\s*=\s*"mysql"/i.test(prismaSchema)) {
+		mysqlReasons.push("Prisma provider mysql");
+	}
+
+	for (const { file, content } of files) {
+		if (!content) continue;
+		const label = basename(file);
+		if (/dialect\s*:\s*["']postgres(?:ql)?["']/i.test(content)) {
+			postgresReasons.push(`${label} postgres dialect`);
+		}
+		if (/dialect\s*:\s*["']mysql["']/i.test(content)) {
+			mysqlReasons.push(`${label} mysql dialect`);
+		}
+		if (/postgres(?:ql)?:\/\/|PGHOST|POSTGRES_/i.test(content)) {
+			postgresReasons.push(`${label} postgres connection`);
+		}
+		if (/mysql:\/\/|MYSQL_HOST|MYSQL_/i.test(content)) {
+			mysqlReasons.push(`${label} mysql connection`);
+		}
+		if (/DATABASE_URL/i.test(content)) {
+			postgresReasons.push(`${label} DATABASE_URL`);
+		}
+	}
+
+	if (mysqlReasons.length > postgresReasons.length) {
+		return { kind: "mysql", reasons: uniqueReasons(mysqlReasons) };
+	}
+	if (postgresReasons.length > 0 || mysqlReasons.length > 0) {
+		return {
+			kind:
+				postgresReasons.length >= mysqlReasons.length ? "postgres" : "mysql",
+			reasons: uniqueReasons(
+				postgresReasons.length >= mysqlReasons.length
+					? postgresReasons
+					: mysqlReasons,
+			),
+		};
+	}
+	if (genericReasons.length > 0) {
+		return { kind: "postgres", reasons: uniqueReasons(genericReasons) };
+	}
+
+	return { kind: "none", reasons: [] };
+}
+
+function detectStorage(
+	dependencies: Set<string>,
+	files: Array<{ file: string; content: string }>,
+): { detected: boolean; reasons: string[] } {
+	const reasons: string[] = [];
+
+	for (const dependency of [
+		"@aws-sdk/client-s3",
+		"@google-cloud/storage",
+		"@uploadthing/react",
+		"aws-sdk",
+		"busboy",
+		"firebase",
+		"firebase-admin",
+		"formidable",
+		"minio",
+		"multer",
+		"uploadthing",
+	]) {
+		if (dependencies.has(dependency)) {
+			reasons.push(`dependency ${dependency}`);
+			break;
+		}
+	}
+
+	for (const { file, content } of files) {
+		if (!content) continue;
+		const label = basename(file);
+		if (
+			/S3Client|PutObjectCommand|GetObjectCommand|AWS_S3|S3_BUCKET|STORAGE_BUCKET|FIREBASE_STORAGE_BUCKET|UploadThing|getStorage\(/i.test(
+				content,
+			)
+		) {
+			reasons.push(`${label} object storage usage`);
+		}
+		if (
+			/multer|diskStorage|upload\.single|upload\.array|multipart\/form-data/i.test(
+				content,
+			)
+		) {
+			reasons.push(`${label} file upload handling`);
+		}
+	}
+
+	return { detected: reasons.length > 0, reasons: uniqueReasons(reasons) };
+}
+
+function detectGitSource(cwd: string): ProjectInspection["git"] {
+	const gitPath = join(cwd, ".git");
+	if (!existsSync(gitPath)) return { hasGit: false };
+
+	let configPath = join(gitPath, "config");
+	try {
+		const stat = statSync(gitPath);
+		if (stat.isFile()) {
+			const content = readTextFile(gitPath, 4096);
+			const match = content.match(/gitdir:\s*(.+)/i);
+			if (match?.[1]) configPath = join(cwd, match[1].trim(), "config");
+		}
+	} catch {}
+
+	const config = readTextFile(configPath, 64 * 1024);
+	const remoteUrl = config.match(/url\s*=\s*(.+)/)?.[1]?.trim();
+	const provider = remoteUrl?.includes("github.com")
+		? "GitHub"
+		: remoteUrl?.includes("gitlab.com")
+			? "GitLab"
+			: remoteUrl?.includes("bitbucket.org")
+				? "Bitbucket"
+				: remoteUrl
+					? "Git"
+					: undefined;
+
+	return { hasGit: true, provider, remoteUrl };
+}
+
+function uniqueReasons(reasons: string[]): string[] {
+	return Array.from(new Set(reasons)).slice(0, 5);
+}
+
+function formatDatabaseKind(kind: DatabaseKind): string {
+	if (kind === "postgres") return "Postgres";
+	if (kind === "mysql") return "MySQL";
+	return "none";
+}
+
 async function resolveDeploymentTarget(
 	client: any,
+	profile: Profile,
 	appIdentifier?: string,
-): Promise<{ app: AppSummary; shouldUploadSource: boolean }> {
+	options: DeployOptions = {},
+	sourcePreference: SourcePreference = "auto",
+): Promise<DeploymentTarget> {
 	const _spinner = startSpinner("Finding application...");
 	const apps: AppSummary[] = await client.application.allByOrganization.query();
 	succeedSpinner();
@@ -190,6 +700,8 @@ async function resolveDeploymentTarget(
 		const details = await getApplicationDetails(client, app.applicationId);
 		return {
 			app,
+			createdApp: false,
+			hasConfiguredSource: hasConfiguredSource(details),
 			shouldUploadSource: shouldUseLocalSource(details, {
 				explicitApp: true,
 			}),
@@ -206,6 +718,8 @@ async function resolveDeploymentTarget(
 			const details = await getApplicationDetails(client, app.applicationId);
 			return {
 				app,
+				createdApp: false,
+				hasConfiguredSource: hasConfiguredSource(details),
 				shouldUploadSource: shouldUseLocalSource(details, {
 					linkedProject: true,
 				}),
@@ -229,8 +743,18 @@ async function resolveDeploymentTarget(
 	}
 
 	if (apps.length === 0) {
-		const app = await createAppFromCurrentDirectory(client);
-		return { app, shouldUploadSource: true };
+		if (sourcePreference === "configured") {
+			throw new InvalidArgumentError(
+				'No Tarout app exists to deploy from a configured source. Create or select an app with a configured Git provider first, or rerun with "--source upload".',
+			);
+		}
+		const app = await createAppFromCurrentDirectory(client, profile, options);
+		return {
+			app,
+			createdApp: true,
+			hasConfiguredSource: false,
+			shouldUploadSource: true,
+		};
 	}
 
 	const createValue = "__create__";
@@ -246,8 +770,18 @@ async function resolveDeploymentTarget(
 	]);
 
 	if (selected === createValue) {
-		const app = await createAppFromCurrentDirectory(client);
-		return { app, shouldUploadSource: true };
+		if (sourcePreference === "configured") {
+			throw new InvalidArgumentError(
+				'New apps do not have a configured Git provider source yet. Connect a Git provider first, or rerun with "--source upload".',
+			);
+		}
+		const app = await createAppFromCurrentDirectory(client, profile, options);
+		return {
+			app,
+			createdApp: true,
+			hasConfiguredSource: false,
+			shouldUploadSource: true,
+		};
 	}
 
 	const app = findApp(apps, selected);
@@ -255,27 +789,27 @@ async function resolveDeploymentTarget(
 		throw new NotFoundError("Application", selected);
 	}
 
-	const profile = getCurrentProfile();
-	if (profile) {
-		setProjectConfig({
-			applicationId: app.applicationId,
-			name: app.name,
-			organizationId: profile.organizationId,
-			linkedAt: new Date().toISOString(),
-		});
-	}
+	setProjectConfig({
+		applicationId: app.applicationId,
+		name: app.name,
+		organizationId: profile.organizationId,
+		linkedAt: new Date().toISOString(),
+	});
 
 	const details = await getApplicationDetails(client, app.applicationId);
 	return {
 		app,
+		createdApp: false,
+		hasConfiguredSource: hasConfiguredSource(details),
 		shouldUploadSource: await promptForLocalSourceIfNeeded(details),
 	};
 }
 
-async function createAppFromCurrentDirectory(client: any): Promise<AppSummary> {
-	const profile = getCurrentProfile();
-	if (!profile) throw new AuthError();
-
+async function createAppFromCurrentDirectory(
+	client: any,
+	profile: Profile,
+	options: DeployOptions = {},
+): Promise<AppSummary> {
 	const defaultName = basename(process.cwd()) || "tarout-app";
 	let appName = defaultName;
 
@@ -284,12 +818,14 @@ async function createAppFromCurrentDirectory(client: any): Promise<AppSummary> {
 	}
 
 	const slug = generateSlug(appName);
+	const plan = await resolveAppPlanForCreate(client, options);
 	const _spinner = startSpinner("Creating application...");
 	const application = await client.application.create.mutate({
 		name: appName,
 		appName: slug,
 		organizationId: profile.organizationId,
 		region: DEFAULT_REGION,
+		...(plan ? { plan } : {}),
 	});
 	succeedSpinner("Application created!");
 
@@ -303,6 +839,8 @@ async function createAppFromCurrentDirectory(client: any): Promise<AppSummary> {
 	if (!isJsonMode()) {
 		box("Project Linked", [
 			`Application: ${colors.cyan(application.name)}`,
+			`Plan: ${colors.bold(application.plan ?? plan ?? "auto")}`,
+			"Source: current directory upload (no GitHub required)",
 			`ID: ${colors.dim(application.applicationId)}`,
 			`Directory: ${colors.dim(process.cwd())}`,
 		]);
@@ -312,8 +850,469 @@ async function createAppFromCurrentDirectory(client: any): Promise<AppSummary> {
 		applicationId: application.applicationId,
 		name: application.name,
 		appName: application.appName,
+		plan: application.plan,
 		sourceType: application.sourceType,
 	};
+}
+
+async function resolveAppPlanForCreate(
+	client: any,
+	options: DeployOptions,
+): Promise<AppPlan | undefined> {
+	const explicitPlan = normalizeAppPlan(options.plan);
+	if (explicitPlan) return explicitPlan;
+	if (isJsonMode() || shouldSkipConfirmation()) return undefined;
+
+	const choices = await getAppPlanChoices(client);
+	if (choices.length === 0) return undefined;
+
+	return select<AppPlan>("Application hosting plan:", choices);
+}
+
+async function getAppPlanChoices(
+	client: any,
+): Promise<Array<{ name: string; value: AppPlan }>> {
+	try {
+		const options = await client.application.getCreateOptions.query();
+		const tiers = Array.isArray(options?.tiers) ? options.tiers : [];
+		const defaultTier = options?.defaultTier as AppPlan | null | undefined;
+		const availableChoices = tiers
+			.filter((tier: any) => tier && Number(tier.available ?? 0) > 0)
+			.map((tier: any) => ({
+				name: formatAppPlanChoice(tier.tier, tier, tier.tier === defaultTier),
+				value: tier.tier as AppPlan,
+			}));
+
+		if (defaultTier) {
+			availableChoices.sort(
+				(
+					a: { name: string; value: AppPlan },
+					b: { name: string; value: AppPlan },
+				) => {
+					if (a.value === defaultTier) return -1;
+					if (b.value === defaultTier) return 1;
+					return 0;
+				},
+			);
+		}
+
+		return availableChoices;
+	} catch {
+		return [
+			{ name: "Free app", value: "FREE" },
+			{ name: "Shared app", value: "SHARED" },
+			{ name: "Dedicated app", value: "DEDICATED" },
+		];
+	}
+}
+
+function formatAppPlanChoice(
+	plan: AppPlan,
+	tier: { available?: number; total?: number },
+	isDefault: boolean,
+): string {
+	const label =
+		plan === "FREE"
+			? "Free app"
+			: plan === "SHARED"
+				? "Shared app"
+				: "Dedicated app";
+	const availability =
+		typeof tier.available === "number" && typeof tier.total === "number"
+			? ` ${colors.dim(`(${tier.available}/${tier.total} slots available)`)}`
+			: "";
+	const suffix = isDefault ? ` ${colors.dim("recommended")}` : "";
+	return `${label}${availability}${suffix}`;
+}
+
+function normalizeAppPlan(value: string | undefined): AppPlan | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().toUpperCase();
+	if (
+		normalized === "FREE" ||
+		normalized === "SHARED" ||
+		normalized === "DEDICATED"
+	) {
+		return normalized;
+	}
+
+	throw new InvalidArgumentError(
+		'Invalid app plan. Use "free", "shared", or "dedicated".',
+	);
+}
+
+async function resolveSourcePreference(
+	options: DeployOptions,
+	inspection: ProjectInspection,
+): Promise<SourcePreference> {
+	const explicitSource = normalizeSourcePreference(options.source);
+	if (explicitSource !== "auto") return explicitSource;
+	if (!inspection.git.hasGit || isJsonMode() || shouldSkipConfirmation()) {
+		return "auto";
+	}
+
+	const label = inspection.git.provider
+		? `${inspection.git.provider} Git repository detected. Deployment source:`
+		: "Git repository detected. Deployment source:";
+	return select<SourcePreference>(label, [
+		{
+			name: "Use current folder upload for this deploy (default, no GitHub required)",
+			value: "upload",
+		},
+		{
+			name: "Use an app source already connected in Tarout",
+			value: "configured",
+		},
+		{
+			name: "Open Tarout Git provider setup in the browser, then rerun deploy",
+			value: "connect",
+		},
+	]);
+}
+
+function normalizeSourcePreference(
+	value: string | undefined,
+): SourcePreference {
+	if (!value) return "auto";
+	const normalized = value.trim().toLowerCase();
+	if (
+		normalized === "auto" ||
+		normalized === "upload" ||
+		normalized === "configured" ||
+		normalized === "connect"
+	) {
+		return normalized;
+	}
+
+	throw new InvalidArgumentError(
+		'Invalid source choice. Use "auto", "upload", "configured", or "connect".',
+	);
+}
+
+function resolveShouldUploadSource(
+	target: DeploymentTarget,
+	sourcePreference: SourcePreference,
+): boolean {
+	if (sourcePreference === "upload") return true;
+	if (sourcePreference === "configured") {
+		if (!target.hasConfiguredSource) {
+			throw new InvalidArgumentError(
+				'No configured Git/provider source exists for this app yet. Connect a Git provider first, or rerun with "--source upload" to deploy the current folder.',
+			);
+		}
+		return false;
+	}
+	if (sourcePreference === "connect") {
+		throw new InvalidArgumentError(
+			'Connect a Git provider in Tarout first, then rerun with "--source configured" or "--source upload".',
+		);
+	}
+	return target.shouldUploadSource;
+}
+
+async function openGitProviderSetup(): Promise<void> {
+	const url = `${getApiUrl().replace(/\/+$/, "")}/dashboard/settings/git-providers`;
+
+	if (isJsonMode()) {
+		outputData({
+			action: "connect_git_provider",
+			url,
+			next: 'After connecting GitHub or another Git provider, rerun "tarout deploy --source configured" or use "--source upload".',
+		});
+		return;
+	}
+
+	log("");
+	log(`Opening Tarout Git provider setup: ${colors.cyan(url)}`);
+	log(
+		"Complete the GitHub or Git provider connection in the browser, then rerun deploy.",
+	);
+	log(
+		`No GitHub account is required if you keep using ${colors.dim("--source upload")}.`,
+	);
+	await open(url);
+}
+
+async function configureOptionalResources(
+	client: any,
+	profile: Profile,
+	app: AppSummary,
+	options: DeployOptions,
+	inspection: ProjectInspection,
+): Promise<void> {
+	const database = await resolveDatabaseChoice(options, inspection);
+	const createdResources: string[] = [];
+
+	if (database !== "none") {
+		const plan = await resolveResourcePlan(
+			options.databasePlan,
+			"Database plan:",
+		);
+		const databaseName = formatResourceName(
+			app.name,
+			database === "postgres" ? "Postgres" : "MySQL",
+		);
+		await createAndAttachDatabase(client, profile, app, {
+			kind: database,
+			name: databaseName,
+			plan,
+		});
+		createdResources.push(
+			`${database === "postgres" ? "Postgres" : "MySQL"} (${plan})`,
+		);
+	}
+
+	if (await resolveStorageChoice(options, inspection)) {
+		const plan = await resolveResourcePlan(options.storagePlan, "Storage plan:");
+		const storageName = formatResourceName(app.name, "files", 50);
+		await createAndAttachStorage(client, app, {
+			name: storageName,
+			plan,
+		});
+		createdResources.push(`Storage (${plan})`);
+	}
+
+	if (createdResources.length > 0 && !isJsonMode()) {
+		box("Provisioned Resources", createdResources);
+	}
+}
+
+async function resolveDatabaseChoice(
+	options: DeployOptions,
+	inspection: ProjectInspection,
+): Promise<DatabaseKind> {
+	const explicitChoice = normalizeDatabaseKind(options.database);
+	if (explicitChoice) return explicitChoice;
+	if (isJsonMode() || shouldSkipConfirmation()) return inspection.database;
+
+	if (inspection.database !== "none") {
+		log("");
+		log(
+			`Detected ${colors.cyan(formatDatabaseKind(inspection.database))} usage: ${inspection.databaseReasons.slice(0, 3).join("; ")}`,
+		);
+		const alternate = inspection.database === "postgres" ? "mysql" : "postgres";
+		return select<DatabaseKind>("Provision a database?", [
+			{
+				name: `Yes, create ${formatDatabaseKind(inspection.database)} (detected)`,
+				value: inspection.database,
+			},
+			{ name: "No database", value: "none" },
+			{ name: `Create ${formatDatabaseKind(alternate)}`, value: alternate },
+		]);
+	}
+
+	return select<DatabaseKind>("Provision a database?", [
+		{ name: "No database", value: "none" },
+		{ name: "Postgres", value: "postgres" },
+		{ name: "MySQL", value: "mysql" },
+	]);
+}
+
+async function resolveStorageChoice(
+	options: DeployOptions,
+	inspection: ProjectInspection,
+): Promise<boolean> {
+	if (options.storage === true) return true;
+	if (isJsonMode() || shouldSkipConfirmation()) return inspection.storage;
+
+	if (inspection.storage) {
+		log("");
+		log(
+			`Detected file storage usage: ${inspection.storageReasons.slice(0, 3).join("; ")}`,
+		);
+	}
+	return confirm(
+		"Provision file storage for this app?",
+		inspection.storage,
+	);
+}
+
+async function resolveResourcePlan(
+	value: string | undefined,
+	message: string,
+): Promise<ResourcePlan> {
+	const explicitPlan = normalizeResourcePlan(value);
+	if (explicitPlan) return explicitPlan;
+	if (isJsonMode() || shouldSkipConfirmation()) return "FREE";
+
+	return select<ResourcePlan>(message, [
+		{ name: "Free", value: "FREE" },
+		{ name: "Starter", value: "STARTER" },
+		{ name: "Standard", value: "STANDARD" },
+		{ name: "Pro", value: "PRO" },
+	]);
+}
+
+async function createAndAttachDatabase(
+	client: any,
+	profile: Profile,
+	app: AppSummary,
+	input: { kind: "postgres" | "mysql"; name: string; plan: ResourcePlan },
+): Promise<void> {
+	const appName = generateResourceSlug(app.name, input.kind);
+	const label = input.kind === "postgres" ? "Postgres" : "MySQL";
+	const _createSpinner = startSpinner(`Creating ${label} database...`);
+
+	try {
+		if (input.kind === "postgres") {
+			await client.postgres.create.mutate({
+				name: input.name,
+				appName,
+				dockerImage: "postgres:17",
+				organizationId: profile.organizationId,
+				environmentId: profile.environmentId,
+				plan: input.plan,
+				region: DEFAULT_REGION,
+			});
+		} else {
+			await client.mysql.create.mutate({
+				name: input.name,
+				appName,
+				dockerImage: "mysql:9.1",
+				organizationId: profile.organizationId,
+				environmentId: profile.environmentId,
+				plan: input.plan,
+				region: DEFAULT_REGION,
+			});
+		}
+		succeedSpinner(`${label} database created.`);
+	} catch (err) {
+		failSpinner(`Failed to create ${label} database.`);
+		throw err;
+	}
+
+	const databaseId = await findDatabaseIdByAppName(client, input.kind, appName);
+	const _attachSpinner = startSpinner(`Attaching ${label} to ${app.name}...`);
+	try {
+		if (input.kind === "postgres") {
+			await client.postgres.attachToApplication.mutate({
+				postgresId: databaseId,
+				applicationId: app.applicationId,
+			});
+		} else {
+			await client.mysql.attachToApplication.mutate({
+				mysqlId: databaseId,
+				applicationId: app.applicationId,
+			});
+		}
+		succeedSpinner(`${label} credentials attached.`);
+	} catch (err) {
+		failSpinner(`Failed to attach ${label} credentials.`);
+		throw err;
+	}
+}
+
+async function findDatabaseIdByAppName(
+	client: any,
+	kind: "postgres" | "mysql",
+	appName: string,
+): Promise<string> {
+	const databases =
+		kind === "postgres"
+			? await client.postgres.allByOrganization.query()
+			: await client.mysql.allByOrganization.query();
+	const database = databases.find((item: any) => item.appName === appName);
+	const id = kind === "postgres" ? database?.postgresId : database?.mysqlId;
+
+	if (!id) {
+		throw new Error(
+			`Created ${kind === "postgres" ? "Postgres" : "MySQL"} database, but could not resolve its ID for attachment.`,
+		);
+	}
+
+	return id;
+}
+
+async function createAndAttachStorage(
+	client: any,
+	app: AppSummary,
+	input: { name: string; plan: ResourcePlan },
+): Promise<void> {
+	const _createSpinner = startSpinner("Creating storage bucket...");
+	let bucketId: string;
+
+	try {
+		const bucket = await client.storage.create.mutate({
+			name: input.name,
+			publicAccess: false,
+			plan: input.plan,
+		});
+		bucketId = bucket.bucketId;
+		succeedSpinner("Storage bucket created.");
+	} catch (err) {
+		failSpinner("Failed to create storage bucket.");
+		throw err;
+	}
+
+	const _attachSpinner = startSpinner(`Attaching storage to ${app.name}...`);
+	try {
+		await client.storage.attachToApplication.mutate({
+			bucketId,
+			applicationId: app.applicationId,
+		});
+		succeedSpinner("Storage credentials attached.");
+	} catch (err) {
+		failSpinner("Failed to attach storage credentials.");
+		throw err;
+	}
+}
+
+function normalizeDatabaseKind(
+	value: string | undefined,
+): DatabaseKind | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "none" || normalized === "no") return "none";
+	if (
+		normalized === "postgres" ||
+		normalized === "postgresql" ||
+		normalized === "pg"
+	) {
+		return "postgres";
+	}
+	if (normalized === "mysql") return "mysql";
+
+	throw new InvalidArgumentError(
+		'Invalid database choice. Use "none", "postgres", or "mysql".',
+	);
+}
+
+function normalizeResourcePlan(
+	value: string | undefined,
+): ResourcePlan | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().toUpperCase();
+	if (
+		normalized === "FREE" ||
+		normalized === "STARTER" ||
+		normalized === "STANDARD" ||
+		normalized === "PRO"
+	) {
+		return normalized;
+	}
+
+	throw new InvalidArgumentError(
+		'Invalid resource plan. Use "free", "starter", "standard", or "pro".',
+	);
+}
+
+function formatResourceName(
+	name: string,
+	suffix: string,
+	maxLength = 80,
+): string {
+	const value = `${name} ${suffix}`.trim();
+	if (value.length <= maxLength) return value;
+
+	const suffixWithSpace = ` ${suffix}`;
+	const baseLength = Math.max(1, maxLength - suffixWithSpace.length);
+	return `${name.slice(0, baseLength).trim()}${suffixWithSpace}`;
+}
+
+function generateResourceSlug(appName: string, suffix: string): string {
+	return generateSlug(
+		`${appName}-${suffix}-${Date.now().toString(36).slice(-6)}`,
+	);
 }
 
 async function getApplicationDetails(client: any, applicationId: string) {
@@ -499,19 +1498,66 @@ export function registerDeployCommands(program: Command) {
 		.command("deploy")
 		.argument("[app]", "Application ID or name")
 		.description("Deploy an application")
+		.option("--api-url <url>", "Custom API URL", "https://tarout.sa")
+		.option("--plan <plan>", "App hosting plan: free, shared, or dedicated")
+		.option(
+			"--source <source>",
+			"Deployment source: auto, upload, configured, or connect",
+		)
+		.option("--database <type>", "Provision a database: none, postgres, or mysql")
+		.option(
+			"--database-plan <plan>",
+			"Database plan: free, starter, standard, or pro",
+		)
+		.option("--storage", "Provision file storage and attach it to the app")
+		.option(
+			"--storage-plan <plan>",
+			"Storage plan: free, starter, standard, or pro",
+		)
+		.option("--token <token>", "API token to use for this deployment")
 		.option("-r, --region <region>", "Deployment region", DEFAULT_REGION)
 		.option("-w, --wait", "Wait for deployment to complete and stream logs")
 		.option("--watch", "Alias for --wait")
-		.action(async (appIdentifier, options) => {
+		.action(async (appIdentifier, options: DeployOptions) => {
 			try {
-				await ensureLoggedInForDeploy();
+				const inspection = inspectCurrentProject();
+				printProjectInspection(inspection);
+
+				const profile = await ensureAuthenticatedForDeploy(options);
 				await confirmRegion(options.region);
 
 				const client = getApiClient();
-				const { app, shouldUploadSource } = await resolveDeploymentTarget(
-					client,
-					appIdentifier,
+				const sourcePreference = await resolveSourcePreference(
+					options,
+					inspection,
 				);
+				if (sourcePreference === "connect") {
+					await openGitProviderSetup();
+					return;
+				}
+				const target =
+					await resolveDeploymentTarget(
+						client,
+						profile,
+						appIdentifier,
+						options,
+						sourcePreference,
+					);
+				const { app, createdApp } = target;
+				const shouldUploadSource = resolveShouldUploadSource(
+					target,
+					sourcePreference,
+				);
+
+				if (createdApp) {
+					await configureOptionalResources(
+						client,
+						profile,
+						app,
+						options,
+						inspection,
+					);
+				}
 
 				if (shouldUploadSource) {
 					await uploadCurrentDirectorySource(

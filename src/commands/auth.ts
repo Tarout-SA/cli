@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import open from "open";
 import { startAuthServer } from "../lib/auth-server.js";
+import { resolveProfileFromCredential } from "../lib/auth-profile.js";
 import {
 	clearConfig,
 	getCurrentProfile,
@@ -48,7 +49,7 @@ export function registerAuthCommands(program: Command) {
 				const callbackUrl = `http://localhost:${authServer.port}/callback`;
 
 				// Open browser to auth page
-				const authUrl = `${apiUrl}/cli-auth?callback=${encodeURIComponent(callbackUrl)}`;
+				const authUrl = `${apiUrl}/cli-authorize?callback=${encodeURIComponent(callbackUrl)}`;
 
 				await open(authUrl);
 
@@ -57,11 +58,11 @@ export function registerAuthCommands(program: Command) {
 				try {
 					const authData = await authServer.waitForCallback();
 
-					succeedSpinner("Authentication successful!");
+					succeedSpinner("CLI authorized.");
 					authServer.close();
 
 					// Save profile
-					setProfile("default", {
+					const fallbackProfile = {
 						token: authData.token,
 						apiUrl,
 						userId: authData.userId,
@@ -69,9 +70,18 @@ export function registerAuthCommands(program: Command) {
 						userName: authData.userName,
 						organizationId: authData.organizationId,
 						organizationName: authData.organizationName,
+						projectId: authData.projectId,
+						projectName: authData.projectName,
+						projectSlug: authData.projectSlug,
 						environmentId: authData.environmentId,
 						environmentName: authData.environmentName,
-					});
+					};
+					const profile = await resolveProfileFromCredential({
+						token: authData.token,
+						apiUrl,
+						fallback: fallbackProfile,
+					}).catch(() => fallbackProfile);
+					setProfile("default", profile);
 					setCurrentProfile("default");
 
 					if (isJsonMode()) {
@@ -93,7 +103,7 @@ export function registerAuthCommands(program: Command) {
 						});
 					} else {
 						log("");
-						success(`Logged in as ${colors.cyan(authData.userEmail)}`);
+						success(`CLI authorized as ${colors.cyan(authData.userEmail)}`);
 						box("Account", [
 							`Organization: ${colors.bold(authData.organizationName)}`,
 							`Environment: ${colors.bold(authData.environmentName)}`,
@@ -159,7 +169,7 @@ export function registerAuthCommands(program: Command) {
 
 				const authServer = await startAuthServer();
 				const callbackUrl = `http://localhost:${authServer.port}/callback`;
-				const authUrl = `${apiUrl}/cli-auth?action=register&callback=${encodeURIComponent(callbackUrl)}`;
+				const authUrl = `${apiUrl}/cli-authorize?action=register&callback=${encodeURIComponent(callbackUrl)}`;
 
 				await open(authUrl);
 
@@ -170,7 +180,7 @@ export function registerAuthCommands(program: Command) {
 					succeedSpinner("Account created and authenticated!");
 					authServer.close();
 
-					setProfile("default", {
+					const fallbackProfile = {
 						token: authData.token,
 						apiUrl,
 						userId: authData.userId,
@@ -178,9 +188,18 @@ export function registerAuthCommands(program: Command) {
 						userName: authData.userName,
 						organizationId: authData.organizationId,
 						organizationName: authData.organizationName,
+						projectId: authData.projectId,
+						projectName: authData.projectName,
+						projectSlug: authData.projectSlug,
 						environmentId: authData.environmentId,
 						environmentName: authData.environmentName,
-					});
+					};
+					const profile = await resolveProfileFromCredential({
+						token: authData.token,
+						apiUrl,
+						fallback: fallbackProfile,
+					}).catch(() => fallbackProfile);
+					setProfile("default", profile);
 					setCurrentProfile("default");
 
 					if (isJsonMode()) {
@@ -231,56 +250,35 @@ export function registerAuthCommands(program: Command) {
 				const apiUrl = options.apiUrl;
 				const _spinner = startSpinner("Verifying token...");
 
-				// Call the platform to get user info from the token
-				const { createTRPCProxyClient, httpBatchLink } = await import(
-					"@trpc/client"
-				);
-				const superjson = (await import("superjson")).default;
-
-				const tempClient = createTRPCProxyClient({
-					transformer: superjson,
-					links: [
-						httpBatchLink({
-							url: `${apiUrl}/api/trpc`,
-							headers: () => ({ "x-api-key": apiToken }),
-						}),
-					],
+				const profile = await resolveProfileFromCredential({
+					token: apiToken,
+					apiUrl,
 				});
-
-				const user = await (tempClient as any).user.get.query();
-				const orgs = await (tempClient as any).organization.all.query();
-				const envs = await (tempClient as any).environment.all.query();
 
 				succeedSpinner("Token verified!");
 
-				const org = orgs?.[0];
-				const env = envs?.[0];
-
-				setProfile("default", {
-					token: apiToken,
-					apiUrl,
-					userId: user.id,
-					userEmail: user.email,
-					userName: user.name,
-					organizationId: org?.id || "",
-					organizationName: org?.name || "",
-					environmentId: env?.environmentId || "",
-					environmentName: env?.name || "",
-				});
+				setProfile("default", profile);
 				setCurrentProfile("default");
 
 				if (isJsonMode()) {
 					outputData({
 						success: true,
-						user: { id: user.id, email: user.email, name: user.name },
-						organization: { id: org?.id, name: org?.name },
+						user: {
+							id: profile.userId,
+							email: profile.userEmail,
+							name: profile.userName,
+						},
+						organization: {
+							id: profile.organizationId,
+							name: profile.organizationName,
+						},
 					});
 				} else {
 					log("");
-					success(`Authenticated as ${colors.cyan(user.email)}`);
+					success(`Authenticated as ${colors.cyan(profile.userEmail)}`);
 					box("Account", [
-						`Organization: ${colors.bold(org?.name || "None")}`,
-						`Environment: ${colors.bold(env?.name || "None")}`,
+						`Organization: ${colors.bold(profile.organizationName || "None")}`,
+						`Environment: ${colors.bold(profile.environmentName || "None")}`,
 					]);
 				}
 			} catch (err) {
@@ -310,7 +308,11 @@ export function registerAuthCommands(program: Command) {
 
 				const result = await client.user.createApiKey.mutate({
 					name: tokenName,
-					metadata: { organizationId: profile?.organizationId || "" },
+					metadata: {
+						organizationId: profile?.organizationId || "",
+						environmentId: profile?.environmentId || "",
+						projectId: profile?.projectId || "",
+					},
 				});
 
 				succeedSpinner("API token created!");

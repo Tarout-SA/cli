@@ -8,6 +8,9 @@ export interface AuthCallbackData {
 	userName?: string;
 	organizationId: string;
 	organizationName: string;
+	projectId?: string;
+	projectName?: string;
+	projectSlug?: string;
 	environmentId: string;
 	environmentName: string;
 }
@@ -37,6 +40,9 @@ export function startAuthServer(): Promise<{
 				userName,
 				organizationId,
 				organizationName,
+				projectId,
+				projectName,
+				projectSlug,
 				environmentId,
 				environmentName,
 				error,
@@ -114,6 +120,9 @@ export function startAuthServer(): Promise<{
 				userName: userName ? String(userName) : undefined,
 				organizationId: String(organizationId),
 				organizationName: String(organizationName),
+				projectId: projectId ? String(projectId) : undefined,
+				projectName: projectName ? String(projectName) : undefined,
+				projectSlug: projectSlug ? String(projectSlug) : undefined,
 				environmentId: String(environmentId),
 				environmentName: String(environmentName),
 			});

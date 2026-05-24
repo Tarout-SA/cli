@@ -33,10 +33,10 @@ bun add -g @tarout/cli
 # 1. Login via browser (opens authentication page)
 tarout login
 
-# 2. Deploy from your project root
-tarout deploy --wait
+# 2. Inspect and deploy from your project root
+tarout deploy --wait --source upload
 
-# The first deploy prompts to create or link an app when needed.
+# The first deploy prompts to create or link an app, and to create detected resources.
 ```
 
 ## Commands
@@ -85,8 +85,8 @@ tarout apps delete my-api --yes
 | `tarout deploy:list <app>` | List recent deployments |
 
 ```bash
-# Deploy the linked application
-tarout deploy --wait
+# Inspect and deploy the current folder
+tarout deploy --wait --source upload
 
 # Deploy and wait for completion
 tarout deploy my-app --wait
@@ -94,6 +94,8 @@ tarout deploy my-app --wait
 # Check deployment status
 tarout deploy:status my-app
 ```
+
+`tarout deploy` inspects the current folder for database, file storage, and Git signals before it asks questions. If Git exists, local upload remains available, so users without GitHub can still deploy. If the user chooses GitHub, run `tarout providers github connect` to open Tarout's Git provider setup page, then connect the repository to the app and deploy with `--source configured`.
 
 ### Logs
 

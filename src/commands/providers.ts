@@ -1,6 +1,7 @@
 import type { Command } from "commander";
+import open from "open";
 import { getApiClient } from "../lib/api.js";
-import { isLoggedIn } from "../lib/config.js";
+import { getApiUrl, isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
 	colors,
@@ -134,6 +135,34 @@ export function registerProvidersCommands(program: Command) {
 	const github = providers
 		.command("github")
 		.description("Manage GitHub providers");
+
+	github
+		.command("connect")
+		.description("Open Tarout's GitHub provider setup flow")
+		.action(async () => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+
+				const url = `${getApiUrl().replace(/\/+$/, "")}/dashboard/settings/git-providers`;
+				if (isJsonMode()) {
+					outputData({
+						action: "connect_github_provider",
+						url,
+						next: "Complete the browser flow, then run tarout apps git github <app> --repo <owner/repo> or tarout deploy <app> --source configured.",
+					});
+					return;
+				}
+
+				log("");
+				log(`Opening Tarout Git provider setup: ${colors.cyan(url)}`);
+				log(
+					"Complete the GitHub browser flow, then connect the repository to your app.",
+				);
+				await open(url);
+			} catch (err) {
+				handleError(err);
+			}
+		});
 
 	github
 		.command("list")
