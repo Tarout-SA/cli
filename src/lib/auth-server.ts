@@ -1,4 +1,5 @@
 import type { Server } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import express from "express";
 
 export interface AuthCallbackData {
@@ -15,13 +16,41 @@ export interface AuthCallbackData {
 	environmentName: string;
 }
 
-export function startAuthServer(): Promise<{
+interface StartAuthServerOptions {
+	state?: string;
+}
+
+function createAuthState(): string {
+	return randomBytes(32).toString("base64url");
+}
+
+function safeEqual(a: string, b: string): boolean {
+	const aBuffer = Buffer.from(a);
+	const bBuffer = Buffer.from(b);
+	if (aBuffer.length !== bBuffer.length) return false;
+	return timingSafeEqual(aBuffer, bBuffer);
+}
+
+function escapeHtml(value: unknown): string {
+	return String(value)
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#39;");
+}
+
+export function startAuthServer(
+	options: StartAuthServerOptions = {},
+): Promise<{
 	port: number;
+	state: string;
 	waitForCallback: () => Promise<AuthCallbackData>;
 	close: () => void;
 }> {
 	return new Promise((resolve) => {
 		const app = express();
+		const expectedState = options.state ?? createAuthState();
 		// biome-ignore lint/style/useConst: server is declared before assignment due to closure scope requirements
 		let server: Server;
 		let callbackResolver: (data: AuthCallbackData) => void;
@@ -43,14 +72,24 @@ export function startAuthServer(): Promise<{
 				projectId,
 				projectName,
 				projectSlug,
-				environmentId,
-				environmentName,
-				error,
-			} = req.query;
+					environmentId,
+					environmentName,
+					error,
+					state,
+				} = req.query;
 
-			if (error) {
-				res.send(`
-          <!DOCTYPE html>
+				if (
+					!state ||
+					Array.isArray(state) ||
+					!safeEqual(String(state), expectedState)
+				) {
+					res.status(400).send("Invalid authentication state");
+					return;
+				}
+
+				if (error) {
+					res.send(`
+	          <!DOCTYPE html>
           <html>
             <head>
               <title>Tarout</title>
@@ -61,13 +100,13 @@ export function startAuthServer(): Promise<{
                 p { color: #666; }
               </style>
             </head>
-            <body>
-              <div class="container">
-                <h1>Authentication Failed</h1>
-                <p>${error}</p>
-                <p>You can close this window and try again.</p>
-              </div>
-            </body>
+	            <body>
+	              <div class="container">
+	                <h1>Authentication Failed</h1>
+	                <p>${escapeHtml(error)}</p>
+	                <p>You can close this window and try again.</p>
+	              </div>
+	            </body>
           </html>
         `);
 				callbackRejecter(new Error(String(error)));
@@ -126,29 +165,36 @@ export function startAuthServer(): Promise<{
 				environmentId: String(environmentId),
 				environmentName: String(environmentName),
 			});
-		});
+			});
 
-		// Find an available port
-		server = app.listen(0, () => {
-			const address = server.address();
-			const port = typeof address === "object" && address ? address.port : 0;
+			// Timeout after 5 minutes
+			const timeout = setTimeout(
+				() => {
+					callbackRejecter(
+						new Error("Authentication timed out. Please try again."),
+					);
+					server.close();
+				},
+				5 * 60 * 1000,
+			);
+			timeout.unref?.();
 
-			resolve({
-				port,
-				waitForCallback: () => callbackPromise,
-				close: () => server.close(),
+			const close = () => {
+				clearTimeout(timeout);
+				server.close();
+			};
+
+			// Find an available port
+			server = app.listen(0, "127.0.0.1", () => {
+				const address = server.address();
+				const port = typeof address === "object" && address ? address.port : 0;
+
+				resolve({
+					port,
+					state: expectedState,
+					waitForCallback: () => callbackPromise,
+					close,
+				});
 			});
 		});
-
-		// Timeout after 5 minutes
-		setTimeout(
-			() => {
-				callbackRejecter(
-					new Error("Authentication timed out. Please try again."),
-				);
-				server.close();
-			},
-			5 * 60 * 1000,
-		);
-	});
-}
+	}

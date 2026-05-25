@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
 import { isLoggedIn } from "../lib/config.js";
@@ -278,7 +278,12 @@ export function registerEnvCommands(program: Command) {
 					maskSecrets: !options.reveal,
 				});
 
-				writeFileSync(options.output, result.content);
+				writeFileSync(options.output, result.content, { mode: 0o600 });
+				try {
+					chmodSync(options.output, 0o600);
+				} catch {
+					// Best-effort: keep exported env files private where supported.
+				}
 
 				succeedSpinner(`Saved to ${options.output}`);
 

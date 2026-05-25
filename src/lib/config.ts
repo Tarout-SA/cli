@@ -45,6 +45,7 @@ export interface Config {
 /** Configuration store using the Conf library. Persists to ~/.tarout/config.json */
 const config = new Conf<Config>({
 	projectName: "tarout",
+	configFileMode: 0o600,
 	defaults: {
 		currentProfile: "default",
 		profiles: {},
@@ -159,6 +160,7 @@ export function listProfiles(): string[] {
 // ==========================================
 
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -187,6 +189,14 @@ export interface ProjectConfig {
 const PROJECT_CONFIG_DIR = ".tarout";
 /** Default path to the local project config file */
 const PROJECT_CONFIG_FILE = "project.json";
+
+function chmodIfSupported(path: string, mode: number): void {
+	try {
+		chmodSync(path, mode);
+	} catch {
+		// chmod is best-effort on some filesystems/platforms.
+	}
+}
 
 /**
  * Gets the path to the .tarout directory for a given base path.
@@ -251,11 +261,16 @@ export function setProjectConfig(
 
 	// Create .tarout directory if it doesn't exist
 	if (!existsSync(configDir)) {
-		mkdirSync(configDir, { recursive: true });
+		mkdirSync(configDir, { recursive: true, mode: 0o700 });
 	}
+	chmodIfSupported(configDir, 0o700);
 
 	// Write the config file
-	writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+	writeFileSync(configPath, JSON.stringify(config, null, 2), {
+		encoding: "utf-8",
+		mode: 0o600,
+	});
+	chmodIfSupported(configPath, 0o600);
 
 	// Create .gitignore in .tarout directory to ignore sensitive files
 	const gitignorePath = join(configDir, ".gitignore");
@@ -263,8 +278,9 @@ export function setProjectConfig(
 		writeFileSync(
 			gitignorePath,
 			"# Ignore local tarout config\n*\n!.gitignore\n",
-			"utf-8",
+			{ encoding: "utf-8", mode: 0o600 },
 		);
+		chmodIfSupported(gitignorePath, 0o600);
 	}
 }
 

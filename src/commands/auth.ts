@@ -44,9 +44,9 @@ export function registerAuthCommands(program: Command) {
 				log("");
 				log("Opening browser to authenticate...");
 
-				// Start local server for callback
-				const authServer = await startAuthServer();
-				const callbackUrl = `http://localhost:${authServer.port}/callback`;
+					// Start local server for callback
+					const authServer = await startAuthServer();
+					const callbackUrl = `http://localhost:${authServer.port}/callback?state=${encodeURIComponent(authServer.state)}`;
 
 				// Open browser to auth page
 				const authUrl = `${apiUrl}/cli-authorize?callback=${encodeURIComponent(callbackUrl)}`;
@@ -167,8 +167,8 @@ export function registerAuthCommands(program: Command) {
 				log("");
 				log("Opening browser to create your account...");
 
-				const authServer = await startAuthServer();
-				const callbackUrl = `http://localhost:${authServer.port}/callback`;
+					const authServer = await startAuthServer();
+					const callbackUrl = `http://localhost:${authServer.port}/callback?state=${encodeURIComponent(authServer.state)}`;
 				const authUrl = `${apiUrl}/cli-authorize?action=register&callback=${encodeURIComponent(callbackUrl)}`;
 
 				await open(authUrl);

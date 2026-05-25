@@ -319,7 +319,6 @@ export function runCommand(
 				...env,
 			},
 			stdio: ["inherit", "pipe", "pipe"],
-			shell: true,
 		};
 
 		const child = spawn(cmd, args, spawnOptions);

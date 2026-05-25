@@ -32,12 +32,12 @@ export interface StreamResult {
  * Streams deployment logs from the server via WebSocket.
  * Connects to /listen-deployment endpoint and streams log output in real-time.
  *
- * @param logPath - The log file path from the deployment record
+ * @param deploymentId - The deployment record id to stream
  * @param options - Callbacks for handling WebSocket events
  * @returns Object containing cleanup function and completion promise
  *
  * @example
- * const { cleanup, done } = streamDeploymentLogs("/path/to/log.log", {
+ * const { cleanup, done } = streamDeploymentLogs("deployment_123", {
  *   onData: (line) => console.log(line),
  *   onClose: () => console.log("Stream ended"),
  * });
@@ -49,7 +49,7 @@ export interface StreamResult {
  * const { code, reason } = await done;
  */
 export function streamDeploymentLogs(
-	logPath: string,
+	deploymentId: string,
 	options: WebSocketOptions,
 ): StreamResult {
 	const token = getToken();
@@ -57,7 +57,7 @@ export function streamDeploymentLogs(
 
 	// Convert HTTP(S) URL to WS(S)
 	const wsUrl = apiUrl.replace(/^http/, "ws");
-	const fullUrl = `${wsUrl}/listen-deployment?logPath=${encodeURIComponent(logPath)}`;
+	const fullUrl = `${wsUrl}/listen-deployment?deploymentId=${encodeURIComponent(deploymentId)}`;
 
 	const ws = new WebSocket(fullUrl, {
 		headers: {
@@ -119,18 +119,18 @@ export function streamDeploymentLogs(
  * This is a higher-level wrapper that handles the common use case of
  * collecting all logs until deployment completes.
  *
- * @param logPath - The log file path from the deployment record
+ * @param deploymentId - The deployment record id to stream
  * @param callbacks - Optional callbacks for real-time updates
  * @returns Promise resolving to collected log lines
  *
  * @example
- * const logs = await collectDeploymentLogs("/path/to/log.log", {
+ * const logs = await collectDeploymentLogs("deployment_123", {
  *   onLine: (line) => process.stdout.write(line + "\n"),
  * });
  * console.log(`Collected ${logs.length} log lines`);
  */
 export async function collectDeploymentLogs(
-	logPath: string,
+	deploymentId: string,
 	callbacks?: {
 		onLine?: (line: string) => void;
 		onError?: (error: Error) => void;
@@ -138,7 +138,7 @@ export async function collectDeploymentLogs(
 ): Promise<string[]> {
 	const lines: string[] = [];
 
-	const { done } = streamDeploymentLogs(logPath, {
+	const { done } = streamDeploymentLogs(deploymentId, {
 		onData: (line) => {
 			lines.push(line);
 			callbacks?.onLine?.(line);

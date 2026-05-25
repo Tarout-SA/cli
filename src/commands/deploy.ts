@@ -209,7 +209,7 @@ async function authenticateViaBrowser(
 	apiUrl: string,
 ): Promise<Profile> {
 	const authServer = await startAuthServer();
-	const callbackUrl = `http://localhost:${authServer.port}/callback`;
+	const callbackUrl = `http://localhost:${authServer.port}/callback?state=${encodeURIComponent(authServer.state)}`;
 	const authUrl =
 		action === "register"
 			? `${apiUrl}/cli-authorize?action=register&callback=${encodeURIComponent(callbackUrl)}`
@@ -1854,7 +1854,7 @@ export function registerDeployCommands(program: Command) {
 					const errors: string[] = [];
 					let finalStatus = deployment.status;
 
-					const { cleanup, done } = streamDeploymentLogs(deployment.logPath, {
+					const { cleanup, done } = streamDeploymentLogs(deployment.deploymentId, {
 						onData: (line) => {
 							logLines.push(line);
 							if (isErrorLine(line)) {
@@ -2294,7 +2294,7 @@ async function streamDeploymentWithLogs(
 	let cleanup: (() => void) | null = null;
 
 	if (deployment.logPath) {
-		const stream = streamDeploymentLogs(deployment.logPath, {
+		const stream = streamDeploymentLogs(deployment.deploymentId, {
 			onData: (line) => {
 				logLines.push(line);
 				if (isErrorLine(line)) {
