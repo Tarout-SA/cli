@@ -166,6 +166,33 @@ export function outputData<T>(data: T): void {
 	}
 }
 
+/**
+ * Emits a structured JSON error to stdout when --json is active.
+ * Use this for command-level failures the caller (an agent) must parse,
+ * e.g. needs_upgrade, deployment_failed, build_failed. Always pairs with
+ * a non-zero exit code via the corresponding ExitCode value at the call site.
+ */
+export function outputError(
+	code: string,
+	message: string,
+	details?: unknown,
+): void {
+	if (globalOptions.json) {
+		outputJson(jsonError(code, message, undefined, details));
+	}
+}
+
+/**
+ * Print a single JSON line to stdout regardless of --json mode.
+ * Used for streaming status events (deployment progress, poll updates)
+ * so an agent can read newline-delimited JSON without waiting for the
+ * final response. Skipped in --quiet to keep that mode silent.
+ */
+export function outputJsonLine(payload: unknown): void {
+	if (globalOptions.quiet) return;
+	console.log(JSON.stringify(payload));
+}
+
 // Quiet mode output (only essential info)
 export function quietOutput(message: string): void {
 	if (globalOptions.quiet || globalOptions.json) {

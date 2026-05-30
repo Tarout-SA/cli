@@ -48,6 +48,7 @@ import {
 	isJsonMode,
 	log,
 	outputData,
+	outputError,
 	quietOutput,
 	shouldSkipConfirmation,
 	success,
@@ -120,7 +121,7 @@ interface DeploymentTarget {
 	shouldUploadSource: boolean;
 }
 
-async function ensureAuthenticatedForDeploy(
+export async function ensureAuthenticatedForDeploy(
 	options: DeployOptions,
 ): Promise<Profile> {
 	const apiUrl = (options.apiUrl || getApiUrl()).replace(/\/+$/, "");
@@ -805,7 +806,7 @@ async function resolveDeploymentTarget(
 	};
 }
 
-async function createAppFromCurrentDirectory(
+export async function createAppFromCurrentDirectory(
 	client: any,
 	profile: Profile,
 	options: DeployOptions = {},
@@ -1379,7 +1380,7 @@ function hasConfiguredSource(app: any): boolean {
 	}
 }
 
-async function uploadCurrentDirectorySource(
+export async function uploadCurrentDirectorySource(
 	client: any,
 	applicationId: string,
 	appName: string,
@@ -2259,7 +2260,7 @@ function sleep(ms: number): Promise<void> {
  * Stream deployment logs and wait for completion.
  * Used by `deploy --wait` to show real-time logs.
  */
-async function streamDeploymentWithLogs(
+export async function streamDeploymentWithLogs(
 	client: any,
 	deploymentId: string,
 	appName: string,
@@ -2348,14 +2349,11 @@ async function streamDeploymentWithLogs(
 
 				if (isJsonMode()) {
 					outputData({
-						success: true,
-						data: {
-							deploymentId,
-							status: "done",
-							url: deployUrl,
-							duration,
-							logs: logLines,
-						},
+						deploymentId,
+						status: "done",
+						url: deployUrl,
+						duration,
+						logs: logLines,
 					});
 				} else {
 					log("");
@@ -2379,23 +2377,23 @@ async function streamDeploymentWithLogs(
 				const duration = Math.round((Date.now() - startTime) / 1000);
 
 				if (isJsonMode()) {
-					outputData({
-						success: false,
-						error: {
-							code:
-								errorAnalysis.category === "build_script" ||
-								errorAnalysis.category === "npm_install" ||
-								errorAnalysis.category === "typescript"
-									? "BUILD_FAILED"
-									: "DEPLOYMENT_FAILED",
-							message: updatedDeployment.errorMessage || "Deployment failed",
+					const failureCode =
+						errorAnalysis.category === "build_script" ||
+						errorAnalysis.category === "npm_install" ||
+						errorAnalysis.category === "typescript"
+							? "BUILD_FAILED"
+							: "DEPLOYMENT_FAILED";
+					outputError(
+						failureCode,
+						updatedDeployment.errorMessage || "Deployment failed",
+						{
 							deploymentId,
 							duration,
 							logs: logLines,
 							errors: errors.length > 0 ? errors : undefined,
 							errorAnalysis,
 						},
-					});
+					);
 				} else {
 					log("");
 					log(colors.dim("─".repeat(50)));
@@ -2451,16 +2449,11 @@ async function streamDeploymentWithLogs(
 		const duration = Math.round((Date.now() - startTime) / 1000);
 
 		if (isJsonMode()) {
-			outputData({
-				success: false,
-				error: {
-					code: "DEPLOYMENT_TIMEOUT",
-					message: "Deployment timed out",
-					deploymentId,
-					duration,
-					logs: logLines,
-					errors: errors.length > 0 ? errors : undefined,
-				},
+			outputError("DEPLOYMENT_TIMEOUT", "Deployment timed out", {
+				deploymentId,
+				duration,
+				logs: logLines,
+				errors: errors.length > 0 ? errors : undefined,
 			});
 		} else {
 			log("");

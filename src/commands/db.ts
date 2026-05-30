@@ -401,10 +401,16 @@ export function registerDbCommands(program: Command) {
 
 				switch (dbInfo.type) {
 					case "postgres":
-						await client.postgres.restart.mutate({ postgresId: dbInfo.id });
+						await client.postgres.changeStatus.mutate({
+							postgresId: dbInfo.id,
+							applicationStatus: "running",
+						});
 						break;
 					case "mysql":
-						await client.mysql.restart.mutate({ mysqlId: dbInfo.id });
+						await client.mysql.changeStatus.mutate({
+							mysqlId: dbInfo.id,
+							applicationStatus: "running",
+						});
 						break;
 				}
 
@@ -456,10 +462,16 @@ export function registerDbCommands(program: Command) {
 
 				switch (dbInfo.type) {
 					case "postgres":
-						await client.postgres.stop.mutate({ postgresId: dbInfo.id });
+						await client.postgres.changeStatus.mutate({
+							postgresId: dbInfo.id,
+							applicationStatus: "stopped",
+						});
 						break;
 					case "mysql":
-						await client.mysql.stop.mutate({ mysqlId: dbInfo.id });
+						await client.mysql.changeStatus.mutate({
+							mysqlId: dbInfo.id,
+							applicationStatus: "stopped",
+						});
 						break;
 				}
 
@@ -499,12 +511,12 @@ export function registerDbCommands(program: Command) {
 				let backups: any[] = [];
 				switch (dbInfo.type) {
 					case "postgres":
-						backups = await client.postgres.getBackups.query({
+						backups = await client.backup.listByDatabase.query({
 							postgresId: dbInfo.id,
 						});
 						break;
 					case "mysql":
-						backups = await client.mysql.getBackups.query({
+						backups = await client.backup.listByDatabase.query({
 							mysqlId: dbInfo.id,
 						});
 						break;
@@ -524,23 +536,20 @@ export function registerDbCommands(program: Command) {
 				}
 
 				log("");
-				log(`Backups for ${colors.cyan(dbInfo.name)}:`);
+				log(`Backup schedules for ${colors.cyan(dbInfo.name)}:`);
 				log("");
 				table(
-					["ID", "STATUS", "SIZE", "CREATED"],
+					["ID", "SCHEDULE", "ENABLED"],
 					backups.map((b: any) => [
 						colors.cyan((b.backupId || b.id || "").slice(0, 8)),
-						b.status || colors.dim("-"),
-						b.sizeBytes
-							? `${(b.sizeBytes / (1024 * 1024)).toFixed(1)} MB`
-							: colors.dim("-"),
-						formatDate(b.createdAt),
+						b.schedule || colors.dim("-"),
+						b.enabled ? colors.green("yes") : colors.dim("no"),
 					]),
 				);
 				log("");
 				log(
 					colors.dim(
-						`${backups.length} backup${backups.length === 1 ? "" : "s"}`,
+						`${backups.length} schedule${backups.length === 1 ? "" : "s"}`,
 					),
 				);
 			} catch (err) {

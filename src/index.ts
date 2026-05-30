@@ -35,6 +35,7 @@ import { registerSettingsCommands } from "./commands/settings.js";
 import { registerSmsCommands } from "./commands/sms.js";
 import { registerStorageCommands } from "./commands/storage.js";
 import { registerTicketsCommands } from "./commands/tickets.js";
+import { registerUpCommand } from "./commands/up.js";
 import { registerWalletCommands } from "./commands/wallet.js";
 import { registerWhatsappCommands } from "./commands/whatsapp.js";
 import { setGlobalOptions } from "./lib/output.js";
@@ -66,6 +67,7 @@ program
 registerAuthCommands(program);
 registerAppsCommands(program);
 registerDeployCommands(program);
+registerUpCommand(program);
 registerLogsCommand(program);
 registerEnvCommands(program);
 registerDbCommands(program);

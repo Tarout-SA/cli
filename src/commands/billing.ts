@@ -1,4 +1,5 @@
 import type { Command } from "commander";
+import open from "open";
 import { getApiClient } from "../lib/api.js";
 import { isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
@@ -8,10 +9,13 @@ import {
 	isJsonMode,
 	log,
 	outputData,
+	outputError,
+	outputJsonLine,
 	shouldSkipConfirmation,
 	table,
 } from "../lib/output.js";
 import { confirm, select } from "../utils/prompts.js";
+import { ExitCode, exit } from "../utils/exit-codes.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
 
 export function registerBillingCommands(program: Command) {
@@ -138,6 +142,20 @@ export function registerBillingCommands(program: Command) {
 			"Plan quantity (for multi-slot plans)",
 			Number.parseInt,
 		)
+		.option(
+			"-w, --wait",
+			"After hosted-checkout opens, poll status until the payment is confirmed",
+		)
+		.option(
+			"--timeout <seconds>",
+			"Maximum wait time in seconds (default 600)",
+			(v) => Number.parseInt(v, 10),
+			600,
+		)
+		.option(
+			"--no-open",
+			"Do not auto-open the payment URL in the default browser",
+		)
 		.action(async (planKey, options) => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
@@ -212,16 +230,220 @@ export function registerBillingCommands(program: Command) {
 
 				succeedSpinner("Plan changed!");
 
+				// Three outcomes:
+				//  (a) applied: true  — free upgrade or stored payment method;
+				//      entitlements are already updated, nothing more to do.
+				//  (b) applied: false + paymentUrl/orderId — user must finish
+				//      checkout in the browser. If --wait, we open and poll.
+				//  (c) applied: false + no paymentUrl — downgrade staged for
+				//      period rollover; nothing to wait on.
+				if (result?.applied) {
+					if (isJsonMode()) {
+						outputData({ ...result, status: "applied" });
+					} else {
+						box("Plan Changed", [
+							`Plan: ${colors.cyan(targetPlan)}`,
+							colors.success("Applied immediately"),
+						]);
+					}
+					return;
+				}
+
+				if (!result?.paymentUrl || !result?.orderId) {
+					if (isJsonMode()) {
+						outputData({ ...result, status: "deferred" });
+					} else {
+						box("Plan Change Staged", [
+							`Plan: ${colors.cyan(targetPlan)}`,
+							"Will apply at the end of the current billing period.",
+						]);
+					}
+					return;
+				}
+
+				const orderId: string = result.orderId;
+				const paymentUrl: string = result.paymentUrl;
+
+				if (!options.wait) {
+					if (isJsonMode()) {
+						outputData({
+							...result,
+							status: "payment_required",
+							hint: "Re-run with --wait to poll until checkout completes, or call `tarout billing confirm <orderId>` after the browser flow.",
+						});
+					} else {
+						box("Payment Required", [
+							`Plan: ${colors.cyan(targetPlan)}`,
+							`Open: ${colors.cyan(paymentUrl)}`,
+							`Order ID: ${colors.dim(orderId)}`,
+							`Then: ${colors.dim(`tarout billing confirm ${orderId.slice(0, 8)}`)} or rerun upgrade with --wait`,
+						]);
+					}
+					return;
+				}
+
+				// --wait path: open the browser, poll the order until it
+				// resolves. The success/failure URLs the platform set on the
+				// checkout fire confirmCheckout/markCheckoutFailed when the
+				// user lands on them, which flips status. Mock mode (set on
+				// the server) returns the success URL immediately as the
+				// "payment URL"; opening it flips status too.
+				if (options.open !== false) {
+					try {
+						await open(paymentUrl);
+					} catch {
+						// Headless / no-display — surface the URL via stdout
+						// below and rely on the user to open it manually.
+					}
+				}
+				if (isJsonMode()) {
+					outputJsonLine({
+						type: "event",
+						event: "checkout_started",
+						orderId,
+						paymentUrl,
+					});
+				} else {
+					log("");
+					log(`Open this URL to complete payment:`);
+					log(`  ${colors.cyan(paymentUrl)}`);
+					log(`Order ID: ${colors.dim(orderId)}`);
+					log(`Polling for confirmation (up to ${options.timeout}s)...`);
+				}
+
+				const final = await pollCheckoutUntilTerminal(client, orderId, {
+					timeoutMs: options.timeout * 1000,
+					intervalMs: 4000,
+				});
+
+				if (final.status === "PAID") {
+					if (isJsonMode()) {
+						outputData({
+							applied: true,
+							orderId,
+							status: "paid",
+							paidAt: final.paidAt,
+						});
+					} else {
+						box("Payment Confirmed", [
+							`Plan: ${colors.cyan(targetPlan)}`,
+							colors.success("Subscription is active. Retry your last action."),
+						]);
+					}
+					return;
+				}
+
+				if (final.status === "FAILED" || final.status === "EXPIRED") {
+					outputError(
+						final.status === "EXPIRED"
+							? "CHECKOUT_EXPIRED"
+							: "CHECKOUT_FAILED",
+						final.failureReason ?? `Checkout ${final.status.toLowerCase()}`,
+						{ orderId, status: final.status, failedAt: final.failedAt },
+					);
+					if (!isJsonMode()) {
+						box("Payment Failed", [
+							`Order ID: ${colors.dim(orderId)}`,
+							`Reason: ${final.failureReason ?? final.status}`,
+						]);
+					}
+					exit(ExitCode.GENERAL_ERROR);
+					return;
+				}
+
+				// timeout still PENDING
+				outputError(
+					"CHECKOUT_TIMEOUT",
+					`Checkout still PENDING after ${options.timeout}s; the agent should keep polling or surface the URL.`,
+					{ orderId, status: final.status, paymentUrl },
+				);
+				if (!isJsonMode()) {
+					box("Still Waiting", [
+						`Order ID: ${colors.dim(orderId)}`,
+						`Run: ${colors.dim(`tarout billing wait ${orderId.slice(0, 8)} --timeout 600`)}`,
+					]);
+				}
+				exit(ExitCode.GENERAL_ERROR);
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Manual confirm escape hatch — useful for headless test runs where the
+	// user cannot complete the browser hand-off (e.g. CI with mock payments).
+	// Calls subscription.confirmCheckout directly.
+	billing
+		.command("confirm")
+		.argument("<orderId>", "Order ID returned by `billing upgrade`")
+		.description("Manually confirm a pending checkout (skips browser flow)")
+		.action(async (orderId: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _s = startSpinner("Confirming checkout...");
+				const result = await client.subscription.confirmCheckout.mutate({
+					orderId,
+				});
+				succeedSpinner("Checkout confirmed.");
 				if (isJsonMode()) {
 					outputData(result);
 				} else {
-					box("Plan Changed", [
-						`Plan: ${colors.cyan(targetPlan)}`,
-						result?.paymentUrl
-							? `Payment required: ${colors.cyan(result.paymentUrl)}`
-							: colors.success("Applied immediately"),
+					box("Confirmed", [
+						`Order ID: ${colors.dim(orderId)}`,
+						colors.success("Subscription is active."),
 					]);
 				}
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// Poll an existing checkout until it terminates. Useful when --wait
+	// timed out and you want to resume waiting from a later session.
+	billing
+		.command("wait")
+		.argument("<orderId>", "Order ID to wait on")
+		.description("Poll a pending checkout until it resolves")
+		.option(
+			"--timeout <seconds>",
+			"Maximum wait time in seconds (default 600)",
+			(v) => Number.parseInt(v, 10),
+			600,
+		)
+		.action(async (orderId: string, options: { timeout: number }) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const final = await pollCheckoutUntilTerminal(client, orderId, {
+					timeoutMs: options.timeout * 1000,
+					intervalMs: 4000,
+				});
+				if (final.status === "PAID") {
+					if (isJsonMode()) {
+						outputData({ orderId, status: "paid", paidAt: final.paidAt });
+					} else {
+						box("Confirmed", [
+							`Order ID: ${colors.dim(orderId)}`,
+							colors.success("Payment confirmed."),
+						]);
+					}
+					return;
+				}
+				if (final.status === "PENDING") {
+					outputError("CHECKOUT_TIMEOUT", "Still pending after timeout", {
+						orderId,
+					});
+					exit(ExitCode.GENERAL_ERROR);
+					return;
+				}
+				outputError(
+					final.status === "EXPIRED"
+						? "CHECKOUT_EXPIRED"
+						: "CHECKOUT_FAILED",
+					final.failureReason ?? `Checkout ${final.status.toLowerCase()}`,
+					{ orderId, status: final.status },
+				);
+				exit(ExitCode.GENERAL_ERROR);
 			} catch (err) {
 				handleError(err);
 			}
@@ -790,6 +1012,57 @@ export function registerBillingCommands(program: Command) {
 				handleError(err);
 			}
 		});
+}
+
+/**
+ * Poll `subscription.pollCheckoutStatus` every `intervalMs` until the
+ * checkout reaches a terminal status (PAID/FAILED/EXPIRED) or `timeoutMs`
+ * elapses. Emits one JSON event line per status read when --json is on,
+ * so an external agent can show progress without buffering.
+ */
+async function pollCheckoutUntilTerminal(
+	client: any,
+	orderId: string,
+	opts: { timeoutMs: number; intervalMs: number },
+): Promise<{
+	status: "PENDING" | "PAID" | "FAILED" | "EXPIRED";
+	paidAt: Date | null;
+	failedAt: Date | null;
+	failureReason: string | null;
+}> {
+	const deadline = Date.now() + opts.timeoutMs;
+	let lastStatus = "";
+	while (Date.now() < deadline) {
+		const r = await client.subscription.pollCheckoutStatus.query({ orderId });
+		if (r.status !== lastStatus) {
+			if (isJsonMode()) {
+				outputJsonLine({
+					type: "event",
+					event: "checkout_status",
+					orderId,
+					status: r.status,
+				});
+			}
+			lastStatus = r.status;
+		}
+		if (r.status !== "PENDING") {
+			return {
+				status: r.status,
+				paidAt: r.paidAt,
+				failedAt: r.failedAt,
+				failureReason: r.failureReason,
+			};
+		}
+		await new Promise((res) => setTimeout(res, opts.intervalMs));
+	}
+	// Timeout — return last seen status (PENDING).
+	const r = await client.subscription.pollCheckoutStatus.query({ orderId });
+	return {
+		status: r.status,
+		paidAt: r.paidAt,
+		failedAt: r.failedAt,
+		failureReason: r.failureReason,
+	};
 }
 
 function formatSubStatus(status: string): string {

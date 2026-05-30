@@ -157,17 +157,27 @@ export function handleError(err: unknown): never {
 		exit(err.code);
 	}
 
-	// Handle tRPC errors
-	if (err && typeof err === "object" && "code" in err) {
-		const trpcError = err as { code: string; message: string };
-		const exitCode = mapTrpcErrorCode(trpcError.code);
-
-		if (isJsonMode()) {
-			outputJson(jsonError(trpcError.code, trpcError.message));
-		} else {
-			error(trpcError.message);
+	// Handle tRPC errors. The tRPC v10 client wraps server TRPCError
+	// instances in TRPCClientError where the structured code lives on
+	// `.data.code` (httpStatus, path, etc. also nested). Accept both shapes
+	// so callers see "FORBIDDEN" or "BAD_REQUEST" instead of UNKNOWN_ERROR.
+	if (err && typeof err === "object") {
+		const e = err as {
+			code?: string;
+			message?: string;
+			data?: { code?: string };
+		};
+		const code = e.code ?? e.data?.code;
+		if (code) {
+			const exitCode = mapTrpcErrorCode(code);
+			const message = e.message ?? "Request failed";
+			if (isJsonMode()) {
+				outputJson(jsonError(code, message));
+			} else {
+				error(message);
+			}
+			exit(exitCode);
 		}
-		exit(exitCode);
 	}
 
 	// Generic error

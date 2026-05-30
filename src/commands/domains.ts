@@ -15,13 +15,21 @@ import {
 	isJsonMode,
 	log,
 	outputData,
+	outputError,
+	outputJsonLine,
 	quietOutput,
 	shouldSkipConfirmation,
 	success,
 	table,
 } from "../lib/output.js";
+import { ExitCode, exit } from "../utils/exit-codes.js";
 import { confirm, input } from "../utils/prompts.js";
-import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
+import {
+	failSpinner,
+	startSpinner,
+	succeedSpinner,
+	updateSpinner,
+} from "../utils/spinner.js";
 
 export function registerDomainsCommands(program: Command) {
 	const domains = program
@@ -465,6 +473,196 @@ export function registerDomainsCommands(program: Command) {
 				handleError(err);
 			}
 		});
+
+	// ── Return DNS records the user must set ──
+	// Wraps subscription.getSetupInstructions so an external agent can read
+	// the exact records (type/name/value/ttl) to relay to the user.
+	domains
+		.command("instructions")
+		.argument("<domain>", "Domain ID or hostname")
+		.description(
+			"Return the DNS records the user must create at their registrar",
+		)
+		.action(async (domainIdentifier: string) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+
+				const _spinner = startSpinner("Finding domain...");
+				const allDomains = await client.domain.all.query({
+					includeUnlinked: true,
+				});
+				const domain = findAppDomain(allDomains, domainIdentifier);
+				if (!domain) {
+					failSpinner();
+					const suggestions = findSimilar(
+						domainIdentifier,
+						allDomains.map((d: any) => d.host),
+					);
+					throw new NotFoundError("Domain", domainIdentifier, suggestions);
+				}
+
+				const instructions = await client.domain.getSetupInstructions.query({
+					domainId: domain.domainId,
+				});
+				succeedSpinner();
+
+				if (isJsonMode()) {
+					outputData({
+						domainId: domain.domainId,
+						host: domain.host,
+						isVerified: domain.isVerified,
+						...instructions,
+					});
+					return;
+				}
+
+				box("DNS Setup", [
+					`Domain: ${colors.cyan(domain.host)}`,
+					`Status: ${domain.isVerified ? colors.success("Verified") : colors.warn("Pending verification")}`,
+					instructions.cloudflareManaged
+						? colors.success("DNS automatically managed by Tarout")
+						: "Add these records at your DNS provider:",
+				]);
+				if (!instructions.cloudflareManaged && instructions.records?.length) {
+					log("");
+					for (const r of instructions.records as Array<{
+						type: string;
+						name: string;
+						value: string;
+						ttl?: number;
+					}>) {
+						log(
+							`  ${colors.bold(r.type.padEnd(6))} ${colors.cyan(r.name)} → ${r.value}${r.ttl ? `  TTL ${r.ttl}` : ""}`,
+						);
+					}
+					log("");
+					log(colors.dim(instructions.instructions));
+				}
+				if (instructions.cloudflareNameservers?.length) {
+					log("");
+					log("Or update nameservers to:");
+					for (const ns of instructions.cloudflareNameservers as string[]) {
+						log(`  ${colors.cyan(ns)}`);
+					}
+				}
+				log("");
+				log(
+					`Wait for verification: ${colors.dim(`tarout domains wait-verified ${domain.domainId.slice(0, 8)}`)}`,
+				);
+				log("");
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
+	// ── Poll until verified ──
+	domains
+		.command("wait-verified")
+		.argument("<domain>", "Domain ID or hostname")
+		.description("Poll until the domain reports isVerified: true")
+		.option(
+			"--timeout <seconds>",
+			"Maximum wait time in seconds (default 1800)",
+			(v) => Number.parseInt(v, 10),
+			1800,
+		)
+		.option(
+			"--interval <seconds>",
+			"Polling interval in seconds (default 10)",
+			(v) => Number.parseInt(v, 10),
+			10,
+		)
+		.action(
+			async (
+				domainIdentifier: string,
+				options: { timeout: number; interval: number },
+			) => {
+				try {
+					if (!isLoggedIn()) throw new AuthError();
+					const client = getApiClient();
+
+					const _spinner = startSpinner("Finding domain...");
+					const allDomains = await client.domain.all.query({
+						includeUnlinked: true,
+					});
+					const domain = findAppDomain(allDomains, domainIdentifier);
+					if (!domain) {
+						failSpinner();
+						throw new NotFoundError("Domain", domainIdentifier);
+					}
+					succeedSpinner();
+
+					const deadline = Date.now() + options.timeout * 1000;
+					let lastVerified = !!domain.isVerified;
+					if (lastVerified) {
+						if (isJsonMode()) {
+							outputData({
+								domainId: domain.domainId,
+								host: domain.host,
+								isVerified: true,
+							});
+						} else {
+							success(`${domain.host} is already verified.`);
+						}
+						return;
+					}
+					if (isJsonMode()) {
+						outputJsonLine({
+							type: "event",
+							event: "domain_wait_started",
+							domainId: domain.domainId,
+							host: domain.host,
+						});
+					} else {
+						log(
+							`Polling ${colors.cyan(domain.host)} every ${options.interval}s (up to ${options.timeout}s)...`,
+						);
+					}
+
+					while (Date.now() < deadline) {
+						await new Promise((res) =>
+							setTimeout(res, options.interval * 1000),
+						);
+						const cur = await client.domain.one.query({
+							domainId: domain.domainId,
+						});
+						if (cur.isVerified !== lastVerified) {
+							lastVerified = cur.isVerified;
+							if (isJsonMode()) {
+								outputJsonLine({
+									type: "event",
+									event: "domain_status_changed",
+									domainId: cur.domainId,
+									isVerified: cur.isVerified,
+								});
+							}
+						}
+						if (cur.isVerified) {
+							if (isJsonMode()) {
+								outputData({
+									domainId: cur.domainId,
+									host: cur.host,
+									isVerified: true,
+								});
+							} else {
+								success(`${cur.host} is verified!`);
+							}
+							return;
+						}
+					}
+
+					outputError(
+						"DOMAIN_VERIFY_TIMEOUT",
+						`Domain ${domain.host} did not verify within ${options.timeout}s`,
+						{ domainId: domain.domainId, host: domain.host },
+					);
+					exit(ExitCode.GENERAL_ERROR);
+				} catch (err) {
+					handleError(err);
+				}
+			},
+		);
 
 	// ── DNS subcommand group ──
 	const dns = domains
@@ -2262,12 +2460,6 @@ function isValidDomain(domain: string): boolean {
 	const pattern =
 		/^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
 	return pattern.test(domain);
-}
-
-function updateSpinner(text: string) {
-	import("../utils/spinner.js").then(({ startSpinner }) => {
-		startSpinner(text);
-	});
 }
 
 function formatStatus(status: string): string {

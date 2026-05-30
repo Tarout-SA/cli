@@ -17,6 +17,7 @@ export interface JsonErrorResponse {
 		code: string;
 		message: string;
 		suggestions?: string[];
+		details?: unknown;
 	};
 }
 
@@ -37,6 +38,7 @@ export function jsonError(
 	code: string,
 	message: string,
 	suggestions?: string[],
+	details?: unknown,
 ): JsonErrorResponse {
 	return {
 		success: false,
@@ -44,6 +46,7 @@ export function jsonError(
 			code,
 			message,
 			...(suggestions && { suggestions }),
+			...(details !== undefined && { details }),
 		},
 	};
 }
