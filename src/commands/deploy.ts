@@ -1052,7 +1052,7 @@ export function formatPlanPrice(priceHalalas: number | undefined): string {
  */
 export async function runInlineUpgrade(
 	client: any,
-	planKey: "shared" | "dedicated_small",
+	planKey: string,
 ): Promise<boolean> {
 	const { pollCheckoutUntilTerminal } = await import("./billing.js");
 
@@ -1227,6 +1227,155 @@ export function inferSuggestedPlan(requested?: string): string {
 	if (r === "dedicated_medium") return "dedicated_medium";
 	if (r === "dedicated_large") return "dedicated_large";
 	return r;
+}
+
+// Short human labels for entitlement keys used in the plan-includes summary.
+// Mirrors the stable set in `src/server/constants/billing-pricing.ts`
+// `ENTITLEMENT_KEYS`. If a new key is added server-side without an entry
+// here, we fall back to the raw key — degraded but not broken.
+const ENTITLEMENT_LABELS: Record<string, string> = {
+	"app.free.slots": "Free app slot",
+	"app.shared.slots": "Starter app slot",
+	"app.dedicated.slots": "Dedicated app slot",
+	"host.small.slots": "Small Pro host",
+	"host.medium.slots": "Medium Pro host",
+	"host.large.slots": "Large Pro host",
+	"db.free.slots": "Free database",
+	"db.starter.slots": "Starter database",
+	"db.standard.slots": "Standard database",
+	"db.pro.slots": "Pro database",
+	"storage.free.slots": "Free storage bucket",
+	"storage.starter.slots": "Starter storage bucket",
+	"storage.standard.slots": "Standard storage bucket",
+	"storage.pro.slots": "Pro storage bucket",
+	"domain.slots": "Custom domain",
+	"email_service.slots": "Email service",
+	"cloud_server.cpu.slots": "CPU cloud server",
+	"cloud_server.gpu.slots": "GPU cloud server",
+	"feature.custom_domain": "Custom domains feature",
+};
+
+function humanizeGrant(g: {
+	entitlementKey: string;
+	quantity: number;
+}): string {
+	const label = ENTITLEMENT_LABELS[g.entitlementKey] ?? g.entitlementKey;
+	if (g.entitlementKey.startsWith("feature.")) return label;
+	return g.quantity > 1 ? `${g.quantity}× ${label}s` : `${g.quantity}× ${label}`;
+}
+
+function summarizePlanGrants(plan: {
+	grants?: Array<{ entitlementKey: string; quantity: number }>;
+}): string {
+	const grants = Array.isArray(plan?.grants) ? plan.grants : [];
+	if (!grants.length) return "";
+	return grants.map(humanizeGrant).join(" · ");
+}
+
+// Parses the failed entitlement key from a server-side `assertEntitlement`
+// message of the form `Plan limit reached for <key>: <used>/<limit>.`.
+// Used to mark the matching plan as "recommended" in the upgrade picker
+// and surface it on JSON-mode output for agents.
+export function extractEntitlementKeyFromError(
+	err: unknown,
+): string | undefined {
+	const msg = err instanceof Error ? err.message : "";
+	const m = msg.match(/Plan limit reached for ([\w.]+)/i);
+	return m?.[1];
+}
+
+/**
+ * Interactive plan picker shown when the deploy flow hits a FORBIDDEN
+ * entitlement gate. Lists each upgrade-worthy plan with name, price, and
+ * a human-readable summary of included entitlements, then delegates to
+ * `runInlineUpgrade` for the actual `changePlan` + checkout poll.
+ *
+ * Returns true only if the upgrade reached PAID / applied-immediately.
+ * False means the user cancelled, the catalog was empty, or the
+ * checkout did not complete — caller should fall back to the static
+ * NEEDS_UPGRADE error.
+ */
+export async function promptUpgradeFromEntitlementError(
+	client: any,
+	err: unknown,
+	requestedPlan?: string,
+): Promise<boolean> {
+	const catalog = await fetchCatalogSafely(client);
+	const allPlans: any[] = catalog?.plans ?? [];
+
+	// Drop "free" (nothing to upgrade *to*) and zero-priced plans.
+	const upgradeable = allPlans.filter(
+		(p) => (p.planKey || p.key) !== "free" && (p.priceHalalas ?? 0) > 0,
+	);
+
+	if (!upgradeable.length) {
+		return false;
+	}
+
+	const failedKey = extractEntitlementKeyFromError(err);
+	const matchingPlan = failedKey
+		? upgradeable.find((p) =>
+				p.grants?.some((g: any) => g.entitlementKey === failedKey),
+			)
+		: undefined;
+	const recommendedKey: string | undefined = matchingPlan
+		? (matchingPlan.planKey || matchingPlan.key)
+		: inferSuggestedPlan(requestedPlan);
+
+	// Details block printed before the selector so users can read full
+	// price + includes lines (inquirer's list collapses each choice to
+	// a single line).
+	log("");
+	log(colors.bold("Available upgrade plans:"));
+	log("");
+	for (const p of upgradeable) {
+		const key = p.planKey || p.key;
+		const isRec = key === recommendedKey;
+		const price = formatPlanPrice(p.priceHalalas) || "Free";
+		const includes = summarizePlanGrants(p);
+		const header = `  ${colors.cyan(p.name || key)}  ${colors.dim(`(${key})`)}  ${colors.bold(price)}${isRec ? `  ${colors.success("← recommended")}` : ""}`;
+		log(header);
+		if (p.description) log(`    ${colors.dim(p.description)}`);
+		if (includes) log(`    Includes: ${includes}`);
+		if (p.quantityAware) {
+			log(
+				`    ${colors.dim(`Quantity-aware (${p.minQuantity}–${p.maxQuantity} units)`)}`,
+			);
+		}
+		log("");
+	}
+
+	// Surface the recommended plan at the top of the selector.
+	const choices = upgradeable
+		.slice()
+		.sort((a, b) => {
+			if ((a.planKey || a.key) === recommendedKey) return -1;
+			if ((b.planKey || b.key) === recommendedKey) return 1;
+			return (a.sortOrder ?? 0) - (b.sortOrder ?? 0);
+		})
+		.map((p) => {
+			const key = (p.planKey || p.key) as string;
+			const price = formatPlanPrice(p.priceHalalas);
+			const tag = key === recommendedKey ? " — recommended" : "";
+			return {
+				name: `${p.name || key} ${price ? `(${price})` : ""}${tag}`,
+				value: key,
+			};
+		});
+
+	choices.push({
+		name: "Cancel — exit without upgrading",
+		value: "__cancel__",
+	});
+
+	const picked = await select<string>(
+		"Select a plan to upgrade to:",
+		choices,
+	);
+
+	if (picked === "__cancel__") return false;
+
+	return runInlineUpgrade(client, picked);
 }
 
 // Mirrors the dashboard's "Advanced" section in
@@ -1959,11 +2108,44 @@ export function registerDeployCommands(program: Command) {
 				if (isEntitlementError(err)) {
 					const message =
 						err instanceof Error ? err.message : "Plan upgrade required";
-					outputError("NEEDS_UPGRADE", message, {
-						suggestedPlan: inferSuggestedPlan(options.plan),
-						hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout deploy`.",
-					});
-					exit(ExitCode.PERMISSION_DENIED);
+
+					// JSON / non-TTY / --yes path: preserve the machine-readable
+					// contract so external agents and CI don't regress.
+					if (isJsonMode() || shouldSkipConfirmation()) {
+						outputError("NEEDS_UPGRADE", message, {
+							suggestedPlan: inferSuggestedPlan(options.plan),
+							failedEntitlementKey: extractEntitlementKeyFromError(err),
+							hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout deploy`.",
+						});
+						exit(ExitCode.PERMISSION_DENIED);
+					}
+
+					log("");
+					log(colors.warn(message));
+
+					const upgraded = await promptUpgradeFromEntitlementError(
+						getApiClient(),
+						err,
+						options.plan,
+					);
+
+					if (!upgraded) {
+						outputError("NEEDS_UPGRADE", message, {
+							suggestedPlan: inferSuggestedPlan(options.plan),
+							failedEntitlementKey: extractEntitlementKeyFromError(err),
+							hint: "Run `tarout billing upgrade <plan> --wait`, then retry `tarout deploy`.",
+						});
+						exit(ExitCode.PERMISSION_DENIED);
+					}
+
+					// Don't resume from inside the catch — the deploy may have
+					// created partial state (app row, source upload). Re-running
+					// `tarout deploy` re-enters the resolver chain safely.
+					box("Upgrade complete", [
+						colors.success("Subscription updated."),
+						`Run ${colors.cyan("tarout deploy")} again to deploy on the new plan.`,
+					]);
+					return;
 				}
 				handleError(err);
 			}

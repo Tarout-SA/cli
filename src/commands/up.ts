@@ -15,19 +15,23 @@ import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
 import { NotFoundError, handleError } from "../lib/errors.js";
 import {
+	box,
 	colors,
 	isJsonMode,
 	log,
 	outputError,
 	outputJsonLine,
+	shouldSkipConfirmation,
 } from "../lib/output.js";
 import { ExitCode, exit } from "../utils/exit-codes.js";
 import {
 	createAppFromCurrentDirectory,
 	ensureAuthenticatedForDeploy,
+	extractEntitlementKeyFromError,
 	inferSuggestedPlan,
 	inspectCurrentProject,
 	isEntitlementError,
+	promptUpgradeFromEntitlementError,
 	streamDeploymentWithLogs,
 	uploadCurrentDirectorySource,
 } from "./deploy.js";
@@ -182,12 +186,40 @@ export function registerUpCommand(program: Command): void {
 					if (isEntitlementError(err)) {
 						const message =
 							err instanceof Error ? err.message : "Plan upgrade required";
-						const suggestedPlan = inferSuggestedPlan(options.plan);
-						outputError("NEEDS_UPGRADE", message, {
-							suggestedPlan,
-							hint: "Phase 2: run `tarout agent request-upgrade <plan>` then `tarout agent poll-upgrade <requestId>` and retry `tarout up`.",
-						});
-						exit(ExitCode.PERMISSION_DENIED);
+
+						// JSON / non-TTY / --yes: keep the machine-readable contract.
+						if (isJsonMode() || shouldSkipConfirmation()) {
+							outputError("NEEDS_UPGRADE", message, {
+								suggestedPlan: inferSuggestedPlan(options.plan),
+								failedEntitlementKey: extractEntitlementKeyFromError(err),
+								hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout up`.",
+							});
+							exit(ExitCode.PERMISSION_DENIED);
+						}
+
+						log("");
+						log(colors.warn(message));
+
+						const upgraded = await promptUpgradeFromEntitlementError(
+							client,
+							err,
+							options.plan,
+						);
+
+						if (!upgraded) {
+							outputError("NEEDS_UPGRADE", message, {
+								suggestedPlan: inferSuggestedPlan(options.plan),
+								failedEntitlementKey: extractEntitlementKeyFromError(err),
+								hint: "Run `tarout billing upgrade <plan> --wait`, then retry `tarout up`.",
+							});
+							exit(ExitCode.PERMISSION_DENIED);
+						}
+
+						box("Upgrade complete", [
+							colors.success("Subscription updated."),
+							`Run ${colors.cyan("tarout up")} again to deploy on the new plan.`,
+						]);
+						return;
 					}
 					throw err;
 				}
