@@ -1020,7 +1020,7 @@ export function registerBillingCommands(program: Command) {
  * elapses. Emits one JSON event line per status read when --json is on,
  * so an external agent can show progress without buffering.
  */
-async function pollCheckoutUntilTerminal(
+export async function pollCheckoutUntilTerminal(
 	client: any,
 	orderId: string,
 	opts: { timeoutMs: number; intervalMs: number },

@@ -25,21 +25,36 @@ import { ExitCode, exit } from "../utils/exit-codes.js";
 import {
 	createAppFromCurrentDirectory,
 	ensureAuthenticatedForDeploy,
+	inferSuggestedPlan,
 	inspectCurrentProject,
+	isEntitlementError,
 	streamDeploymentWithLogs,
 	uploadCurrentDirectorySource,
 } from "./deploy.js";
+
+// Re-exported so existing imports (and tests) of these helpers from
+// `cli/src/commands/up` continue to resolve after they were lifted into
+// `deploy.ts` for sharing with the `tarout deploy` command.
+export { inferSuggestedPlan, isEntitlementError };
 
 const DEFAULT_REGION = "me-central2";
 
 interface UpOptions {
 	apiUrl?: string;
 	branch?: string;
+	buildCommand?: string;
+	description?: string;
+	frameworkPreset?: string;
 	idempotencyKey?: string;
+	installCommand?: string;
+	name?: string;
+	outputDirectory?: string;
 	plan?: string;
 	region?: string;
 	repo?: string;
+	rootDirectory?: string;
 	source?: string;
+	startCommand?: string;
 	token?: string;
 }
 
@@ -69,32 +84,6 @@ export function parseRepo(repo: string): { owner: string; repository: string } {
 	);
 }
 
-/**
- * Convert a tRPC FORBIDDEN raised by the entitlement gate into a
- * structured NEEDS_UPGRADE response so the agent can decide whether
- * to call `tarout agent request-upgrade` (Phase 2) instead of bubbling
- * a generic permission error.
- */
-export function isEntitlementError(err: unknown): boolean {
-	if (!err || typeof err !== "object") return false;
-	// tRPC v10 client wraps server TRPCError into TRPCClientError where the
-	// real code lives on `.data.code` (not top-level `.code`). Accept either.
-	const e = err as {
-		code?: string;
-		message?: string;
-		data?: { code?: string };
-	};
-	const code = e.code ?? e.data?.code;
-	if (code !== "FORBIDDEN") return false;
-	const msg = (e.message ?? "").toLowerCase();
-	return (
-		msg.includes("plan limit reached") ||
-		msg.includes("entitlement") ||
-		msg.includes("upgrade to add more") ||
-		msg.includes("active subscription")
-	);
-}
-
 export function registerUpCommand(program: Command): void {
 	program
 		.command("up")
@@ -107,11 +96,25 @@ export function registerUpCommand(program: Command): void {
 			"Custom API URL (defaults to saved profile or https://tarout.sa)",
 		)
 		.option("--token <token>", "API token for this run")
+		.option("--name <name>", "Application name (defaults to directory name)")
 		.option("--plan <plan>", "App hosting plan: free, shared, or dedicated", "free")
 		.option("--source <source>", "Source: upload (default) or github", "upload")
 		.option("--repo <owner/repo>", "GitHub repository (when --source github)")
 		.option("--branch <branch>", "GitHub branch (with --source github)", "main")
 		.option("-r, --region <region>", "Deployment region", DEFAULT_REGION)
+		.option("--description <text>", "Description for the newly created app")
+		.option(
+			"--framework-preset <preset>",
+			"Framework preset override (e.g. nextjs, vite, astro)",
+		)
+		.option("--root-directory <path>", "Project root directory inside the source")
+		.option("--install-command <cmd>", "Custom install command")
+		.option("--build-command <cmd>", "Custom build command")
+		.option(
+			"--output-directory <path>",
+			"Build output directory (static assets)",
+		)
+		.option("--start-command <cmd>", "Custom start command")
 		.option(
 			"--idempotency-key <key>",
 			"Idempotency key for safe retries (Phase 2; logged only in v1)",
@@ -158,8 +161,16 @@ export function registerUpCommand(program: Command): void {
 				try {
 					emitEvent({ event: "app_create_started" });
 					app = await createAppFromCurrentDirectory(client, profile, {
+						name: options.name,
 						plan: options.plan,
 						region: options.region,
+						description: options.description,
+						frameworkPreset: options.frameworkPreset,
+						rootDirectory: options.rootDirectory,
+						installCommand: options.installCommand,
+						buildCommand: options.buildCommand,
+						outputDirectory: options.outputDirectory,
+						startCommand: options.startCommand,
 					});
 					emitEvent({
 						event: "app_create_done",
@@ -276,21 +287,6 @@ export function registerUpCommand(program: Command): void {
 				handleError(err);
 			}
 		});
-}
-
-/**
- * Best-effort upgrade suggestion when the entitlement gate rejects the
- * requested plan. Returns the next tier so the agent has something
- * concrete to ask for. "free" → "shared" → "dedicated_small".
- */
-export function inferSuggestedPlan(requested?: string): string {
-	const r = (requested ?? "free").trim().toLowerCase();
-	if (!r || r === "free") return "shared";
-	if (r === "shared") return "shared";
-	if (r === "dedicated" || r === "dedicated_small") return "dedicated_small";
-	if (r === "dedicated_medium") return "dedicated_medium";
-	if (r === "dedicated_large") return "dedicated_large";
-	return r;
 }
 
 /**

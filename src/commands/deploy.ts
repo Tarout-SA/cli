@@ -55,7 +55,14 @@ import {
 	table,
 } from "../lib/output.js";
 import { streamDeploymentLogs } from "../lib/websocket.js";
-import { confirm, input, password, select } from "../utils/prompts.js";
+import { ExitCode, exit } from "../utils/exit-codes.js";
+import {
+	confirm,
+	input,
+	password,
+	promptOrEmit,
+	select,
+} from "../utils/prompts.js";
 import {
 	failSpinner,
 	startSpinner,
@@ -85,11 +92,19 @@ interface DeploymentSummary {
 
 interface DeployOptions {
 	apiUrl?: string;
+	buildCommand?: string;
 	database?: string;
 	databasePlan?: string;
+	description?: string;
+	frameworkPreset?: string;
+	installCommand?: string;
+	name?: string;
+	outputDirectory?: string;
 	plan?: string;
 	region?: string;
+	rootDirectory?: string;
 	source?: string;
+	startCommand?: string;
 	storage?: boolean;
 	storagePlan?: string;
 	token?: string;
@@ -135,14 +150,30 @@ export async function ensureAuthenticatedForDeploy(
 
 	if (!isLoggedIn()) {
 		if (isJsonMode()) {
-			throw new AuthError(
-				"Not logged in. Run 'tarout login', 'tarout token <api-token>', or set TAROUT_TOKEN.",
+			await promptOrEmit<never>(
+				{
+					field: "token",
+					kind: "password",
+					question:
+						`Paste a Tarout API token. Generate one at ${apiUrl}/dashboard/account/tokens`,
+					flag: "--token",
+					sensitive: true,
+					context: {
+						step: "auth",
+						reason: "not_logged_in",
+						generateUrl: `${apiUrl}/dashboard/account/tokens`,
+					},
+				},
+				// Unreachable: promptOrEmit exits the process in JSON mode.
+				async () => {
+					throw new AuthError();
+				},
 			);
 		}
-			return promptForCredentials(
-				apiUrl,
-				"Tarout needs an authenticated account before deploying.",
-			);
+		return promptForCredentials(
+			apiUrl,
+			"Tarout needs an authenticated account before deploying.",
+		);
 	}
 
 	const token = getToken();
@@ -164,8 +195,23 @@ export async function ensureAuthenticatedForDeploy(
 	} catch (err) {
 		if (!isCredentialError(err)) throw err;
 		if (isJsonMode()) {
-			throw new AuthError(
-				"Stored credentials are invalid or expired. Run 'tarout login' or provide TAROUT_TOKEN.",
+			await promptOrEmit<never>(
+				{
+					field: "token",
+					kind: "password",
+					question:
+						`Stored credentials are invalid or expired. Paste a new Tarout API token from ${apiUrl}/dashboard/account/tokens`,
+					flag: "--token",
+					sensitive: true,
+					context: {
+						step: "auth",
+						reason: "expired_credentials",
+						generateUrl: `${apiUrl}/dashboard/account/tokens`,
+					},
+				},
+				async () => {
+					throw new AuthError();
+				},
 			);
 		}
 		return promptForCredentials(
@@ -173,6 +219,8 @@ export async function ensureAuthenticatedForDeploy(
 			"Your Tarout credentials are invalid or expired.",
 		);
 	}
+	// Unreachable: both branches above either return or exit via promptOrEmit.
+	throw new AuthError();
 }
 
 async function promptForCredentials(
@@ -327,19 +375,35 @@ async function confirmRegion(region: string | undefined): Promise<void> {
 
 	const message = `Tarout currently deploys only to ${DEFAULT_REGION} (Dammam, Saudi Arabia). The requested region "${requestedRegion}" would move workloads outside the active Saudi region when additional regions are enabled.`;
 
-	if (isJsonMode()) {
-		throw new InvalidArgumentError(message);
-	}
-
-	log("");
-	log(colors.warn(message));
-
 	if (shouldSkipConfirmation()) {
-		log(colors.dim(`Continuing with ${DEFAULT_REGION}.`));
+		if (!isJsonMode()) {
+			log("");
+			log(colors.warn(message));
+			log(colors.dim(`Continuing with ${DEFAULT_REGION}.`));
+		}
 		return;
 	}
 
-	const proceed = await confirm(`Continue with ${DEFAULT_REGION}?`, false);
+	if (!isJsonMode()) {
+		log("");
+		log(colors.warn(message));
+	}
+
+	const proceed = await promptOrEmit<boolean>(
+		{
+			field: "region",
+			kind: "confirm",
+			question: `${message} Continue with ${DEFAULT_REGION}?`,
+			default: false,
+			flag: "--yes",
+			context: {
+				step: "region_confirmation",
+				requestedRegion,
+				activeRegion: DEFAULT_REGION,
+			},
+		},
+		() => confirm(`Continue with ${DEFAULT_REGION}?`, false),
+	);
 	if (!proceed) {
 		throw new InvalidArgumentError("Deployment cancelled.");
 	}
@@ -812,21 +876,35 @@ export async function createAppFromCurrentDirectory(
 	options: DeployOptions = {},
 ): Promise<AppSummary> {
 	const defaultName = basename(process.cwd()) || "tarout-app";
-	let appName = defaultName;
+	const providedName = options.name?.trim();
+	let appName = providedName || defaultName;
 
-	if (!shouldSkipConfirmation()) {
-		appName = await input("Application name:", defaultName);
+	if (!providedName && !shouldSkipConfirmation()) {
+		appName = await promptOrEmit<string>(
+			{
+				field: "name",
+				kind: "input",
+				question: "Application name:",
+				default: defaultName,
+				flag: "--name",
+				context: { step: "app_name", defaultName },
+			},
+			() => input("Application name:", defaultName),
+		);
 	}
 
 	const slug = generateSlug(appName);
 	const plan = await resolveAppPlanForCreate(client, options);
+	const buildConfig = buildConfigFromOptions(options);
 	const _spinner = startSpinner("Creating application...");
 	const application = await client.application.create.mutate({
 		name: appName,
 		appName: slug,
 		organizationId: profile.organizationId,
-		region: DEFAULT_REGION,
+		region: options.region ?? DEFAULT_REGION,
+		...(options.description ? { description: options.description } : {}),
 		...(plan ? { plan } : {}),
+		...(buildConfig ? { buildConfig } : {}),
 	});
 	succeedSpinner("Application created!");
 
@@ -864,17 +942,188 @@ async function resolveAppPlanForCreate(
 	if (explicitPlan) return explicitPlan;
 	if (isJsonMode() || shouldSkipConfirmation()) return undefined;
 
-	const choices = await getAppPlanChoices(client);
+	// Free-tier subscriptions get an extra upsell step: continue with FREE,
+	// or upgrade to a paid plan inline (checkout → confirmation) before the
+	// deploy proceeds. This matches the dashboard's planned upsell on the
+	// `applications/new` page so both flows offer the same path.
+	let createOptions: any;
+	try {
+		createOptions = await client.application.getCreateOptions.query();
+	} catch {
+		createOptions = null;
+	}
+
+	if (createOptions && createOptions.isPaid === false) {
+		const upgraded = await promptFreeTierUpsell(client, createOptions);
+		if (upgraded) return upgraded;
+	}
+
+	const choices = await getAppPlanChoices(client, createOptions);
 	if (choices.length === 0) return undefined;
 
 	return select<AppPlan>("Application hosting plan:", choices);
 }
 
+/**
+ * Free-tier upsell: shown when the org's subscription is `free` (i.e.
+ * `isPaid === false`). User picks one of:
+ *   - "Continue with Free"           → returns "FREE", deploy continues on free
+ *   - "Upgrade to Shared and deploy" → runs inline billing upgrade, returns SHARED on success
+ *   - "Upgrade to Dedicated …"       → same, returns DEDICATED on success
+ *
+ * Returns `undefined` when the user picks "Continue with Free" (so the
+ * caller falls through to the existing tier picker which will return FREE)
+ * OR when the upgrade is cancelled/fails (caller should NOT proceed in that
+ * case — `promptFreeTierUpsell` throws `InvalidArgumentError` on cancel).
+ */
+async function promptFreeTierUpsell(
+	client: any,
+	createOptions: any,
+): Promise<AppPlan | undefined> {
+	const catalog = await fetchCatalogSafely(client);
+	const planByKey = new Map<string, { priceHalalas?: number }>();
+	if (catalog) {
+		for (const p of catalog.plans ?? []) {
+			const key = (p?.planKey || p?.key) as string | undefined;
+			if (key) planByKey.set(key, p);
+		}
+	}
+
+	const sharedPrice = formatPlanPrice(planByKey.get("shared")?.priceHalalas);
+	const dedicatedPrice = formatPlanPrice(
+		planByKey.get("dedicated_small")?.priceHalalas,
+	);
+
+	const choice = await select<"free" | "shared" | "dedicated_small">(
+		"You're on the Free plan. How do you want to deploy?",
+		[
+			{ name: "Continue with Free (no upgrade)", value: "free" },
+			{
+				name: `Upgrade to Shared and deploy${sharedPrice ? ` (${sharedPrice})` : ""}`,
+				value: "shared",
+			},
+			{
+				name: `Upgrade to Dedicated Small and deploy${dedicatedPrice ? ` (${dedicatedPrice})` : ""}`,
+				value: "dedicated_small",
+			},
+		],
+	);
+
+	if (choice === "free") {
+		return undefined;
+	}
+
+	const upgradeOk = await runInlineUpgrade(client, choice);
+	if (!upgradeOk) {
+		// User abandoned checkout, payment failed, or polling timed out.
+		// Abort the deploy so we don't silently land them on FREE after
+		// they explicitly asked to upgrade.
+		throw new InvalidArgumentError(
+			`Deploy cancelled — the ${choice} upgrade did not complete. Re-run \`tarout deploy\` once payment is confirmed, or run \`tarout billing wait <orderId> --timeout 600\` to resume polling.`,
+		);
+	}
+
+	return choice === "shared" ? "SHARED" : "DEDICATED";
+}
+
+async function fetchCatalogSafely(
+	client: any,
+): Promise<{ plans?: Array<{ planKey?: string; key?: string; priceHalalas?: number }> } | null> {
+	try {
+		return await client.subscription.getCatalog.query();
+	} catch {
+		return null;
+	}
+}
+
+export function formatPlanPrice(priceHalalas: number | undefined): string {
+	if (!priceHalalas || priceHalalas <= 0) return "";
+	return `${(priceHalalas / 100).toFixed(2)} SAR/mo`;
+}
+
+/**
+ * Inline plan upgrade: `subscription.changePlan` → if `applied`, return
+ * true immediately; if `paymentUrl + orderId`, open the browser and poll
+ * `pollCheckoutUntilTerminal` until PAID / FAILED / EXPIRED / timeout.
+ *
+ * Returns true only on PAID or applied-immediately. False (or throws via
+ * the caller's InvalidArgumentError) means the upgrade did not complete
+ * and the deploy should stop.
+ */
+export async function runInlineUpgrade(
+	client: any,
+	planKey: "shared" | "dedicated_small",
+): Promise<boolean> {
+	const { pollCheckoutUntilTerminal } = await import("./billing.js");
+
+	const _changing = startSpinner(`Switching to plan "${planKey}"...`);
+	const result = await client.subscription.changePlan.mutate({ planKey });
+
+	if (result?.applied) {
+		succeedSpinner("Plan applied.");
+		return true;
+	}
+
+	if (!result?.paymentUrl || !result?.orderId) {
+		// Downgrade staged for period rollover, or applied without
+		// payment. Treat as not-confirmed for deploy purposes.
+		failSpinner("Plan change did not return a payment URL.");
+		return false;
+	}
+
+	succeedSpinner("Checkout opened — waiting for payment confirmation.");
+
+	const orderId: string = result.orderId;
+	const paymentUrl: string = result.paymentUrl;
+
+	log("");
+	log(`Open this URL to complete payment:`);
+	log(`  ${colors.cyan(paymentUrl)}`);
+	log(`Order ID: ${colors.dim(orderId)}`);
+
+	try {
+		await open(paymentUrl);
+	} catch {
+		// Headless — the URL printed above is the fallback.
+	}
+
+	const _pollSpinner = startSpinner("Polling for payment confirmation...");
+	const final = await pollCheckoutUntilTerminal(client, orderId, {
+		timeoutMs: 600_000,
+		intervalMs: 4_000,
+	});
+
+	if (final.status === "PAID") {
+		succeedSpinner("Payment confirmed.");
+		return true;
+	}
+
+	failSpinner(
+		final.status === "PENDING"
+			? "Payment still pending after 10 minutes."
+			: `Payment ${final.status.toLowerCase()}.`,
+	);
+
+	if (final.failureReason) {
+		log(colors.error(final.failureReason));
+	}
+
+	log(
+		colors.dim(
+			`Resume later with: tarout billing wait ${orderId.slice(0, 8)} --timeout 600`,
+		),
+	);
+
+	return false;
+}
+
 async function getAppPlanChoices(
 	client: any,
+	preloadedOptions?: any,
 ): Promise<Array<{ name: string; value: AppPlan }>> {
 	try {
-		const options = await client.application.getCreateOptions.query();
+		const options =
+			preloadedOptions ?? (await client.application.getCreateOptions.query());
 		const tiers = Array.isArray(options?.tiers) ? options.tiers : [];
 		const defaultTier = options?.defaultTier as AppPlan | null | undefined;
 		const availableChoices = tiers
@@ -940,6 +1189,71 @@ function normalizeAppPlan(value: string | undefined): AppPlan | undefined {
 	throw new InvalidArgumentError(
 		'Invalid app plan. Use "free", "shared", or "dedicated".',
 	);
+}
+
+// Recognizes the structured FORBIDDEN reasons raised by `application.create`
+// in `src/server/api/routers/application.ts` (entitlement caps,
+// "no active subscription", "FREE_NOT_ALLOWED_ON_PAID_PLAN", etc.) so the
+// dashboard and CLI surface the same upgrade signal.
+export function isEntitlementError(err: unknown): boolean {
+	if (!err || typeof err !== "object") return false;
+	// tRPC v10 wraps server `TRPCError` into `TRPCClientError`, putting the
+	// real code on `.data.code`. Accept either shape.
+	const e = err as {
+		code?: string;
+		message?: string;
+		data?: { code?: string };
+	};
+	const code = e.code ?? e.data?.code;
+	if (code !== "FORBIDDEN") return false;
+	const msg = (e.message ?? "").toLowerCase();
+	return (
+		msg.includes("plan limit reached") ||
+		msg.includes("entitlement") ||
+		msg.includes("upgrade to add more") ||
+		msg.includes("active subscription") ||
+		msg.includes("free_not_allowed_on_paid_plan")
+	);
+}
+
+// Best-effort upgrade suggestion when the entitlement gate rejects the
+// requested plan. Returns the next tier so an agent has something concrete
+// to ask for: "free" → "shared" → "dedicated_small".
+export function inferSuggestedPlan(requested?: string): string {
+	const r = (requested ?? "free").trim().toLowerCase();
+	if (!r || r === "free") return "shared";
+	if (r === "shared") return "shared";
+	if (r === "dedicated" || r === "dedicated_small") return "dedicated_small";
+	if (r === "dedicated_medium") return "dedicated_medium";
+	if (r === "dedicated_large") return "dedicated_large";
+	return r;
+}
+
+// Mirrors the dashboard's "Advanced" section in
+// `src/pages/dashboard/applications/new.tsx`: empty strings are collapsed so
+// the server-side framework detector still wins when a flag is not provided.
+export function buildConfigFromOptions(
+	options: DeployOptions,
+): Record<string, string> | undefined {
+	const fields: Array<[keyof DeployOptions, string]> = [
+		["frameworkPreset", "frameworkPreset"],
+		["rootDirectory", "rootDirectory"],
+		["installCommand", "installCommand"],
+		["buildCommand", "buildCommand"],
+		["outputDirectory", "outputDirectory"],
+		["startCommand", "startCommand"],
+	];
+
+	const config: Record<string, string> = {};
+	for (const [source, target] of fields) {
+		const raw = options[source];
+		if (typeof raw !== "string") continue;
+		const trimmed = raw.trim();
+		if (!trimmed) continue;
+		config[target] = trimmed;
+	}
+
+	return Object.keys(config).length > 0 ? config : undefined;
 }
 
 async function resolveSourcePreference(
@@ -1341,13 +1655,31 @@ async function promptForLocalSourceIfNeeded(app: any): Promise<boolean> {
 
 	if (shouldSkipConfirmation()) return false;
 
-	log("");
-	log(
-		`${colors.bold(app.name)} already has a ${colors.cyan(app.sourceType)} source configured.`,
-	);
-	return confirm(
-		"Use the current directory as the deployment source instead?",
-		false,
+	const message = `${app.name} already has a ${app.sourceType} source configured.`;
+	if (!isJsonMode()) {
+		log("");
+		log(
+			`${colors.bold(app.name)} already has a ${colors.cyan(app.sourceType)} source configured.`,
+		);
+	}
+	return promptOrEmit<boolean>(
+		{
+			field: "source",
+			kind: "confirm",
+			question: `${message} Use the current directory as the deployment source instead?`,
+			default: false,
+			flag: "--source upload",
+			context: {
+				step: "source_override",
+				appName: app.name,
+				existingSourceType: app.sourceType,
+			},
+		},
+		() =>
+			confirm(
+				"Use the current directory as the deployment source instead?",
+				false,
+			),
 	);
 }
 
@@ -1517,6 +1849,22 @@ export function registerDeployCommands(program: Command) {
 		)
 		.option("--token <token>", "API token to use for this deployment")
 		.option("-r, --region <region>", "Deployment region", DEFAULT_REGION)
+		.option("--description <text>", "Description for a newly created app")
+		.option(
+			"--framework-preset <preset>",
+			"Framework preset override (e.g. nextjs, vite, astro)",
+		)
+		.option(
+			"--root-directory <path>",
+			"Project root directory inside the source",
+		)
+		.option("--install-command <cmd>", "Custom install command")
+		.option("--build-command <cmd>", "Custom build command")
+		.option(
+			"--output-directory <path>",
+			"Build output directory (static assets)",
+		)
+		.option("--start-command <cmd>", "Custom start command")
 		.option("-w, --wait", "Wait for deployment to complete and stream logs")
 		.option("--watch", "Alias for --wait")
 		.action(async (appIdentifier, options: DeployOptions) => {
@@ -1608,6 +1956,15 @@ export function registerDeployCommands(program: Command) {
 					log("");
 				}
 			} catch (err) {
+				if (isEntitlementError(err)) {
+					const message =
+						err instanceof Error ? err.message : "Plan upgrade required";
+					outputError("NEEDS_UPGRADE", message, {
+						suggestedPlan: inferSuggestedPlan(options.plan),
+						hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout deploy`.",
+					});
+					exit(ExitCode.PERMISSION_DENIED);
+				}
 				handleError(err);
 			}
 		});

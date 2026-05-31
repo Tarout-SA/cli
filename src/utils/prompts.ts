@@ -1,4 +1,10 @@
 import inquirer from "inquirer";
+import {
+	type NeedsInputRequest,
+	isJsonMode,
+	outputNeedsInput,
+} from "../lib/output.js";
+import { ExitCode, exit } from "./exit-codes.js";
 
 export async function confirm(
 	message: string,
@@ -55,4 +61,24 @@ export async function password(message: string): Promise<string> {
 		},
 	]);
 	return value;
+}
+
+/**
+ * Either prompt the human user via inquirer (TTY mode) or emit a
+ * structured needs_input event and exit (JSON / agent mode).
+ *
+ * Used at deploy-flow choice points so an external coding agent can read
+ * the request from stdout, ask its human user in chat, then re-invoke
+ * the CLI with the answer passed via `req.flag`. Exits with
+ * ExitCode.NEEDS_INPUT in the JSON path; never returns.
+ */
+export async function promptOrEmit<T>(
+	req: NeedsInputRequest,
+	fallback: () => Promise<T>,
+): Promise<T> {
+	if (isJsonMode()) {
+		outputNeedsInput(req);
+		exit(ExitCode.NEEDS_INPUT);
+	}
+	return fallback();
 }

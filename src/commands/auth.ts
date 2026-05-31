@@ -18,7 +18,7 @@ import {
 	outputData,
 	success,
 } from "../lib/output.js";
-import { input } from "../utils/prompts.js";
+import { input, promptOrEmit } from "../utils/prompts.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
 
 export function registerAuthCommands(program: Command) {
@@ -297,7 +297,16 @@ export function registerAuthCommands(program: Command) {
 
 				let tokenName = options.name;
 				if (!tokenName) {
-					tokenName = await input("Token name (e.g., ci-deploy):");
+					tokenName = await promptOrEmit<string>(
+						{
+							field: "name",
+							kind: "input",
+							question: "Token name (e.g., ci-deploy):",
+							flag: "--name",
+							context: { step: "token_create" },
+						},
+						() => input("Token name (e.g., ci-deploy):"),
+					);
 				}
 
 				const { getApiClient } = await import("../lib/api.js");

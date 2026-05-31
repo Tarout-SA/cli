@@ -193,6 +193,34 @@ export function outputJsonLine(payload: unknown): void {
 	console.log(JSON.stringify(payload));
 }
 
+export interface NeedsInputRequest {
+	/** Stable id the agent uses to recognize what's being asked. */
+	field: string;
+	/** Prompt kind so the agent picks the right UI affordance. */
+	kind: "input" | "select" | "confirm" | "password";
+	/** Question to show the human user verbatim. */
+	question: string;
+	/** Required for kind="select". */
+	choices?: Array<{ label: string; value: string }>;
+	/** Optional default value the agent can pre-fill. */
+	default?: string | boolean;
+	/** CLI flag the agent should pass on its next invocation. */
+	flag: string;
+	/** Hint to the agent that the value is secret (mask in UI, omit from logs). */
+	sensitive?: boolean;
+	/** Free-form context the agent can use to phrase a richer question. */
+	context?: Record<string, unknown>;
+}
+
+/**
+ * Emit a single needs_input event in JSON mode. Always pairs with
+ * ExitCode.NEEDS_INPUT at the call site so the external agent knows
+ * to collect the value and re-invoke.
+ */
+export function outputNeedsInput(request: NeedsInputRequest): void {
+	outputJsonLine({ type: "needs_input", ...request });
+}
+
 // Quiet mode output (only essential info)
 export function quietOutput(message: string): void {
 	if (globalOptions.quiet || globalOptions.json) {

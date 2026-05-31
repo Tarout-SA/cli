@@ -239,6 +239,7 @@ APP_ID=$(tarout apps list --json | jq -r '.[0].id')
 | 3 | Authentication error (not logged in) |
 | 4 | Resource not found |
 | 5 | Permission denied |
+| 6 | Needs input — see `needs_input` event below |
 
 ### JSON Output Format
 
@@ -254,6 +255,51 @@ All `--json` output follows a consistent structure:
 // List operations
 { "success": true, "data": [...], "meta": { "total": 10 } }
 ```
+
+### Agent Input Relay (`needs_input`)
+
+When `tarout up --json` hits a choice point and the value wasn't passed as a
+flag, it emits a single `needs_input` line on stdout and exits with code `6`
+instead of crashing or silently defaulting. The external agent reads that
+event, asks the human user in its chat UI, then re-invokes `tarout up` with
+the same arguments plus the new flag.
+
+```json
+{
+  "type": "needs_input",
+  "field": "name",
+  "kind": "input",
+  "question": "Application name:",
+  "default": "my-project",
+  "flag": "--name",
+  "sensitive": false,
+  "context": { "step": "app_name", "defaultName": "my-project" }
+}
+```
+
+Fields:
+- `field` — stable id (e.g. `name`, `region`, `token`, `source`).
+- `kind` — `"input" | "select" | "confirm" | "password"`.
+- `question` — show verbatim to the user.
+- `choices` — present when `kind: "select"`.
+- `default` — pre-fill suggestion.
+- `flag` — the CLI flag to pass on the next invocation.
+- `sensitive` — `true` for tokens / passwords (mask in UI, omit from logs).
+- `context` — free-form metadata the agent can use to phrase a richer prompt.
+
+Loop pattern for an agent:
+
+```text
+1. invoke `tarout up --json [flags]`
+2. read stdout line-by-line
+3. if line.type === "needs_input":
+     - ask the user for `question`
+     - re-invoke with the same flags + `${flag} ${answer}`
+4. otherwise treat the final JSON envelope as success / error
+```
+
+Flags currently supported by `tarout up` for skipping the relay:
+`--token`, `--name`, `--plan`, `--source`, `--repo`, `--branch`, `--region`, `--yes`.
 
 ## Configuration
 
