@@ -13,6 +13,7 @@
 import { resolve } from "node:path";
 import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
+import { getProjectConfig } from "../lib/config.js";
 import { NotFoundError, handleError } from "../lib/errors.js";
 import {
 	box,
@@ -25,9 +26,12 @@ import {
 } from "../lib/output.js";
 import { ExitCode, exit } from "../utils/exit-codes.js";
 import {
+	type AppSummary,
+	configureOptionalResources,
 	createAppFromCurrentDirectory,
 	ensureAuthenticatedForDeploy,
 	extractEntitlementKeyFromError,
+	findApp,
 	inferSuggestedPlan,
 	inspectCurrentProject,
 	isEntitlementError,
@@ -47,6 +51,8 @@ interface UpOptions {
 	apiUrl?: string;
 	branch?: string;
 	buildCommand?: string;
+	database?: string;
+	databasePlan?: string;
 	description?: string;
 	frameworkPreset?: string;
 	idempotencyKey?: string;
@@ -59,6 +65,8 @@ interface UpOptions {
 	rootDirectory?: string;
 	source?: string;
 	startCommand?: string;
+	storage?: boolean;
+	storagePlan?: string;
 	token?: string;
 }
 
@@ -106,6 +114,13 @@ export function registerUpCommand(program: Command): void {
 		.option("--repo <owner/repo>", "GitHub repository (when --source github)")
 		.option("--branch <branch>", "GitHub branch (with --source github)", "main")
 		.option("-r, --region <region>", "Deployment region", DEFAULT_REGION)
+		.option(
+			"--database <type>",
+			"Provision and attach a database: none, postgres, or mysql (defaults to auto-detected)",
+		)
+		.option("--database-plan <plan>", "Database plan (e.g. free, starter)")
+		.option("--storage", "Provision and attach file storage")
+		.option("--storage-plan <plan>", "Storage plan (e.g. free, starter)")
 		.option("--description <text>", "Description for the newly created app")
 		.option(
 			"--framework-preset <preset>",
@@ -161,67 +176,118 @@ export function registerUpCommand(program: Command): void {
 
 				const client = getApiClient();
 
-				let app: Awaited<ReturnType<typeof createAppFromCurrentDirectory>>;
-				try {
-					emitEvent({ event: "app_create_started" });
-					app = await createAppFromCurrentDirectory(client, profile, {
-						name: options.name,
-						plan: options.plan,
-						region: options.region,
-						description: options.description,
-						frameworkPreset: options.frameworkPreset,
-						rootDirectory: options.rootDirectory,
-						installCommand: options.installCommand,
-						buildCommand: options.buildCommand,
-						outputDirectory: options.outputDirectory,
-						startCommand: options.startCommand,
-					});
-					emitEvent({
-						event: "app_create_done",
-						applicationId: app.applicationId,
-						name: app.name,
-						plan: app.plan ?? options.plan ?? "free",
-					});
-				} catch (err) {
-					if (isEntitlementError(err)) {
-						const message =
-							err instanceof Error ? err.message : "Plan upgrade required";
-
-						// JSON / non-TTY / --yes: keep the machine-readable contract.
-						if (isJsonMode() || shouldSkipConfirmation()) {
-							outputError("NEEDS_UPGRADE", message, {
-								suggestedPlan: inferSuggestedPlan(options.plan),
-								failedEntitlementKey: extractEntitlementKeyFromError(err),
-								hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout up`.",
-							});
-							exit(ExitCode.PERMISSION_DENIED);
-						}
-
-						log("");
-						log(colors.warn(message));
-
-						const upgraded = await promptUpgradeFromEntitlementError(
-							client,
-							err,
-							options.plan,
-						);
-
-						if (!upgraded) {
-							outputError("NEEDS_UPGRADE", message, {
-								suggestedPlan: inferSuggestedPlan(options.plan),
-								failedEntitlementKey: extractEntitlementKeyFromError(err),
-								hint: "Run `tarout billing upgrade <plan> --wait`, then retry `tarout up`.",
-							});
-							exit(ExitCode.PERMISSION_DENIED);
-						}
-
-						box("Upgrade complete", [
-							colors.success("Subscription updated."),
-							`Run ${colors.cyan("tarout up")} again to deploy on the new plan.`,
-						]);
-						return;
+				// Idempotent: if this directory is already linked to an app, REUSE it
+				// (redeploy in place) instead of creating a duplicate on every `up`.
+				// This makes the agent edit→up→edit→up loop safe.
+				let app: AppSummary | undefined;
+				const linked = getProjectConfig();
+				let reused = false;
+				if (linked) {
+					const apps =
+						(await client.application.allByOrganization.query()) as AppSummary[];
+					const existing =
+						findApp(apps, linked.applicationId) ?? findApp(apps, linked.name);
+					if (existing) {
+						app = existing;
+						reused = true;
+						emitEvent({
+							event: "app_reused",
+							applicationId: app.applicationId,
+							name: app.name,
+						});
 					}
-					throw err;
+				}
+
+				if (!reused) {
+					try {
+						emitEvent({ event: "app_create_started" });
+						app = await createAppFromCurrentDirectory(client, profile, {
+							name: options.name,
+							plan: options.plan,
+							region: options.region,
+							description: options.description,
+							frameworkPreset: options.frameworkPreset,
+							rootDirectory: options.rootDirectory,
+							installCommand: options.installCommand,
+							buildCommand: options.buildCommand,
+							outputDirectory: options.outputDirectory,
+							startCommand: options.startCommand,
+						});
+						emitEvent({
+							event: "app_create_done",
+							applicationId: app.applicationId,
+							name: app.name,
+							plan: app.plan ?? options.plan ?? "free",
+						});
+					} catch (err) {
+						if (isEntitlementError(err)) {
+							const message =
+								err instanceof Error ? err.message : "Plan upgrade required";
+
+							// JSON / non-TTY / --yes: keep the machine-readable contract.
+							if (isJsonMode() || shouldSkipConfirmation()) {
+								outputError("NEEDS_UPGRADE", message, {
+									suggestedPlan: inferSuggestedPlan(options.plan),
+									failedEntitlementKey: extractEntitlementKeyFromError(err),
+									hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout up`.",
+								});
+								exit(ExitCode.PERMISSION_DENIED);
+							}
+
+							log("");
+							log(colors.warn(message));
+
+							const upgraded = await promptUpgradeFromEntitlementError(
+								client,
+								err,
+								options.plan,
+							);
+
+							if (!upgraded) {
+								outputError("NEEDS_UPGRADE", message, {
+									suggestedPlan: inferSuggestedPlan(options.plan),
+									failedEntitlementKey: extractEntitlementKeyFromError(err),
+									hint: "Run `tarout billing upgrade <plan> --wait`, then retry `tarout up`.",
+								});
+								exit(ExitCode.PERMISSION_DENIED);
+							}
+
+							box("Upgrade complete", [
+								colors.success("Subscription updated."),
+								`Run ${colors.cyan("tarout up")} again to deploy on the new plan.`,
+							]);
+							return;
+						}
+						throw err;
+					}
+
+					// Provision the backend the project actually needs (detected DB /
+					// storage, or the explicit --database/--storage flags) and wire it
+					// in, only on first creation. `deploy` already does this; `up` used
+					// to detect resources but never create them, leaving the app to boot
+					// without its backend.
+					emitEvent({
+						event: "provision_started",
+						database: inspection.database,
+						storage: inspection.storage,
+					});
+					await configureOptionalResources(
+						client,
+						profile,
+						app,
+						{
+							database: options.database,
+							databasePlan: options.databasePlan,
+							storage: options.storage,
+							storagePlan: options.storagePlan,
+						},
+						inspection,
+					);
+					emitEvent({ event: "provision_done" });
+				}
+
+				if (!app) {
+					throw new Error("Failed to resolve the target application.");
 				}
 
 				if (source === "github") {

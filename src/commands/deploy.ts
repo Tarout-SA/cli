@@ -56,6 +56,7 @@ import {
 } from "../lib/output.js";
 import { streamDeploymentLogs } from "../lib/websocket.js";
 import { ExitCode, exit } from "../utils/exit-codes.js";
+import { formatAppUrl } from "../utils/url.js";
 import {
 	confirm,
 	input,
@@ -75,7 +76,7 @@ const DROP_UPLOAD_CONTENT_TYPE = "application/zip";
 
 const execFileAsync = promisify(execFile);
 
-interface AppSummary {
+export interface AppSummary {
 	appName?: string;
 	applicationId: string;
 	name: string;
@@ -155,13 +156,13 @@ export async function ensureAuthenticatedForDeploy(
 					field: "token",
 					kind: "password",
 					question:
-						`Paste a Tarout API token. Generate one at ${apiUrl}/dashboard/account/tokens`,
+						`Paste a Tarout API token. Generate one at ${apiUrl}/dashboard/settings/profile`,
 					flag: "--token",
 					sensitive: true,
 					context: {
 						step: "auth",
 						reason: "not_logged_in",
-						generateUrl: `${apiUrl}/dashboard/account/tokens`,
+						generateUrl: `${apiUrl}/dashboard/settings/profile`,
 					},
 				},
 				// Unreachable: promptOrEmit exits the process in JSON mode.
@@ -200,13 +201,13 @@ export async function ensureAuthenticatedForDeploy(
 					field: "token",
 					kind: "password",
 					question:
-						`Stored credentials are invalid or expired. Paste a new Tarout API token from ${apiUrl}/dashboard/account/tokens`,
+						`Stored credentials are invalid or expired. Paste a new Tarout API token from ${apiUrl}/dashboard/settings/profile`,
 					flag: "--token",
 					sensitive: true,
 					context: {
 						step: "auth",
 						reason: "expired_credentials",
-						generateUrl: `${apiUrl}/dashboard/account/tokens`,
+						generateUrl: `${apiUrl}/dashboard/settings/profile`,
 					},
 				},
 				async () => {
@@ -883,7 +884,10 @@ export async function createAppFromCurrentDirectory(
 	const providedName = options.name?.trim();
 	let appName = providedName || defaultName;
 
-	if (!providedName && !shouldSkipConfirmation()) {
+	// In JSON/agent mode, auto-apply the directory-name default instead of
+	// emitting a needs_input round-trip — `--name` is documented as defaulting to
+	// the directory name, and the agent already has no TTY to answer.
+	if (!providedName && !shouldSkipConfirmation() && !isJsonMode()) {
 		appName = await promptOrEmit<string>(
 			{
 				field: "name",
@@ -1501,7 +1505,7 @@ async function openGitProviderSetup(): Promise<void> {
 	await open(url);
 }
 
-async function configureOptionalResources(
+export async function configureOptionalResources(
 	client: any,
 	profile: Profile,
 	app: AppSummary,
@@ -1621,9 +1625,10 @@ async function createAndAttachDatabase(
 	const label = input.kind === "postgres" ? "Postgres" : "MySQL";
 	const _createSpinner = startSpinner(`Creating ${label} database...`);
 
+	let databaseId: string | undefined;
 	try {
 		if (input.kind === "postgres") {
-			await client.postgres.create.mutate({
+			const created = await client.postgres.create.mutate({
 				name: input.name,
 				appName,
 				dockerImage: "postgres:17",
@@ -1632,8 +1637,9 @@ async function createAndAttachDatabase(
 				plan: input.plan,
 				region: DEFAULT_REGION,
 			});
+			databaseId = created?.postgresId;
 		} else {
-			await client.mysql.create.mutate({
+			const created = await client.mysql.create.mutate({
 				name: input.name,
 				appName,
 				dockerImage: "mysql:9.1",
@@ -1642,6 +1648,7 @@ async function createAndAttachDatabase(
 				plan: input.plan,
 				region: DEFAULT_REGION,
 			});
+			databaseId = created?.mysqlId;
 		}
 		succeedSpinner(`${label} database created.`);
 	} catch (err) {
@@ -1649,7 +1656,11 @@ async function createAndAttachDatabase(
 		throw err;
 	}
 
-	const databaseId = await findDatabaseIdByAppName(client, input.kind, appName);
+	// create now returns the id directly; fall back to a name lookup only for
+	// older servers that don't.
+	if (!databaseId) {
+		databaseId = await findDatabaseIdByAppName(client, input.kind, appName);
+	}
 	const _attachSpinner = startSpinner(`Attaching ${label} to ${app.name}...`);
 	try {
 		if (input.kind === "postgres") {
@@ -2196,11 +2207,9 @@ export function registerDeployCommands(program: Command) {
 						applicationId: app.applicationId,
 						name: app.name,
 						status: app.applicationStatus,
-						url: app.appSubdomain
-							? `https://${app.appSubdomain}`
-							: app.domain?.[0]?.host
-								? `https://${app.domain[0].host}`
-								: null,
+						url:
+							formatAppUrl(app.appSubdomain) ??
+							formatAppUrl(app.domain?.[0]?.host),
 						cloudStatus,
 					});
 					return;
@@ -2211,11 +2220,9 @@ export function registerDeployCommands(program: Command) {
 				log("");
 				log(`Status: ${getStatusBadge(app.applicationStatus)}`);
 
-				const appUrl = app.appSubdomain
-					? `https://${app.appSubdomain}`
-					: app.domain?.[0]?.host
-						? `https://${app.domain[0].host}`
-						: null;
+				const appUrl =
+					formatAppUrl(app.appSubdomain) ??
+					formatAppUrl(app.domain?.[0]?.host);
 				if (appUrl) {
 					log(`URL: ${colors.cyan(appUrl)}`);
 				}
@@ -2785,7 +2792,7 @@ export function registerLogsCommand(program: Command) {
 }
 
 // Helper functions
-function findApp(apps: AppSummary[], identifier: string) {
+export function findApp(apps: AppSummary[], identifier: string) {
 	const lowerIdentifier = identifier.toLowerCase();
 
 	return apps.find(
@@ -2836,6 +2843,30 @@ export async function streamDeploymentWithLogs(
 	const startTime = Date.now();
 	let wsConnected = false;
 	let lastStatus = deployment.status;
+
+	// In environments where the WebSocket log stream can't connect (hosted MCP,
+	// sandboxes/CI that block raw WS), `logLines` stays empty even though the
+	// HTTP status poll works. Backfill the build logs over HTTP at terminal status
+	// so the one-shot agent command always carries them (esp. for diagnosing a
+	// failed deploy). No-op once any logs were already streamed.
+	const backfillLogsIfEmpty = async () => {
+		if (logLines.length > 0) return;
+		try {
+			const res = await client.deployment.getDeploymentLogs.query({
+				deploymentId,
+				offset: 0,
+				limit: 5000,
+			});
+			if (Array.isArray(res?.lines)) {
+				for (const line of res.lines) {
+					logLines.push(line);
+					if (isErrorLine(line)) errors.push(line);
+				}
+			}
+		} catch {
+			// Best-effort: if the HTTP log fetch also fails, emit whatever we have.
+		}
+	};
 
 	if (!isJsonMode()) {
 		log("");
@@ -2891,16 +2922,15 @@ export async function streamDeploymentWithLogs(
 				// Give WebSocket a moment to flush remaining logs
 				await sleep(500);
 				cleanup?.();
+				await backfillLogsIfEmpty();
 
 				// Get final application info for URL
 				const finalApp = await client.application.one.query({ applicationId });
 				const duration = Math.round((Date.now() - startTime) / 1000);
 
-				const deployUrl = finalApp.appSubdomain
-					? `https://${finalApp.appSubdomain}`
-					: finalApp.domain?.[0]?.host
-						? `https://${finalApp.domain[0].host}`
-						: null;
+				const deployUrl =
+					formatAppUrl(finalApp.appSubdomain) ??
+					formatAppUrl(finalApp.domain?.[0]?.host);
 
 				if (isJsonMode()) {
 					outputData({
@@ -2924,6 +2954,7 @@ export async function streamDeploymentWithLogs(
 
 			if (lastStatus === "error" || lastStatus === "cancelled") {
 				cleanup?.();
+				await backfillLogsIfEmpty();
 
 				const errorAnalysis = analyzeDeploymentError(
 					logLines,
@@ -3001,6 +3032,7 @@ export async function streamDeploymentWithLogs(
 
 		// Timeout
 		cleanup?.();
+		await backfillLogsIfEmpty();
 		const duration = Math.round((Date.now() - startTime) / 1000);
 
 		if (isJsonMode()) {

@@ -1,6 +1,12 @@
 import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
-import { isLoggedIn } from "../lib/config.js";
+import { resolveProfileFromCredential } from "../lib/auth-profile.js";
+import {
+	getApiUrl,
+	getCurrentProfile,
+	getToken,
+	isLoggedIn,
+} from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
 	colors,
@@ -209,6 +215,25 @@ export function registerAccountCommands(program: Command) {
 							flag: "--name",
 						}));
 					const client = getApiClient();
+
+					// The server requires metadata.organizationId — without it the
+					// mutation is rejected by Zod (the command would always fail), and a
+					// key with an empty org authenticates to nothing. Resolve the org
+					// from the saved profile, falling back to the live credential.
+					const profile = getCurrentProfile();
+					let organizationId = profile?.organizationId;
+					if (!organizationId) {
+						const resolved = await resolveProfileFromCredential({
+							apiUrl: getApiUrl(),
+							token: getToken() || "",
+							fallback: profile,
+						});
+						organizationId = resolved.organizationId;
+					}
+					if (!organizationId) {
+						throw new AuthError();
+					}
+
 					const _spinner = startSpinner("Creating API key...");
 					const result = await client.user.createApiKey.mutate({
 						name,
@@ -221,6 +246,7 @@ export function registerAccountCommands(program: Command) {
 							options.rateLimitWindow || "60000",
 						),
 						rateLimitMax: Number.parseInt(options.rateLimitMax || "100"),
+						metadata: { organizationId },
 					} as any);
 					succeedSpinner("API key created.");
 					if (isJsonMode()) {
@@ -276,30 +302,10 @@ export function registerAccountCommands(program: Command) {
 			}
 		});
 
-	// ── Generate auth token ────────────────────────────────────────────────────────
-	account
-		.command("generate-token")
-		.description("Generate a one-time metrics/auth token")
-		.action(async () => {
-			try {
-				if (!isLoggedIn()) throw new AuthError();
-				const client = getApiClient();
-				const _spinner = startSpinner("Generating token...");
-				const result = await client.user.generateToken.mutate();
-				succeedSpinner();
-				if (isJsonMode()) {
-					outputData(result);
-					return;
-				}
-				const r = result as any;
-				log("");
-				log(`Token: ${colors.cyan(r.token || String(result))}`);
-				log("");
-			} catch (err) {
-				failSpinner();
-				handleError(err);
-			}
-		});
+	// Note: a `generate-token` command used to live here but called
+	// user.generateToken, a server procedure that is permanently disabled (always
+	// throws "Token generation is disabled"). Use `tarout token:create` to mint an
+	// API key. The metrics-token command below is the live token path.
 
 	// ── Metrics token ──────────────────────────────────────────────────────────────
 	account

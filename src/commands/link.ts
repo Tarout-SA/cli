@@ -32,6 +32,7 @@ import {
 } from "../lib/output.js";
 import { confirm, select } from "../utils/prompts.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
+import { formatAppUrl } from "../utils/url.js";
 
 export function registerLinkCommands(program: Command) {
 	// Link command - connect local directory to a Tarout app
@@ -278,7 +279,7 @@ export function registerLinkCommands(program: Command) {
 								applicationId: config.applicationId,
 								name: config.name,
 								status: app.applicationStatus,
-								url: app.appSubdomain ? `https://${app.appSubdomain}` : null,
+								url: formatAppUrl(app.appSubdomain),
 								linkedAt: config.linkedAt,
 							});
 							return;
@@ -291,7 +292,7 @@ export function registerLinkCommands(program: Command) {
 						log(`ID: ${colors.dim(config.applicationId)}`);
 						log(`Status: ${getStatusIndicator(app.applicationStatus)}`);
 						if (app.appSubdomain) {
-							log(`URL: ${colors.cyan(`https://${app.appSubdomain}`)}`);
+							log(`URL: ${colors.cyan(formatAppUrl(app.appSubdomain) ?? "")}`);
 						}
 						log(`Linked: ${new Date(config.linkedAt).toLocaleString()}`);
 						log("");

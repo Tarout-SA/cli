@@ -22,6 +22,7 @@ import {
 } from "../lib/output.js";
 import { confirm, input, select } from "../utils/prompts.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
+import { formatAppUrl } from "../utils/url.js";
 
 interface AppSummary {
 	appName?: string;
@@ -316,7 +317,7 @@ export function registerAppsCommands(program: Command) {
 				log("");
 
 				// URL
-				const appUrl = app.appSubdomain ? `https://${app.appSubdomain}` : null;
+				const appUrl = formatAppUrl(app.appSubdomain);
 				if (appUrl) {
 					log(`${colors.bold("URL")}`);
 					log(`  ${appUrl}`);
@@ -1440,9 +1441,9 @@ export function registerAppsCommands(program: Command) {
 				let url: string | null = null;
 
 				if (app.domain && app.domain.length > 0) {
-					url = `https://${app.domain[0].host}`;
+					url = formatAppUrl(app.domain[0].host) ?? "";
 				} else if (app.appSubdomain) {
-					url = `https://${app.appSubdomain}`;
+					url = formatAppUrl(app.appSubdomain) ?? "";
 				}
 
 				if (!url) {

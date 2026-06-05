@@ -1,7 +1,9 @@
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
-import { isLoggedIn } from "../lib/config.js";
+import { getApiUrl, isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import { colors, isJsonMode, log, outputData, table } from "../lib/output.js";
 import {
@@ -14,6 +16,62 @@ interface ManifestEntry {
 	path: string;
 	type: "query" | "mutation" | "subscription";
 	router: string;
+}
+
+// Cache the surface manifest per API URL with a short TTL so an agent firing many
+// `tarout call`s in a session doesn't refetch it every time. The cache is a pure
+// optimization: a cache MISS for a requested procedure triggers a live refetch
+// (see below), so a newly-added procedure is never wrongly reported as unknown.
+const MANIFEST_TTL_MS = 5 * 60 * 1000;
+
+function manifestCachePath(): string {
+	return join(homedir(), ".tarout", "surface-manifest-cache.json");
+}
+
+async function fetchManifestFresh(
+	client: any,
+	apiUrl: string,
+): Promise<ManifestEntry[]> {
+	const manifest =
+		(await client.settings.getSurfaceManifest.query()) as ManifestEntry[];
+	try {
+		const dir = join(homedir(), ".tarout");
+		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+		let cache: Record<string, { at: number; manifest: ManifestEntry[] }> = {};
+		try {
+			cache = JSON.parse(readFileSync(manifestCachePath(), "utf8"));
+		} catch {
+			// no/invalid cache file — start fresh
+		}
+		cache[apiUrl] = { at: Date.now(), manifest };
+		writeFileSync(manifestCachePath(), JSON.stringify(cache), { mode: 0o600 });
+	} catch {
+		// caching is best-effort; never let it break the call
+	}
+	return manifest;
+}
+
+async function loadManifest(
+	client: any,
+	apiUrl: string,
+): Promise<ManifestEntry[]> {
+	try {
+		const cache = JSON.parse(readFileSync(manifestCachePath(), "utf8")) as Record<
+			string,
+			{ at: number; manifest: ManifestEntry[] }
+		>;
+		const entry = cache[apiUrl];
+		if (
+			entry &&
+			Date.now() - entry.at < MANIFEST_TTL_MS &&
+			Array.isArray(entry.manifest)
+		) {
+			return entry.manifest;
+		}
+	} catch {
+		// cache miss/corruption — fall through to a live fetch
+	}
+	return fetchManifestFresh(client, apiUrl);
 }
 
 /**
@@ -46,8 +104,8 @@ export function registerCallCommand(program: Command) {
 				// ── Discovery mode ──────────────────────────────────────────────
 				if (opts.list !== undefined || !procedure) {
 					startSpinner("Loading control surface...");
-					const manifest =
-						(await client.settings.getSurfaceManifest.query()) as ManifestEntry[];
+					// Always fetch fresh for discovery so the listing is never stale.
+					const manifest = await fetchManifestFresh(client, getApiUrl());
 					succeedSpinner();
 
 					const filter =
@@ -79,9 +137,15 @@ export function registerCallCommand(program: Command) {
 				}
 
 				// ── Resolve the procedure's call type from the manifest ─────────
-				const manifest =
-					(await client.settings.getSurfaceManifest.query()) as ManifestEntry[];
-				const entry = manifest.find((m) => m.path === procedure);
+				const apiUrl = getApiUrl();
+				let manifest = await loadManifest(client, apiUrl);
+				let entry = manifest.find((m) => m.path === procedure);
+				if (!entry) {
+					// Not in the (possibly cached) manifest — refetch live before
+					// declaring it unknown, so a just-added procedure still works.
+					manifest = await fetchManifestFresh(client, apiUrl);
+					entry = manifest.find((m) => m.path === procedure);
+				}
 				if (!entry) {
 					throw new Error(
 						`Unknown or non-exposed procedure: "${procedure}". Run \`tarout call --list\` to see what's available.`,
@@ -118,7 +182,17 @@ export function registerCallCommand(program: Command) {
 						? await node.mutate(input)
 						: await node.query(input);
 				succeedSpinner();
-				outputData(result);
+				// outputData only prints under --json; in human mode it would be a
+				// silent no-op (the call looks like it did nothing). Print the result.
+				if (isJsonMode()) {
+					outputData(result);
+				} else {
+					log(
+						typeof result === "string"
+							? result
+							: JSON.stringify(result, null, 2),
+					);
+				}
 			} catch (err) {
 				failSpinner();
 				handleError(err);

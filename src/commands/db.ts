@@ -193,6 +193,8 @@ export function registerDbCommands(program: Command) {
 
 				succeedSpinner("Database created!");
 
+				// create now returns postgresId/mysqlId (plus env/project). Guard
+				// against an unexpectedly missing id so we never crash on .slice().
 				const dbId = database.postgresId || database.mysqlId;
 
 				if (isJsonMode()) {
@@ -200,18 +202,20 @@ export function registerDbCommands(program: Command) {
 					return;
 				}
 
-				quietOutput(dbId);
+				if (dbId) quietOutput(dbId);
 
 				box("Database Created", [
-					`ID: ${colors.cyan(dbId)}`,
-					`Name: ${database.name}`,
+					`ID: ${colors.cyan(dbId ?? "(pending)")}`,
+					`Name: ${database.name ?? dbName}`,
 					`Type: ${getTypeLabel(dbType)}`,
 				]);
 
 				log("Next steps:");
-				log(
-					`  View connection info: ${colors.dim(`tarout db info ${dbId.slice(0, 8)}`)}`,
-				);
+				if (dbId) {
+					log(
+						`  View connection info: ${colors.dim(`tarout db info ${dbId.slice(0, 8)}`)}`,
+					);
+				}
 				log("");
 			} catch (err) {
 				handleError(err);
@@ -565,7 +569,7 @@ export function registerDbCommands(program: Command) {
 					backups.map((b: any) => [
 						colors.cyan((b.backupId || b.id || "").slice(0, 8)),
 						b.schedule || colors.dim("-"),
-						b.enabled ? colors.green("yes") : colors.dim("no"),
+						b.enabled ? colors.success("yes") : colors.dim("no"),
 					]),
 				);
 				log("");

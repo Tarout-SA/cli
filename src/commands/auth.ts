@@ -4,7 +4,9 @@ import { startAuthServer } from "../lib/auth-server.js";
 import { resolveProfileFromCredential } from "../lib/auth-profile.js";
 import {
 	clearConfig,
+	getApiUrl,
 	getCurrentProfile,
+	getToken,
 	isLoggedIn,
 	setCurrentProfile,
 	setProfile,
@@ -32,7 +34,7 @@ import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
  * of waiting on a never-arriving browser callback.
  */
 function refuseBrowserAuthForAgent(action: "login" | "register"): never {
-	const message = `tarout ${action} requires a browser. Agents should ask the user to run \`tarout token <api-token>\` or set TAROUT_TOKEN — generate one at https://tarout.sa/dashboard/account/api-keys.`;
+	const message = `tarout ${action} requires a browser. Agents should ask the user to run \`tarout token <api-token>\` or set TAROUT_TOKEN — generate one at https://tarout.sa/dashboard/settings/profile.`;
 	if (isJsonMode()) {
 		outputError("AUTH_BOOTSTRAP_REQUIRED", message, {
 			action,
@@ -363,14 +365,38 @@ export function registerAuthCommands(program: Command) {
 				const client = getApiClient();
 
 				const profile = getCurrentProfile();
+
+				// A key with an empty organizationId authenticates to NOTHING (every
+				// later REST/MCP/CLI call → UNAUTHORIZED). When running from a bare
+				// TAROUT_TOKEN (no saved profile, so profile is null) resolve the real
+				// org from the live credential instead of stamping "".
+				let keyOrg = profile?.organizationId;
+				let keyEnv = profile?.environmentId;
+				let keyProj = profile?.projectId;
+				if (!keyOrg) {
+					const resolved = await resolveProfileFromCredential({
+						apiUrl: getApiUrl(),
+						token: getToken() || "",
+						fallback: profile,
+					});
+					keyOrg = resolved.organizationId;
+					keyEnv = resolved.environmentId;
+					keyProj = resolved.projectId;
+				}
+				if (!keyOrg) {
+					throw new Error(
+						"Could not determine your organization. Run `tarout auth login` first, or pass a token scoped to an organization.",
+					);
+				}
+
 				const _spinner = startSpinner("Creating API token...");
 
 				const result = await client.user.createApiKey.mutate({
 					name: tokenName,
 					metadata: {
-						organizationId: profile?.organizationId || "",
-						environmentId: profile?.environmentId || "",
-						projectId: profile?.projectId || "",
+						organizationId: keyOrg,
+						environmentId: keyEnv || "",
+						projectId: keyProj || "",
 					},
 				});
 
