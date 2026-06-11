@@ -103,6 +103,8 @@ interface DeployOptions {
 	outputDirectory?: string;
 	plan?: string;
 	region?: string;
+	reuseDatabase?: string;
+	reuseStorage?: string;
 	rootDirectory?: string;
 	source?: string;
 	startCommand?: string;
@@ -1516,32 +1518,49 @@ export async function configureOptionalResources(
 	const createdResources: string[] = [];
 
 	if (database !== "none") {
-		const plan = await resolveResourcePlan(
-			options.databasePlan,
-			"Database plan:",
+		const decision = await resolveDatabaseProvisioning(
+			client,
+			profile,
+			app,
+			database,
+			options,
 		);
-		const databaseName = formatResourceName(
-			app.name,
-			database === "postgres" ? "Postgres" : "MySQL",
-		);
-		await createAndAttachDatabase(client, profile, app, {
-			kind: database,
-			name: databaseName,
-			plan,
-		});
-		createdResources.push(
-			`${database === "postgres" ? "Postgres" : "MySQL"} (${plan})`,
-		);
+		if (decision.action === "reuse") {
+			await attachExistingDatabase(client, app, database, decision);
+			createdResources.push(
+				`${formatDatabaseKind(database)} reused — ${decision.name} (${decision.plan})`,
+			);
+		} else {
+			await createAndAttachDatabase(client, profile, app, {
+				kind: database,
+				name: decision.name,
+				plan: decision.plan,
+			});
+			createdResources.push(
+				`${formatDatabaseKind(database)} (${decision.plan})`,
+			);
+		}
 	}
 
 	if (await resolveStorageChoice(options, inspection)) {
-		const plan = await resolveResourcePlan(options.storagePlan, "Storage plan:");
-		const storageName = formatResourceName(app.name, "files", 50);
-		await createAndAttachStorage(client, app, {
-			name: storageName,
-			plan,
-		});
-		createdResources.push(`Storage (${plan})`);
+		const decision = await resolveStorageProvisioning(
+			client,
+			profile,
+			app,
+			options,
+		);
+		if (decision.action === "reuse") {
+			await attachExistingStorage(client, app, decision);
+			createdResources.push(
+				`Storage reused — ${decision.name} (${decision.plan})`,
+			);
+		} else {
+			await createAndAttachStorage(client, app, {
+				name: decision.name,
+				plan: decision.plan,
+			});
+			createdResources.push(`Storage (${decision.plan})`);
+		}
 	}
 
 	if (createdResources.length > 0 && !isJsonMode()) {
@@ -1734,6 +1753,636 @@ async function createAndAttachStorage(
 		failSpinner("Failed to attach storage credentials.");
 		throw err;
 	}
+}
+
+// --- Reuse-or-create resolution -----------------------------------------
+
+type ProvisionDecision<TReuseFields> =
+	| ({ action: "reuse"; plan: ResourcePlan; name: string } & TReuseFields)
+	| { action: "create"; plan: ResourcePlan; name: string };
+
+interface DatabaseCandidate {
+	id: string;
+	name: string;
+	appName?: string | null;
+	plan: ResourcePlan;
+	region?: string | null;
+	projectId?: string | null;
+	environmentId?: string | null;
+	applicationStatus?: string | null;
+	isReadOnly?: boolean | null;
+	createdAt?: string | Date | null;
+}
+
+interface StorageCandidate {
+	bucketId: string;
+	name: string;
+	plan: ResourcePlan;
+	region?: string | null;
+	projectId?: string | null;
+	environmentId?: string | null;
+	applicationStatus?: string | null;
+	isUploadBlocked?: boolean | null;
+	createdAt?: string | Date | null;
+}
+
+type DatabaseDecision = ProvisionDecision<{
+	databaseId: string;
+	upgraded: boolean;
+}>;
+type StorageDecision = ProvisionDecision<{
+	bucketId: string;
+	upgraded: boolean;
+}>;
+
+async function resolveDatabaseProvisioning(
+	client: any,
+	profile: Profile,
+	app: AppSummary,
+	kind: "postgres" | "mysql",
+	options: DeployOptions,
+): Promise<DatabaseDecision> {
+	const candidates = await listDatabaseCandidates(client, kind, profile);
+	const requestedPlan = normalizeResourcePlan(options.databasePlan);
+	const planExplicit = Boolean(options.databasePlan);
+
+	if (options.reuseDatabase) {
+		const picked = resolveExplicitDatabaseRef(
+			candidates,
+			options.reuseDatabase,
+			kind,
+		);
+		return finalizeDatabaseReuse(
+			client,
+			picked,
+			kind,
+			requestedPlan,
+			planExplicit,
+		);
+	}
+
+	if (candidates.length === 0 || isJsonMode() || shouldSkipConfirmation()) {
+		return buildDatabaseCreateDecision(app, kind, requestedPlan);
+	}
+
+	const label = formatDatabaseKind(kind);
+	const choices = [
+		{ name: `Create a new ${label} database`, value: "__create__" },
+		...candidates.map((c) => ({
+			name: formatDatabaseCandidateLine(c),
+			value: c.id,
+		})),
+	];
+	log("");
+	log(
+		`Found ${candidates.length} existing ${label} database${candidates.length === 1 ? "" : "s"} in this project.`,
+	);
+	const picked = await select<string>(
+		`Reuse an existing ${label} database or create a new one?`,
+		choices,
+		{
+			field: kind === "postgres" ? "reuse_postgres" : "reuse_mysql",
+			flag:
+				kind === "postgres"
+					? "--reuse-database <id|name|auto>"
+					: "--reuse-database <id|name|auto>",
+			context: { kind },
+		},
+	);
+
+	if (picked === "__create__") {
+		const plan =
+			requestedPlan ?? (await resolveResourcePlan(undefined, "Database plan:"));
+		return {
+			action: "create",
+			plan,
+			name: formatResourceName(app.name, label),
+		};
+	}
+
+	const candidate = candidates.find((c) => c.id === picked);
+	if (!candidate) {
+		// Defensive: select returned an id not in our list.
+		throw new Error(
+			`Unable to resolve picked ${label} database (id=${picked}).`,
+		);
+	}
+	return finalizeDatabaseReuse(
+		client,
+		candidate,
+		kind,
+		requestedPlan,
+		planExplicit,
+	);
+}
+
+async function resolveStorageProvisioning(
+	client: any,
+	profile: Profile,
+	app: AppSummary,
+	options: DeployOptions,
+): Promise<StorageDecision> {
+	const candidates = await listStorageCandidates(client, profile);
+	const requestedPlan = normalizeResourcePlan(options.storagePlan);
+	const planExplicit = Boolean(options.storagePlan);
+
+	if (options.reuseStorage) {
+		const picked = resolveExplicitStorageRef(candidates, options.reuseStorage);
+		return finalizeStorageReuse(client, picked, requestedPlan, planExplicit);
+	}
+
+	if (candidates.length === 0 || isJsonMode() || shouldSkipConfirmation()) {
+		return buildStorageCreateDecision(app, requestedPlan);
+	}
+
+	const choices = [
+		{ name: "Create a new storage bucket", value: "__create__" },
+		...candidates.map((c) => ({
+			name: formatStorageCandidateLine(c),
+			value: c.bucketId,
+		})),
+	];
+	log("");
+	log(
+		`Found ${candidates.length} existing storage bucket${candidates.length === 1 ? "" : "s"} in this project.`,
+	);
+	const picked = await select<string>(
+		"Reuse an existing storage bucket or create a new one?",
+		choices,
+		{
+			field: "reuse_storage",
+			flag: "--reuse-storage <id|name|auto>",
+		},
+	);
+
+	if (picked === "__create__") {
+		const plan =
+			requestedPlan ?? (await resolveResourcePlan(undefined, "Storage plan:"));
+		return {
+			action: "create",
+			plan,
+			name: formatResourceName(app.name, "files", 50),
+		};
+	}
+
+	const candidate = candidates.find((c) => c.bucketId === picked);
+	if (!candidate) {
+		throw new Error(`Unable to resolve picked storage bucket (id=${picked}).`);
+	}
+	return finalizeStorageReuse(client, candidate, requestedPlan, planExplicit);
+}
+
+async function listDatabaseCandidates(
+	client: any,
+	kind: "postgres" | "mysql",
+	profile: Profile,
+): Promise<DatabaseCandidate[]> {
+	const rows: any[] =
+		kind === "postgres"
+			? await client.postgres.allByOrganization.query()
+			: await client.mysql.allByOrganization.query();
+
+	return (rows ?? [])
+		.filter((r) => {
+			// Require projectId match. If the server is older and doesn't return
+			// projectId, exclude the row — safer than risking a cross-project
+			// attach that the server would reject anyway.
+			if (!r?.projectId || !profile.projectId) return false;
+			return r.projectId === profile.projectId;
+		})
+		.map<DatabaseCandidate>((r) => ({
+			id: kind === "postgres" ? r.postgresId : r.mysqlId,
+			name: r.name,
+			appName: r.appName,
+			plan: (r.plan as ResourcePlan) ?? "FREE",
+			region: r.region ?? null,
+			projectId: r.projectId ?? null,
+			environmentId: r.environmentId ?? null,
+			applicationStatus: r.applicationStatus ?? null,
+			isReadOnly: r.isReadOnly ?? null,
+			createdAt: r.createdAt ?? null,
+		}))
+		.filter((c) => Boolean(c.id));
+}
+
+async function listStorageCandidates(
+	client: any,
+	profile: Profile,
+): Promise<StorageCandidate[]> {
+	const rows: any[] = await client.storage.allByOrganization.query();
+	return (rows ?? [])
+		.filter((r) => {
+			if (!r?.projectId || !profile.projectId) return false;
+			return r.projectId === profile.projectId;
+		})
+		.map<StorageCandidate>((r) => ({
+			bucketId: r.bucketId,
+			name: r.name,
+			plan: (r.plan as ResourcePlan) ?? "FREE",
+			region: r.region ?? null,
+			projectId: r.projectId ?? null,
+			environmentId: r.environmentId ?? null,
+			applicationStatus: r.applicationStatus ?? null,
+			isUploadBlocked: r.isUploadBlocked ?? null,
+			createdAt: r.createdAt ?? null,
+		}))
+		.filter((c) => Boolean(c.bucketId));
+}
+
+function resolveExplicitDatabaseRef(
+	candidates: DatabaseCandidate[],
+	ref: string,
+	kind: "postgres" | "mysql",
+): DatabaseCandidate {
+	const label = formatDatabaseKind(kind);
+	const normalized = ref.trim();
+
+	if (normalized.toLowerCase() === "auto") {
+		if (candidates.length === 0) {
+			throw new InvalidArgumentError(
+				`--reuse-database=auto: no existing ${label} databases in this project.`,
+			);
+		}
+		if (candidates.length > 1) {
+			const sample = candidates
+				.slice(0, 5)
+				.map((c) => `${c.name} (${c.id})`)
+				.join(", ");
+			throw new InvalidArgumentError(
+				`--reuse-database=auto needs exactly one match, found ${candidates.length}. Candidates: ${sample}. Pick one by id or name.`,
+			);
+		}
+		return candidates[0]!;
+	}
+
+	const lower = normalized.toLowerCase();
+	const match =
+		candidates.find((c) => c.id === normalized) ??
+		candidates.find((c) => c.name.toLowerCase() === lower) ??
+		candidates.find((c) => (c.appName ?? "").toLowerCase() === lower);
+
+	if (!match) {
+		const known = candidates.map((c) => `${c.name} (${c.id.slice(0, 8)})`);
+		const suggestions = findSimilar(
+			normalized,
+			candidates.flatMap((c) => [c.name, c.id]),
+		);
+		throw new NotFoundError(
+			`${label} database`,
+			normalized,
+			suggestions.length > 0
+				? suggestions
+				: known.length > 0
+					? known.slice(0, 5)
+					: [
+							`No ${label} databases found in this project. Drop --reuse-database to create a new one.`,
+						],
+		);
+	}
+	return match;
+}
+
+function resolveExplicitStorageRef(
+	candidates: StorageCandidate[],
+	ref: string,
+): StorageCandidate {
+	const normalized = ref.trim();
+
+	if (normalized.toLowerCase() === "auto") {
+		if (candidates.length === 0) {
+			throw new InvalidArgumentError(
+				"--reuse-storage=auto: no existing storage buckets in this project.",
+			);
+		}
+		if (candidates.length > 1) {
+			const sample = candidates
+				.slice(0, 5)
+				.map((c) => `${c.name} (${c.bucketId})`)
+				.join(", ");
+			throw new InvalidArgumentError(
+				`--reuse-storage=auto needs exactly one match, found ${candidates.length}. Candidates: ${sample}. Pick one by id or name.`,
+			);
+		}
+		return candidates[0]!;
+	}
+
+	const lower = normalized.toLowerCase();
+	const match =
+		candidates.find((c) => c.bucketId === normalized) ??
+		candidates.find((c) => c.name.toLowerCase() === lower);
+
+	if (!match) {
+		const known = candidates.map(
+			(c) => `${c.name} (${c.bucketId.slice(0, 8)})`,
+		);
+		const suggestions = findSimilar(
+			normalized,
+			candidates.flatMap((c) => [c.name, c.bucketId]),
+		);
+		throw new NotFoundError(
+			"Storage bucket",
+			normalized,
+			suggestions.length > 0
+				? suggestions
+				: known.length > 0
+					? known.slice(0, 5)
+					: [
+							"No storage buckets found in this project. Drop --reuse-storage to create a new one.",
+						],
+		);
+	}
+	return match;
+}
+
+async function finalizeDatabaseReuse(
+	client: any,
+	candidate: DatabaseCandidate,
+	kind: "postgres" | "mysql",
+	requestedPlan: ResourcePlan | undefined,
+	planExplicit: boolean,
+): Promise<DatabaseDecision> {
+	let plan = candidate.plan;
+	let upgraded = false;
+
+	if (planExplicit && requestedPlan) {
+		const cmp = compareResourcePlan(requestedPlan, candidate.plan);
+		if (cmp > 0) {
+			const ok = await confirmUpgrade(
+				`${formatDatabaseKind(kind)} ${candidate.name} is on ${candidate.plan}. Upgrade to ${requestedPlan} before attaching?`,
+				true,
+				kind === "postgres" ? "upgrade_postgres" : "upgrade_mysql",
+			);
+			if (ok) {
+				await runDatabaseUpgrade(client, kind, candidate.id, requestedPlan);
+				plan = requestedPlan;
+				upgraded = true;
+			}
+		} else if (cmp < 0 && !isJsonMode()) {
+			log(
+				colors.warn(
+					`Requested ${requestedPlan} is lower than existing ${candidate.plan}; attaching at current plan.`,
+				),
+			);
+		}
+	}
+
+	return {
+		action: "reuse",
+		databaseId: candidate.id,
+		plan,
+		name: candidate.name,
+		upgraded,
+	};
+}
+
+async function finalizeStorageReuse(
+	client: any,
+	candidate: StorageCandidate,
+	requestedPlan: ResourcePlan | undefined,
+	planExplicit: boolean,
+): Promise<StorageDecision> {
+	let plan = candidate.plan;
+	let upgraded = false;
+
+	if (planExplicit && requestedPlan) {
+		const cmp = compareResourcePlan(requestedPlan, candidate.plan);
+		if (cmp > 0) {
+			if (candidate.plan !== "FREE") {
+				if (!isJsonMode()) {
+					log(
+						colors.warn(
+							`Storage bucket ${candidate.name} is on ${candidate.plan}. Inline upgrades to ${requestedPlan} are only supported from FREE — upgrade from the dashboard. Attaching at current plan.`,
+						),
+					);
+				}
+			} else if (
+				requestedPlan === "STARTER" ||
+				requestedPlan === "STANDARD" ||
+				requestedPlan === "PRO"
+			) {
+				const ok = await confirmUpgrade(
+					`Storage bucket ${candidate.name} is on FREE. Upgrade to ${requestedPlan} before attaching?`,
+					true,
+					"upgrade_storage",
+				);
+				if (ok) {
+					await runStorageUpgrade(client, candidate.bucketId, requestedPlan);
+					plan = requestedPlan;
+					upgraded = true;
+				}
+			}
+		} else if (cmp < 0 && !isJsonMode()) {
+			log(
+				colors.warn(
+					`Requested ${requestedPlan} is lower than existing ${candidate.plan}; attaching at current plan.`,
+				),
+			);
+		}
+	}
+
+	return {
+		action: "reuse",
+		bucketId: candidate.bucketId,
+		plan,
+		name: candidate.name,
+		upgraded,
+	};
+}
+
+async function confirmUpgrade(
+	message: string,
+	defaultValue: boolean,
+	field: string,
+): Promise<boolean> {
+	if (isJsonMode() || shouldSkipConfirmation()) {
+		// Non-interactive: do not silently upgrade — billing-mutating. Skip.
+		return false;
+	}
+	return confirm(message, defaultValue, {
+		field,
+		flag: "--yes (default attaches at current plan; pass --database-plan/--storage-plan with --yes to force an upgrade)",
+	});
+}
+
+async function runDatabaseUpgrade(
+	client: any,
+	kind: "postgres" | "mysql",
+	id: string,
+	targetPlan: ResourcePlan,
+): Promise<void> {
+	if (targetPlan === "FREE") return; // Server rejects downgrade-to-FREE anyway.
+	const label = formatDatabaseKind(kind);
+	const _spinner = startSpinner(`Upgrading ${label} to ${targetPlan}...`);
+	try {
+		if (kind === "postgres") {
+			await client.postgres.upgrade.mutate({
+				postgresId: id,
+				targetPlan,
+			});
+		} else {
+			await client.mysql.upgrade.mutate({
+				mysqlId: id,
+				targetPlan,
+			});
+		}
+		succeedSpinner(`${label} upgraded to ${targetPlan}.`);
+	} catch (err) {
+		failSpinner(`Failed to upgrade ${label}.`);
+		throw err;
+	}
+}
+
+async function runStorageUpgrade(
+	client: any,
+	bucketId: string,
+	targetPlan: ResourcePlan,
+): Promise<void> {
+	if (targetPlan === "FREE") return;
+	const _spinner = startSpinner(`Upgrading storage to ${targetPlan}...`);
+	try {
+		await client.storage.upgrade.mutate({
+			bucketId,
+			targetPlan,
+		});
+		succeedSpinner(`Storage upgraded to ${targetPlan}.`);
+	} catch (err) {
+		failSpinner("Failed to upgrade storage.");
+		throw err;
+	}
+}
+
+async function attachExistingDatabase(
+	client: any,
+	app: AppSummary,
+	kind: "postgres" | "mysql",
+	decision: Extract<DatabaseDecision, { action: "reuse" }>,
+): Promise<void> {
+	const label = formatDatabaseKind(kind);
+	const _spinner = startSpinner(`Attaching ${label} to ${app.name}...`);
+	try {
+		if (kind === "postgres") {
+			await client.postgres.attachToApplication.mutate({
+				postgresId: decision.databaseId,
+				applicationId: app.applicationId,
+			});
+		} else {
+			await client.mysql.attachToApplication.mutate({
+				mysqlId: decision.databaseId,
+				applicationId: app.applicationId,
+			});
+		}
+		succeedSpinner(`${label} credentials attached.`);
+	} catch (err) {
+		failSpinner(`Failed to attach ${label} credentials.`);
+		throw err;
+	}
+}
+
+async function attachExistingStorage(
+	client: any,
+	app: AppSummary,
+	decision: Extract<StorageDecision, { action: "reuse" }>,
+): Promise<void> {
+	const _spinner = startSpinner(`Attaching storage to ${app.name}...`);
+	try {
+		await client.storage.attachToApplication.mutate({
+			bucketId: decision.bucketId,
+			applicationId: app.applicationId,
+		});
+		succeedSpinner("Storage credentials attached.");
+	} catch (err) {
+		failSpinner("Failed to attach storage credentials.");
+		throw err;
+	}
+}
+
+async function buildDatabaseCreateDecision(
+	app: AppSummary,
+	kind: "postgres" | "mysql",
+	requestedPlan: ResourcePlan | undefined,
+): Promise<Extract<DatabaseDecision, { action: "create" }>> {
+	const plan =
+		requestedPlan ??
+		(await resolveResourcePlan(undefined, "Database plan:"));
+	return {
+		action: "create",
+		plan,
+		name: formatResourceName(app.name, formatDatabaseKind(kind)),
+	};
+}
+
+async function buildStorageCreateDecision(
+	app: AppSummary,
+	requestedPlan: ResourcePlan | undefined,
+): Promise<Extract<StorageDecision, { action: "create" }>> {
+	const plan =
+		requestedPlan ?? (await resolveResourcePlan(undefined, "Storage plan:"));
+	return {
+		action: "create",
+		plan,
+		name: formatResourceName(app.name, "files", 50),
+	};
+}
+
+function formatDatabaseCandidateLine(c: DatabaseCandidate): string {
+	const parts: string[] = [c.name];
+	const badges: string[] = [c.plan];
+	if (c.region) badges.push(c.region);
+	const ageBadge = describeAge(c.createdAt);
+	if (ageBadge) badges.push(ageBadge);
+	const status = describeApplicationStatus(c.applicationStatus);
+	if (status) badges.push(status);
+	if (c.isReadOnly) badges.push("read-only");
+	parts.push(`(${badges.join(" · ")})`);
+	parts.push(colors.dim(`[${c.id.slice(0, 8)}]`));
+	return parts.join(" ");
+}
+
+function formatStorageCandidateLine(c: StorageCandidate): string {
+	const parts: string[] = [c.name];
+	const badges: string[] = [c.plan];
+	if (c.region) badges.push(c.region);
+	const ageBadge = describeAge(c.createdAt);
+	if (ageBadge) badges.push(ageBadge);
+	const status = describeApplicationStatus(c.applicationStatus);
+	if (status) badges.push(status);
+	if (c.isUploadBlocked) badges.push("upload blocked");
+	parts.push(`(${badges.join(" · ")})`);
+	parts.push(colors.dim(`[${c.bucketId.slice(0, 8)}]`));
+	return parts.join(" ");
+}
+
+function describeAge(value: string | Date | null | undefined): string | null {
+	if (!value) return null;
+	const date = value instanceof Date ? value : new Date(value);
+	const time = date.getTime();
+	if (!Number.isFinite(time)) return null;
+	const days = Math.max(0, Math.floor((Date.now() - time) / 86_400_000));
+	if (days === 0) return "today";
+	if (days === 1) return "1d ago";
+	if (days < 30) return `${days}d ago`;
+	if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+	return `${Math.floor(days / 365)}y ago`;
+}
+
+function describeApplicationStatus(
+	status: string | null | undefined,
+): string | null {
+	if (!status) return null;
+	const normalized = status.toLowerCase();
+	if (normalized === "running" || normalized === "done") return null;
+	return normalized;
+}
+
+const RESOURCE_PLAN_RANK: Record<ResourcePlan, number> = {
+	FREE: 0,
+	STARTER: 1,
+	STANDARD: 2,
+	PRO: 3,
+};
+
+function compareResourcePlan(a: ResourcePlan, b: ResourcePlan): number {
+	return RESOURCE_PLAN_RANK[a] - RESOURCE_PLAN_RANK[b];
 }
 
 function normalizeDatabaseKind(
@@ -2010,6 +2659,14 @@ export function registerDeployCommands(program: Command) {
 		.option(
 			"--storage-plan <plan>",
 			"Storage plan: free, starter, standard, or pro",
+		)
+		.option(
+			"--reuse-database <ref>",
+			"Reuse an existing database in this project: <id>, <name>, or 'auto' (exactly one match)",
+		)
+		.option(
+			"--reuse-storage <ref>",
+			"Reuse an existing storage bucket in this project: <id>, <name>, or 'auto' (exactly one match)",
 		)
 		.option("--token <token>", "API token to use for this deployment")
 		.option("-r, --region <region>", "Deployment region", DEFAULT_REGION)
