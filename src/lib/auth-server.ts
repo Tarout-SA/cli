@@ -113,18 +113,19 @@ export function startAuthServer(
 				return;
 			}
 
-			if (
-				!token ||
-				!userId ||
-				!userEmail ||
-				!organizationId ||
-				!organizationName ||
-				!environmentId ||
-				!environmentName
-			) {
-				res.status(400).send("Missing required parameters");
+			const missing: string[] = [];
+			if (!token) missing.push("token");
+			if (!userId) missing.push("userId");
+			if (!userEmail) missing.push("userEmail");
+			if (!organizationId) missing.push("organizationId");
+			if (!organizationName) missing.push("organizationName");
+			if (!environmentId) missing.push("environmentId");
+			if (!environmentName) missing.push("environmentName");
+			if (missing.length > 0) {
+				const list = missing.join(", ");
+				res.status(400).send(`Missing required parameters: ${list}`);
 				callbackRejecter(
-					new Error("Missing required parameters from auth callback"),
+					new Error(`Missing required parameters from auth callback: ${list}`),
 				);
 				return;
 			}
