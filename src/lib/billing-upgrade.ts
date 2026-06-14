@@ -113,12 +113,15 @@ export async function performBillingChange(
 			addons: input.addons,
 		});
 	} else if (kind === "addon") {
-		const addons =
+		const items =
 			input.addons ??
 			(input.addonKey
 				? [{ addonKey: input.addonKey, quantity: input.quantity ?? 1 }]
 				: []);
-		result = await client.subscription.purchaseAddons.mutate({ addons });
+		// Server contract: `purchaseAddons` takes `{ items }` (see
+		// validations/subscription.ts `purchaseAddonsInput`). `changePlan` is the
+		// one that takes `addons` — they are not interchangeable.
+		result = await client.subscription.purchaseAddons.mutate({ items });
 	} else {
 		result = await client.subscription.setPlanQuantity.mutate({
 			quantity: input.quantity,

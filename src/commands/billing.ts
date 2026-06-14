@@ -11,9 +11,15 @@ import {
 import { isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
+	buildPlanAddonCart,
+	isPaidFamily,
+	planFamily,
+} from "../lib/plan-cart.js";
+import {
 	box,
 	colors,
 	isJsonMode,
+	isNonInteractiveMode,
 	log,
 	outputData,
 	outputError,
@@ -21,7 +27,7 @@ import {
 	shouldSkipConfirmation,
 	table,
 } from "../lib/output.js";
-import { confirm, select } from "../utils/prompts.js";
+import { confirm, input, select } from "../utils/prompts.js";
 import { ExitCode, exit } from "../utils/exit-codes.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
 
@@ -224,7 +230,10 @@ export function registerBillingCommands(program: Command) {
 					| "monthly"
 					| "yearly"
 					| undefined;
-				const addons:
+				let planQuantity = options.quantity as number | undefined;
+				// Explicit `--addon` flags take priority; otherwise we may build the
+				// bundled cart interactively below (estimator parity).
+				let addons:
 					| Array<{ addonKey: string; quantity: number }>
 					| undefined =
 					Array.isArray(options.addon) && options.addon.length > 0
@@ -267,13 +276,48 @@ export function registerBillingCommands(program: Command) {
 					throw new Error("No plan selected");
 				}
 
+				// Estimator parity: when run interactively without explicit `--addon`
+				// flags, offer to bundle databases + storage into the same checkout —
+				// exactly like the dashboard plan-card estimator. This is what makes
+				// `tarout billing upgrade shared` actually grant a DB/storage slot
+				// instead of an app-only plan. Agent / --json / --yes mode stays
+				// explicit: we never silently add paid addons there.
+				if (
+					!isJsonMode() &&
+					!isNonInteractiveMode() &&
+					!shouldSkipConfirmation() &&
+					!addons &&
+					isPaidFamily(targetPlan)
+				) {
+					// Quantity-aware Starter: number of app slots → plan quantity.
+					if (planQuantity === undefined && planFamily(targetPlan) === "SHARED") {
+						const apps = parsePositiveInt(
+							await input("How many apps (app slots)?", "1"),
+							1,
+						);
+						planQuantity = Math.max(1, apps);
+					}
+
+					const databases = parsePositiveInt(
+						await input("How many databases to include?", "1"),
+						0,
+					);
+					const storageGb = parsePositiveInt(
+						await input("Object storage to include (GB, 0 for none)?", "5"),
+						0,
+					);
+
+					const cart = buildPlanAddonCart(targetPlan, { databases, storageGb });
+					if (cart.length > 0) addons = cart;
+				}
+
 				// Preview the change
 				const _previewSpinner = startSpinner("Calculating change...");
 				let preview: any;
 				try {
 					preview = await client.subscription.previewPlanChange.query({
 						planKey: targetPlan,
-						planQuantity: options.quantity,
+						planQuantity,
 						billingPeriod,
 						addons,
 					});
@@ -286,7 +330,7 @@ export function registerBillingCommands(program: Command) {
 				if (!shouldSkipConfirmation()) {
 					log("");
 					log(`Plan: ${colors.cyan(targetPlan)}`);
-					if (options.quantity) log(`Quantity: ${options.quantity}`);
+					if (planQuantity) log(`Quantity: ${planQuantity}`);
 					if (billingPeriod) log(`Billing period: ${billingPeriod}`);
 					if (addons && addons.length > 0) {
 						log(
@@ -323,7 +367,7 @@ export function registerBillingCommands(program: Command) {
 							flag: "--yes",
 							context: {
 								plan: targetPlan,
-								quantity: options.quantity,
+								quantity: planQuantity,
 								billingPeriod,
 								addons,
 								amountDueHalalas,
@@ -342,7 +386,7 @@ export function registerBillingCommands(program: Command) {
 				const result = await performBillingChange(client, {
 					kind: "plan",
 					planKey: targetPlan,
-					quantity: options.quantity,
+					quantity: planQuantity,
 					billingPeriod,
 					addons,
 					wait: options.wait,
@@ -735,7 +779,7 @@ export function registerBillingCommands(program: Command) {
 				const client = getApiClient();
 				const _spinner = startSpinner("Calculating preview...");
 				const preview = await client.subscription.previewAddonsPurchase.query({
-					addons: [{ addonKey, quantity: options.quantity || 1 }],
+					items: [{ addonKey, quantity: options.quantity || 1 }],
 				} as any);
 				succeedSpinner();
 				if (isJsonMode()) {
@@ -1132,6 +1176,15 @@ function collectAddon(
 		);
 	}
 	return [...previous, { addonKey, quantity }];
+}
+
+/**
+ * Parse a free-text prompt answer into a non-negative integer, falling back to
+ * `fallback` for blank/invalid input. Used by the interactive upgrade estimator.
+ */
+function parsePositiveInt(raw: string, fallback: number): number {
+	const n = Number.parseInt(String(raw).trim(), 10);
+	return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 /**
