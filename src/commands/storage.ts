@@ -11,6 +11,7 @@ import {
 	box,
 	colors,
 	isJsonMode,
+	isNonInteractiveMode,
 	log,
 	outputData,
 	quietOutput,
@@ -19,6 +20,32 @@ import {
 } from "../lib/output.js";
 import { confirm, input, select } from "../utils/prompts.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
+import {
+	type ResourcePlan,
+	loadResourceTiers,
+	pickDefaultResourceTier,
+} from "./deploy.js";
+
+const STORAGE_TIER_LABEL: Record<ResourcePlan, string> = {
+	FREE: "FREE (1 GB)",
+	STARTER: "STARTER (10 GB)",
+	STANDARD: "STANDARD (100 GB)",
+	PRO: "PRO (1 TB)",
+};
+
+function normalizeStoragePlan(value: string | undefined): ResourcePlan | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().toUpperCase();
+	if (
+		normalized === "FREE" ||
+		normalized === "STARTER" ||
+		normalized === "STANDARD" ||
+		normalized === "PRO"
+	) {
+		return normalized as ResourcePlan;
+	}
+	return undefined;
+}
 
 export function registerStorageCommands(program: Command) {
 	const storage = program
@@ -82,7 +109,10 @@ export function registerStorageCommands(program: Command) {
 		.command("create")
 		.argument("[name]", "Bucket name")
 		.description("Create a new storage bucket")
-		.option("-p, --plan <plan>", "Plan: FREE, STARTER, STANDARD, PRO", "FREE")
+		.option(
+			"-p, --plan <plan>",
+			"Plan: free, starter, standard, or pro (defaults to your org's entitled tier)",
+		)
 		.option("--public", "Enable public read access")
 		.option("-d, --description <text>", "Bucket description")
 		.action(async (name, options) => {
@@ -93,7 +123,6 @@ export function registerStorageCommands(program: Command) {
 				if (!profile) throw new AuthError();
 
 				let bucketName = name;
-				let plan = (options.plan || "FREE").toUpperCase();
 
 				if (!bucketName) {
 					bucketName = await input("Bucket name:", undefined, {
@@ -102,20 +131,42 @@ export function registerStorageCommands(program: Command) {
 					});
 				}
 
-				if (!options.plan && !shouldSkipConfirmation()) {
-					plan = await select(
-						"Storage plan:",
-						[
-							{ name: "FREE (1 GB)", value: "FREE" },
-							{ name: "STARTER (10 GB)", value: "STARTER" },
-							{ name: "STANDARD (100 GB)", value: "STANDARD" },
-							{ name: "PRO (1 TB)", value: "PRO" },
-						],
-						{ field: "plan", flag: "--plan" },
-					);
+				const client = getApiClient();
+
+				// Default to the tier the org is actually entitled to instead of
+				// hardcoding FREE — a paid org without a free storage slot would
+				// otherwise hit storage.free.slots: 1/0. Explicit --plan always wins.
+				let plan: ResourcePlan;
+				const explicit = normalizeStoragePlan(options.plan);
+				if (explicit) {
+					plan = explicit;
+				} else {
+					const tiers = await loadResourceTiers(client, "storage");
+					const def = pickDefaultResourceTier(tiers);
+					if (
+						isJsonMode() ||
+						isNonInteractiveMode() ||
+						shouldSkipConfirmation()
+					) {
+						plan = def;
+					} else {
+						const order: ResourcePlan[] = [
+							def,
+							...(["FREE", "STARTER", "STANDARD", "PRO"] as ResourcePlan[]).filter(
+								(t) => t !== def,
+							),
+						];
+						plan = await select<ResourcePlan>(
+							"Storage plan:",
+							order.map((t) => ({
+								name: `${STORAGE_TIER_LABEL[t]}${t === def ? `  ${colors.dim("recommended")}` : ""}`,
+								value: t,
+							})),
+							{ field: "plan", flag: "--plan" },
+						);
+					}
 				}
 
-				const client = getApiClient();
 				const _spinner = startSpinner("Creating storage bucket...");
 
 				const bucket = await client.storage.create.mutate({

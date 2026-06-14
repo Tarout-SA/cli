@@ -24,6 +24,7 @@ import {
 	box,
 	colors,
 	isJsonMode,
+	isNonInteractiveMode,
 	log,
 	outputError,
 	outputJsonLine,
@@ -41,7 +42,7 @@ import {
 	inferSuggestedPlan,
 	inspectCurrentProject,
 	isEntitlementError,
-	promptUpgradeFromEntitlementError,
+	promptEntitlementRemedy,
 	streamDeploymentWithLogs,
 	uploadCurrentDirectorySource,
 } from "./deploy.js";
@@ -65,6 +66,7 @@ interface UpOptions {
 	idempotencyKey?: string;
 	installCommand?: string;
 	name?: string;
+	newApp?: boolean;
 	outputDirectory?: string;
 	plan?: string;
 	region?: string;
@@ -118,11 +120,18 @@ export function registerUpCommand(program: Command): void {
 		)
 		.option("--token <token>", "API token for this run")
 		.option("--name <name>", "Application name (defaults to directory name)")
-		.option("--plan <plan>", "App hosting plan: free, shared, or dedicated", "free")
+		.option(
+			"--plan <plan>",
+			"App hosting plan: free, shared, or dedicated (defaults to your org's tier)",
+		)
 		.option("--source <source>", "Source: upload (default) or github", "upload")
 		.option(
 			"--app <ref>",
 			"Deploy to an existing app by id or name (skips create-or-pick prompt; 'auto' picks the lone match)",
+		)
+		.option(
+			"--new-app",
+			"Create a new app instead of being prompted to reuse an existing one",
 		)
 		.option("--repo <owner/repo>", "GitHub repository (when --source github)")
 		.option("--branch <branch>", "GitHub branch (with --source github)", "main")
@@ -214,9 +223,7 @@ export function registerUpCommand(program: Command): void {
 					return allApps;
 				};
 
-				if (options.app) {
-					const apps = await loadApps();
-					const picked = resolveAppRef(apps, options.app);
+				const reuse = (picked: AppSummary, via: string) => {
 					app = picked;
 					reused = true;
 					setProjectConfig({
@@ -229,34 +236,40 @@ export function registerUpCommand(program: Command): void {
 						event: "app_reused",
 						applicationId: picked.applicationId,
 						name: picked.name,
-						via: "--app",
+						via,
 					});
-				} else if (linked) {
-					const apps = await loadApps();
-					const existing =
-						findApp(apps, linked.applicationId) ?? findApp(apps, linked.name);
-					if (existing) {
-						app = existing;
-						reused = true;
-						emitEvent({
-							event: "app_reused",
-							applicationId: app.applicationId,
-							name: app.name,
-							via: "linked",
-						});
-					}
-				}
+				};
 
-				if (!app && !isJsonMode() && !shouldSkipConfirmation()) {
+				if (options.app) {
+					// Explicit target — reuse without prompting.
 					const apps = await loadApps();
-					if (apps.length > 0) {
+					reuse(resolveAppRef(apps, options.app), "--app");
+				} else if (!options.newApp) {
+					// No explicit choice: surface the create-vs-reuse decision instead
+					// of silently redeploying to the linked/existing app. `--yes` is the
+					// escape hatch that keeps the old idempotent behavior (reuse the
+					// linked app, else create). Otherwise ask — interactive shows a
+					// menu, agent mode emits a structured needs_input naming the exact
+					// re-invoke flags so the human decides through the agent.
+					const apps = await loadApps();
+					const linkedApp = linked
+						? findApp(apps, linked.applicationId) ?? findApp(apps, linked.name)
+						: undefined;
+
+					if (shouldSkipConfirmation()) {
+						if (linkedApp) reuse(linkedApp, "linked");
+					} else if (apps.length > 0) {
 						const createValue = "__create__";
-						log("");
-						log(
-							`Found ${apps.length} existing app${apps.length === 1 ? "" : "s"} in this organization.`,
-						);
+						const orderedApps = linkedApp
+							? [
+									linkedApp,
+									...apps.filter(
+										(a) => a.applicationId !== linkedApp.applicationId,
+									),
+								]
+							: apps;
 						const selected = await select<string>(
-							"Deploy to an existing app or create a new one?",
+							"Create a new app or reuse an existing one?",
 							[
 								{
 									name: `Create a new app${
@@ -264,14 +277,28 @@ export function registerUpCommand(program: Command): void {
 									}`,
 									value: createValue,
 								},
-								...apps.map((existing) => ({
-									name: `${existing.name} ${colors.dim(`(${existing.applicationId.slice(0, 8)})`)}`,
+								...orderedApps.map((existing) => ({
+									name: `Reuse ${existing.name} ${colors.dim(`(${existing.applicationId.slice(0, 8)})`)}${
+										linkedApp &&
+										existing.applicationId === linkedApp.applicationId
+											? colors.dim(" — linked")
+											: ""
+									}`,
 									value: existing.applicationId,
 								})),
 							],
 							{
-								field: "deploy_target_app",
-								flag: "--app <id|name|auto>",
+								field: "deploy_app",
+								flag: "--new-app to create a new app, or --app <id|name> to reuse an existing one",
+								context: {
+									linkedApp: linkedApp
+										? { id: linkedApp.applicationId, name: linkedApp.name }
+										: null,
+									apps: orderedApps.map((a) => ({
+										id: a.applicationId,
+										name: a.name,
+									})),
+								},
 							},
 						);
 						if (selected !== createValue) {
@@ -279,20 +306,7 @@ export function registerUpCommand(program: Command): void {
 							if (!picked) {
 								throw new NotFoundError("Application", selected);
 							}
-							app = picked;
-							reused = true;
-							setProjectConfig({
-								applicationId: picked.applicationId,
-								name: picked.name,
-								organizationId: profile.organizationId,
-								linkedAt: new Date().toISOString(),
-							});
-							emitEvent({
-								event: "app_reused",
-								applicationId: picked.applicationId,
-								name: picked.name,
-								via: "interactive",
-							});
+							reuse(picked, "interactive");
 						}
 					}
 				}
@@ -323,8 +337,14 @@ export function registerUpCommand(program: Command): void {
 							const message =
 								err instanceof Error ? err.message : "Plan upgrade required";
 
-							// JSON / non-TTY / --yes: keep the machine-readable contract.
-							if (isJsonMode() || shouldSkipConfirmation()) {
+								// Any non-interactive context (JSON, no TTY, or --yes) gets the
+							// NEEDS_UPGRADE envelope, which lists both the buy-addon and
+							// upgrade-plan options for the agent to put to the user.
+							if (
+								isJsonMode() ||
+								isNonInteractiveMode() ||
+								shouldSkipConfirmation()
+							) {
 								await emitNeedsUpgrade(client, err, options.plan, "tarout up");
 								exit(ExitCode.PERMISSION_DENIED);
 							}
@@ -332,7 +352,7 @@ export function registerUpCommand(program: Command): void {
 							log("");
 							log(colors.warn(message));
 
-							const upgraded = await promptUpgradeFromEntitlementError(
+							const upgraded = await promptEntitlementRemedy(
 								client,
 								err,
 								options.plan,
@@ -343,7 +363,7 @@ export function registerUpCommand(program: Command): void {
 								exit(ExitCode.PERMISSION_DENIED);
 							}
 
-							box("Upgrade complete", [
+							box("Billing updated", [
 								colors.success("Subscription updated."),
 								`Run ${colors.cyan("tarout up")} again to deploy on the new plan.`,
 							]);
@@ -462,6 +482,49 @@ export function registerUpCommand(program: Command): void {
 					app.applicationId,
 				);
 			} catch (err) {
+				// Entitlement gates hit during resource provisioning
+				// (`configureOptionalResources` — db / storage) land here, outside
+				// the app-creation handler above. Offer the same upgrade-vs-addon
+				// chooser. `client` from the try block isn't in catch scope, so
+				// re-fetch the cached client.
+				if (isEntitlementError(err)) {
+					const message =
+						err instanceof Error ? err.message : "Plan upgrade required";
+					if (
+						isJsonMode() ||
+						isNonInteractiveMode() ||
+						shouldSkipConfirmation()
+					) {
+						await emitNeedsUpgrade(
+							getApiClient(),
+							err,
+							options.plan,
+							"tarout up",
+						);
+						exit(ExitCode.PERMISSION_DENIED);
+					}
+					log("");
+					log(colors.warn(message));
+					const upgraded = await promptEntitlementRemedy(
+						getApiClient(),
+						err,
+						options.plan,
+					);
+					if (!upgraded) {
+						await emitNeedsUpgrade(
+							getApiClient(),
+							err,
+							options.plan,
+							"tarout up",
+						);
+						exit(ExitCode.PERMISSION_DENIED);
+					}
+					box("Billing updated", [
+						colors.success("Subscription updated."),
+						`Run ${colors.cyan("tarout up")} again to deploy on the new plan.`,
+					]);
+					return;
+				}
 				if (err instanceof Error && err.message.startsWith("Invalid --source")) {
 					outputError("INVALID_ARGUMENTS", err.message);
 					if (!isJsonMode()) log(colors.error(err.message));

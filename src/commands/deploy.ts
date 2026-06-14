@@ -17,10 +17,14 @@ import { getApiClient, resetApiClient } from "../lib/api.js";
 import { startAuthServer } from "../lib/auth-server.js";
 import {
 	type Catalog,
+	type EntitlementRemedy,
 	nextPlanForRequested,
 	resolveEntitlementRemedy,
 } from "../lib/entitlement-remedy.js";
-import { performBillingChange } from "../lib/billing-upgrade.js";
+import {
+	type PerformBillingChangeInput,
+	performBillingChange,
+} from "../lib/billing-upgrade.js";
 import {
 	isCredentialError,
 	resolveProfileFromCredential,
@@ -52,6 +56,7 @@ import {
 	colors,
 	getStatusBadge,
 	isJsonMode,
+	isNonInteractiveMode,
 	log,
 	outputData,
 	outputError,
@@ -107,6 +112,7 @@ interface DeployOptions {
 	frameworkPreset?: string;
 	installCommand?: string;
 	name?: string;
+	newApp?: boolean;
 	outputDirectory?: string;
 	plan?: string;
 	region?: string;
@@ -123,7 +129,7 @@ interface DeployOptions {
 }
 
 type AppPlan = "FREE" | "SHARED" | "DEDICATED";
-type ResourcePlan = "FREE" | "STARTER" | "STANDARD" | "PRO";
+export type ResourcePlan = "FREE" | "STARTER" | "STANDARD" | "PRO";
 type DatabaseKind = "none" | "postgres" | "mysql";
 type SourcePreference = "auto" | "upload" | "configured" | "connect";
 
@@ -787,94 +793,132 @@ async function resolveDeploymentTarget(
 		};
 	}
 
-	const linkedProject = getProjectConfig();
-	if (linkedProject) {
-		const app =
-			findApp(apps, linkedProject.applicationId) ??
-			findApp(apps, linkedProject.name);
-
-		if (app) {
-			const details = await getApplicationDetails(client, app.applicationId);
-			return {
-				app,
-				createdApp: false,
-				hasConfiguredSource: hasConfiguredSource(details),
-				shouldUploadSource: shouldUseLocalSource(details, {
-					linkedProject: true,
-				}),
-			};
-		}
-
-		if (!isJsonMode()) {
-			log("");
-			log(
-				colors.warn(
-					`Linked application "${linkedProject.name}" was not found in this organization.`,
-				),
-			);
-		}
+	// Explicit "create a new app" — skip the picker entirely.
+	if (options.newApp) {
+		assertConfiguredSourceAllowsCreate(sourcePreference);
+		return createNewAppTarget(client, profile, options);
 	}
 
-	if (isJsonMode()) {
-		throw new InvalidArgumentError(
-			"No linked application. Run 'tarout link', pass an app name, or run without --json to choose interactively.",
+	// Resolve the linked app (if a `tarout link` config points at a real app).
+	// It's the recommended reuse default, but we no longer silently deploy to
+	// it — the user (or the agent, on the user's behalf) must choose.
+	const linkedProject = getProjectConfig();
+	const linkedApp = linkedProject
+		? findApp(apps, linkedProject.applicationId) ??
+			findApp(apps, linkedProject.name)
+		: undefined;
+	if (linkedProject && !linkedApp && !isJsonMode()) {
+		log("");
+		log(
+			colors.warn(
+				`Linked application "${linkedProject.name}" was not found in this organization.`,
+			),
 		);
 	}
 
+	// Nothing to reuse — creating is the only path, so no choice to surface.
 	if (apps.length === 0) {
-		if (sourcePreference === "configured") {
-			throw new InvalidArgumentError(
-				'No Tarout app exists to deploy from a configured source. Create or select an app with a configured Git provider first, or rerun with "--source upload".',
-			);
-		}
-		const app = await createAppFromCurrentDirectory(client, profile, options);
-		return {
-			app,
-			createdApp: true,
-			hasConfiguredSource: false,
-			shouldUploadSource: true,
-		};
+		assertConfiguredSourceAllowsCreate(sourcePreference, true);
+		return createNewAppTarget(client, profile, options);
 	}
 
+	// `--yes` is the explicit "don't ask me" escape hatch: accept the default
+	// (the linked app if present, otherwise create a new one).
+	if (shouldSkipConfirmation()) {
+		if (linkedApp) return reuseAppTarget(client, profile, linkedApp);
+		assertConfiguredSourceAllowsCreate(sourcePreference, true);
+		return createNewAppTarget(client, profile, options);
+	}
+
+	// Otherwise ASK. Interactive shows the menu; agent mode (--json / no TTY)
+	// emits a structured needs_input naming the exact re-invoke flags — so the
+	// human decides through the agent instead of the CLI silently reusing.
 	const createValue = "__create__";
-	const selected = await select<string>("Select an application to deploy:", [
+	const orderedApps = linkedApp
+		? [linkedApp, ...apps.filter((a) => a.applicationId !== linkedApp.applicationId)]
+		: apps;
+	const selected = await select<string>(
+		"Create a new app or reuse an existing one?",
+		[
+			{
+				name: `Create a new app from ${colors.cyan(basename(process.cwd()) || "this directory")}`,
+				value: createValue,
+			},
+			...orderedApps.map((app) => ({
+				name: `Reuse ${app.name} ${colors.dim(`(${app.applicationId.slice(0, 8)})`)}${
+					linkedApp && app.applicationId === linkedApp.applicationId
+						? colors.dim(" — linked")
+						: ""
+				}`,
+				value: app.applicationId,
+			})),
+		],
 		{
-			name: `Create a new app from ${colors.cyan(basename(process.cwd()) || "this directory")}`,
-			value: createValue,
+			field: "deploy_app",
+			flag: "--new-app to create a new app, or --app <id|name> to reuse an existing one",
+			context: {
+				linkedApp: linkedApp
+					? { id: linkedApp.applicationId, name: linkedApp.name }
+					: null,
+				apps: orderedApps.map((a) => ({
+					id: a.applicationId,
+					name: a.name,
+				})),
+			},
 		},
-		...apps.map((app) => ({
-			name: `${app.name} ${colors.dim(`(${app.applicationId.slice(0, 8)})`)}`,
-			value: app.applicationId,
-		})),
-	]);
+	);
 
 	if (selected === createValue) {
-		if (sourcePreference === "configured") {
-			throw new InvalidArgumentError(
-				'New apps do not have a configured Git provider source yet. Connect a Git provider first, or rerun with "--source upload".',
-			);
-		}
-		const app = await createAppFromCurrentDirectory(client, profile, options);
-		return {
-			app,
-			createdApp: true,
-			hasConfiguredSource: false,
-			shouldUploadSource: true,
-		};
+		assertConfiguredSourceAllowsCreate(sourcePreference);
+		return createNewAppTarget(client, profile, options);
 	}
 
 	const app = findApp(apps, selected);
 	if (!app) {
 		throw new NotFoundError("Application", selected);
 	}
+	return reuseAppTarget(client, profile, app);
+}
 
+/** Guard: a brand-new app has no configured Git provider, so `--source
+ * configured` can't apply to it. */
+function assertConfiguredSourceAllowsCreate(
+	sourcePreference: SourcePreference,
+	noAppsExist = false,
+): void {
+	if (sourcePreference !== "configured") return;
+	throw new InvalidArgumentError(
+		noAppsExist
+			? 'No Tarout app exists to deploy from a configured source. Create or select an app with a configured Git provider first, or rerun with "--source upload".'
+			: 'New apps do not have a configured Git provider source yet. Connect a Git provider first, or rerun with "--source upload".',
+	);
+}
+
+async function createNewAppTarget(
+	client: any,
+	profile: Profile,
+	options: DeployOptions,
+): Promise<DeploymentTarget> {
+	const app = await createAppFromCurrentDirectory(client, profile, options);
+	return {
+		app,
+		createdApp: true,
+		hasConfiguredSource: false,
+		shouldUploadSource: true,
+	};
+}
+
+async function reuseAppTarget(
+	client: any,
+	profile: Profile,
+	app: AppSummary,
+): Promise<DeploymentTarget> {
 	setProjectConfig({
 		applicationId: app.applicationId,
 		name: app.name,
 		organizationId: profile.organizationId,
 		linkedAt: new Date().toISOString(),
 	});
-
 	const details = await getApplicationDetails(client, app.applicationId);
 	return {
 		app,
@@ -951,12 +995,46 @@ export async function createAppFromCurrentDirectory(
 	};
 }
 
+/** Best-effort "is this org on a paid subscription?" — drives the FREE→paid
+ * tier reconciliation. A failed lookup is treated as free (the server still
+ * enforces the real rule, so we never wrongly suppress a valid FREE create). */
+async function isOrgPaidSafely(client: any): Promise<boolean> {
+	try {
+		const opts = await client.application.getCreateOptions.query();
+		return opts?.isPaid === true;
+	} catch {
+		return false;
+	}
+}
+
 async function resolveAppPlanForCreate(
 	client: any,
 	options: DeployOptions,
 ): Promise<AppPlan | undefined> {
 	const explicitPlan = normalizeAppPlan(options.plan);
-	if (explicitPlan) return explicitPlan;
+
+	// A non-FREE explicit tier is honored as-is.
+	if (explicitPlan && explicitPlan !== "FREE") return explicitPlan;
+
+	// FREE is only valid on a free org — the server rejects `plan: FREE` for a
+	// paid org with FREE_NOT_ALLOWED_ON_PAID_PLAN. So whenever the resolved tier
+	// is FREE (explicit `--plan free`, or `tarout up`'s historical default), we
+	// confirm the org is actually free; if it's paid we send no plan and let the
+	// server auto-pick the org's real (paid) tier instead of erroring.
+	if (explicitPlan === "FREE") {
+		if (await isOrgPaidSafely(client)) {
+			if (!isJsonMode()) {
+				log(
+					colors.dim(
+						"Your org is on a paid plan — free apps aren't available, so this app will use your paid tier.",
+					),
+				);
+			}
+			return undefined;
+		}
+		return "FREE";
+	}
+
 	if (isJsonMode() || shouldSkipConfirmation()) return undefined;
 
 	// Free-tier subscriptions get an extra upsell step: continue with FREE,
@@ -1116,6 +1194,148 @@ export async function runInlineUpgrade(
 	}
 
 	return false;
+}
+
+async function getCurrentPlanQuantitySafely(client: any): Promise<number> {
+	try {
+		const sub = await client.subscription.getCurrent.query();
+		const q = Number(sub?.planQuantity);
+		return Number.isFinite(q) && q > 0 ? q : 1;
+	} catch {
+		return 1;
+	}
+}
+
+/**
+ * Inline targeted remedy — the "add just the missing resource" counterpart to
+ * {@link runInlineUpgrade}: buy a single resource addon, or bump the
+ * quantity-aware plan by one app slot. `setPlanQuantity` is absolute, so the
+ * quantity-bump path reads the current quantity and adds one. Returns true only
+ * when the change applied immediately or the checkout was paid.
+ */
+export async function runInlineTargetedRemedy(
+	client: any,
+	remedy: EntitlementRemedy,
+): Promise<boolean> {
+	let input: PerformBillingChangeInput;
+	let label: string;
+	if (remedy.kind === "addon") {
+		input = { kind: "addon", addonKey: remedy.targetKey, quantity: 1 };
+		label = remedy.targetName ?? remedy.targetKey;
+	} else {
+		const next = (await getCurrentPlanQuantitySafely(client)) + 1;
+		input = { kind: "plan_quantity", planKey: remedy.targetKey, quantity: next };
+		label = `${remedy.targetName ?? remedy.targetKey} ×${next}`;
+	}
+
+	const _spinner = startSpinner(`Adding ${label}...`);
+	const result = await performBillingChange(client, {
+		...input,
+		wait: true,
+		timeoutMs: 600_000,
+		openBrowser: isJsonMode()
+			? undefined
+			: async (url: string) => {
+					await open(url);
+				},
+		onCheckoutOpened: ({ orderId, paymentUrl }) => {
+			log("");
+			log("Open this URL to complete payment:");
+			log(`  ${colors.cyan(paymentUrl)}`);
+			log(`Order ID: ${colors.dim(orderId)}`);
+		},
+	});
+
+	if (result.status === "applied" || result.status === "paid") {
+		succeedSpinner(`${label} added.`);
+		return true;
+	}
+
+	failSpinner(
+		result.status === "deferred"
+			? "Change did not require an immediate payment."
+			: result.status === "pending_timeout"
+				? "Payment still pending after 10 minutes."
+				: `Payment ${result.status}.`,
+	);
+	if (result.failureReason) log(colors.error(result.failureReason));
+	if (result.orderId) {
+		log(
+			colors.dim(
+				`Resume later with: tarout billing wait ${result.orderId.slice(0, 8)} --timeout 600`,
+			),
+		);
+	}
+	return false;
+}
+
+/**
+ * Entitlement-gate chooser. When a FORBIDDEN entitlement error can be cleared
+ * by buying a single resource (a db / storage / domain addon, or one more app
+ * slot on the quantity-aware plan), offer two paths — add just that resource,
+ * or upgrade the whole plan — and apply the chosen one inline. When the only
+ * remedy is a plan change (free-tier slot caps, dedicated host) there is no
+ * cheaper targeted option, so fall straight through to the plan-upgrade picker.
+ *
+ * Interactive-only: callers short-circuit to `emitNeedsUpgrade` in JSON / agent
+ * mode before reaching here. Returns true when a billing change applied or was
+ * paid (caller should retry), false on cancel or non-completion.
+ */
+export async function promptEntitlementRemedy(
+	client: any,
+	err: unknown,
+	requestedPlan?: string,
+): Promise<boolean> {
+	const failedKey = extractEntitlementKeyFromError(err);
+	const catalog = (await fetchCatalogSafely(client)) as Catalog | null;
+	const remedy = resolveEntitlementRemedy(failedKey, catalog, { requestedPlan });
+
+	// No cheaper targeted action — only a full plan change unlocks these.
+	if (remedy.kind === "plan") {
+		return promptUpgradeFromEntitlementError(client, err, requestedPlan);
+	}
+
+	const price =
+		remedy.priceHalalas !== undefined
+			? ` (${formatPlanPrice(remedy.priceHalalas)})`
+			: "";
+	const targetedLabel =
+		remedy.kind === "plan_quantity"
+			? `Add one more app slot${price}`
+			: `Add just the ${remedy.targetName ?? remedy.targetKey}${price}`;
+
+	log("");
+	log(colors.warn("That resource isn't included in your current plan."));
+	log("");
+
+	const UPGRADE = "__upgrade__";
+	const TARGETED = "__targeted__";
+	const CANCEL = "__cancel__";
+	// "Upgrade the plan" is listed first so it is the highlighted default.
+	const choice = await select<string>(
+		"How would you like to add it?",
+		[
+			{ name: "Upgrade the plan", value: UPGRADE },
+			{ name: targetedLabel, value: TARGETED },
+			{ name: "Cancel", value: CANCEL },
+		],
+		{
+			field: "entitlement_remedy",
+			flag: "--plan <key> (upgrade) | tarout billing addon:buy <key> (addon)",
+			context: {
+				failedEntitlementKey: failedKey,
+				remedyKind: remedy.kind,
+				targetKey: remedy.targetKey,
+				command: remedy.command,
+			},
+		},
+	);
+
+	if (choice === CANCEL) return false;
+	if (choice === UPGRADE) {
+		return promptUpgradeFromEntitlementError(client, err, requestedPlan);
+	}
+	return runInlineTargetedRemedy(client, remedy);
 }
 
 async function getAppPlanChoices(
@@ -1280,11 +1500,60 @@ export function extractEntitlementKeyFromError(
 }
 
 /**
- * Emit the structured NEEDS_UPGRADE envelope for an entitlement gate, derived
- * from the *correct* remedy (plan upgrade vs addon purchase vs quantity bump)
- * instead of always suggesting a plan. Pairs with ExitCode.PERMISSION_DENIED at
- * the call site so an agent gets one parseable, actionable response.
+ * Emit the structured NEEDS_UPGRADE envelope for an entitlement gate. When a
+ * cheaper targeted action exists (buy a single addon, or add one app slot), the
+ * envelope carries BOTH that option AND the full plan upgrade in an `options`
+ * array — so the agent presents the choice to the human instead of committing
+ * to one on its own. Plan-only gates (free-tier caps, dedicated host) carry the
+ * single upgrade option. Pairs with ExitCode.PERMISSION_DENIED at the call site.
  */
+export interface RemedyOption {
+	action: "buy_addon" | "add_app_slot" | "upgrade_plan";
+	label: string;
+	command: string;
+}
+
+/**
+ * The list of concrete actions that clear an entitlement gate. A targeted
+ * remedy (addon / app-slot) is paired with the full plan upgrade so the caller
+ * can present BOTH and let the human choose; a plan-only remedy yields the
+ * single upgrade action.
+ */
+export function buildRemedyOptions(
+	remedy: EntitlementRemedy,
+	requestedPlan: string | undefined,
+	catalog: Catalog | null,
+): RemedyOption[] {
+	if (remedy.kind === "addon" || remedy.kind === "plan_quantity") {
+		const upgradePlan = nextPlanForRequested(requestedPlan);
+		const planDef = (catalog?.plans ?? []).find(
+			(p) => (p.planKey ?? p.key) === upgradePlan,
+		);
+		return [
+			{
+				action: remedy.kind === "addon" ? "buy_addon" : "add_app_slot",
+				label:
+					remedy.kind === "addon"
+						? `Buy just the ${remedy.targetName ?? remedy.targetKey}`
+						: "Add one more app slot",
+				command: remedy.command,
+			},
+			{
+				action: "upgrade_plan",
+				label: `Upgrade to ${planDef?.name ?? upgradePlan}`,
+				command: `tarout billing upgrade ${upgradePlan} --wait`,
+			},
+		];
+	}
+	return [
+		{
+			action: "upgrade_plan",
+			label: `Upgrade to ${remedy.targetName ?? remedy.targetKey}`,
+			command: remedy.command,
+		},
+	];
+}
+
 export async function emitNeedsUpgrade(
 	client: any,
 	err: unknown,
@@ -1295,16 +1564,105 @@ export async function emitNeedsUpgrade(
 	const failedKey = extractEntitlementKeyFromError(err);
 	const catalog = (await fetchCatalogSafely(client)) as Catalog | null;
 	const remedy = resolveEntitlementRemedy(failedKey, catalog, { requestedPlan });
+	const options = buildRemedyOptions(remedy, requestedPlan, catalog);
+
+	const hint =
+		options.length > 1
+			? `Two ways to resolve this — ask the user which they prefer, do not choose for them: (1) ${options[0]?.label}: \`${options[0]?.command}\`; (2) ${options[1]?.label}: \`${options[1]?.command}\`. Then retry: ${retryCommand}.`
+			: `${remedy.hint} Then retry: ${retryCommand}.`;
+
 	outputError("NEEDS_UPGRADE", message, {
 		failedEntitlementKey: failedKey,
 		remedyKind: remedy.kind,
-		// `suggestedPlan` retained for back-compat; now correct for every gate
-		// (the plan key, addon key, or quantity-aware plan to act on).
+		// `suggestedPlan`/`nextCommand` retained for back-compat (the recommended
+		// targeted action); `options` is the authoritative choice list.
 		suggestedPlan: remedy.targetKey,
 		suggestedTarget: remedy.targetKey,
 		nextCommand: remedy.command,
-		hint: `${remedy.hint} Then retry: ${retryCommand}.`,
+		options,
+		hint,
 	});
+}
+
+// Best-effort lookup of the free-tier databases already holding the single
+// org-wide `db.free.slots` reservation, so the deploy error can name what's
+// blocking instead of leaving the user to hunt for it. Never throws — a failed
+// lookup just yields an empty list and a slightly less specific message.
+// Note: `allByOrganization` is scoped to the active environment, so a free DB
+// living in another environment won't appear here; that's surfaced in the hint.
+async function listFreeDatabasesSafely(
+	client: any,
+): Promise<Array<{ kind: "postgres" | "mysql"; id: string; name: string }>> {
+	try {
+		const [pgRows, myRows] = await Promise.all([
+			client.postgres.allByOrganization.query().catch(() => []),
+			client.mysql.allByOrganization.query().catch(() => []),
+		]);
+		const out: Array<{ kind: "postgres" | "mysql"; id: string; name: string }> =
+			[];
+		for (const r of (pgRows ?? []) as any[]) {
+			if ((r?.plan ?? "FREE") === "FREE" && r?.postgresId) {
+				out.push({ kind: "postgres", id: r.postgresId, name: r.name });
+			}
+		}
+		for (const r of (myRows ?? []) as any[]) {
+			if ((r?.plan ?? "FREE") === "FREE" && r?.mysqlId) {
+				out.push({ kind: "mysql", id: r.mysqlId, name: r.name });
+			}
+		}
+		return out;
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Explain an exhausted free-tier resource slot (`db.free.slots` /
+ * `storage.free.slots`). The free plan grants exactly ONE database and ONE
+ * storage bucket for the whole org (Postgres + MySQL combined, across every
+ * environment), so the fix is almost never "buy an addon" — it's reuse the
+ * existing one, delete it, or upgrade. Name the resource holding the slot and
+ * list those three concrete paths.
+ */
+async function explainFreeResourceSlotExhaustion(
+	client: any,
+	failedKey: string,
+): Promise<void> {
+	const isDb = failedKey === "db.free.slots";
+	const resource = isDb ? "database" : "storage bucket";
+	log("");
+	log(
+		colors.warn(
+			`The free plan includes one ${resource} for the whole organization (across all environments).`,
+		),
+	);
+
+	if (isDb) {
+		const existing = await listFreeDatabasesSafely(client);
+		if (existing.length > 0) {
+			log("You already have:");
+			for (const d of existing) {
+				log(
+					`  • ${d.name} ${colors.dim(`(${d.kind} · ${d.id.slice(0, 8)})`)}`,
+				);
+			}
+		} else {
+			log(
+				colors.dim(
+					"Your existing free database may be in another environment — run `tarout db list`.",
+				),
+			);
+		}
+	}
+
+	log("");
+	log("To continue, pick one:");
+	if (isDb) {
+		log(`  • Reuse it:  ${colors.cyan("tarout deploy --reuse-database auto")}`);
+		log(`  • Delete it: ${colors.cyan("tarout db delete <id>")}`);
+	}
+	log(`  • Upgrade:   ${colors.cyan("tarout billing upgrade shared --wait")}`);
+	log("");
 }
 
 /**
@@ -1631,20 +1989,132 @@ async function resolveStorageChoice(
 	);
 }
 
+export type ResourceKind = "database" | "storage";
+
+export interface ResourceTier {
+	tier: ResourcePlan;
+	canCreate: boolean;
+	limit: number;
+	available: number;
+	monthlyHalalas: number;
+}
+
+const RESOURCE_TIER_LABEL: Record<ResourcePlan, string> = {
+	FREE: "Free",
+	STARTER: "Starter",
+	STANDARD: "Standard",
+	PRO: "Pro",
+};
+
+// Pull the connected org's per-tier availability for databases or storage.
+// `postgres.getEntitlements` covers both Postgres and MySQL (they share the
+// db.* keys). Best-effort: a failed lookup yields [] and the caller falls back.
+export async function loadResourceTiers(
+	client: any,
+	kind: ResourceKind,
+): Promise<ResourceTier[]> {
+	try {
+		const ent =
+			kind === "database"
+				? await client.postgres.getEntitlements.query()
+				: await client.storage.getEntitlements.query();
+		const tiers = Array.isArray(ent?.tiers) ? ent.tiers : [];
+		return tiers
+			.map((t: any) => ({
+				tier: String(t?.tier) as ResourcePlan,
+				canCreate: Boolean(t?.canCreate),
+				limit: Number(t?.limit ?? 0),
+				available: Number(t?.available ?? 0),
+				monthlyHalalas: Number(t?.monthlyHalalas ?? 0),
+			}))
+			.filter((t: ResourceTier) =>
+				["FREE", "STARTER", "STANDARD", "PRO"].includes(t.tier),
+			);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * The tier a new resource should default to, derived from the connected org's
+ * actual entitlements — so a paid org never silently lands on FREE, and the
+ * server is never asked for a tier the org doesn't own (which is what produced
+ * `db.starter.slots: 1/0` for an org that actually holds a db.standard slot).
+ *
+ *  1. Cheapest tier with an OPEN slot right now (a paid org's FREE tier has a 0
+ *     limit, so it's never creatable and is skipped automatically).
+ *  2. No open slot → the most capable tier the org actually OWNS (limit > 0), so
+ *     the server gate + entitlement-remedy reflect the org's real plan instead
+ *     of a tier it doesn't have.
+ *  3. No entitlement at all (e.g. a paid org with no db/storage addon) → the
+ *     entry paid tier, so the gate offers the cheapest addon to purchase.
+ */
+export function pickDefaultResourceTier(tiers: ResourceTier[]): ResourcePlan {
+	const creatable = tiers
+		.filter((t) => t.canCreate)
+		.sort((a, b) => a.monthlyHalalas - b.monthlyHalalas);
+	if (creatable.length > 0) return creatable[0]!.tier;
+
+	const owned = tiers
+		.filter((t) => t.limit > 0)
+		.sort((a, b) => b.monthlyHalalas - a.monthlyHalalas);
+	if (owned.length > 0) return owned[0]!.tier;
+
+	return "STARTER";
+}
+
 async function resolveResourcePlan(
+	client: any,
+	kind: ResourceKind,
 	value: string | undefined,
 	message: string,
 ): Promise<ResourcePlan> {
 	const explicitPlan = normalizeResourcePlan(value);
 	if (explicitPlan) return explicitPlan;
-	if (isJsonMode() || shouldSkipConfirmation()) return "FREE";
 
-	return select<ResourcePlan>(message, [
-		{ name: "Free", value: "FREE" },
-		{ name: "Starter", value: "STARTER" },
-		{ name: "Standard", value: "STANDARD" },
-		{ name: "Pro", value: "PRO" },
-	]);
+	const tiers = await loadResourceTiers(client, kind);
+	const def = pickDefaultResourceTier(tiers);
+
+	// Non-interactive (JSON, no TTY, or --yes): auto-pick the plan-aware default
+	// instead of hardcoding FREE. This is what keeps paid orgs off the free tier.
+	if (isJsonMode() || isNonInteractiveMode() || shouldSkipConfirmation()) {
+		return def;
+	}
+
+	// Interactive: list the tiers (default first / recommended) with price and
+	// the org's real availability so the choice reflects the account's plan.
+	const byTier = new Map(tiers.map((t) => [t.tier, t]));
+	const order: ResourcePlan[] = [
+		def,
+		...(["FREE", "STARTER", "STANDARD", "PRO"] as ResourcePlan[]).filter(
+			(t) => t !== def,
+		),
+	];
+	const choices = order.map((t) => {
+		const info = byTier.get(t);
+		const price =
+			info && info.monthlyHalalas > 0
+				? ` — ${(info.monthlyHalalas / 100).toFixed(0)} SAR/mo`
+				: t === "FREE"
+					? " — Free"
+					: "";
+		const avail = info
+			? info.canCreate
+				? ` ${colors.dim(`(${info.available} available)`)}`
+				: ` ${colors.dim("(needs an addon/upgrade)")}`
+			: "";
+		const rec = t === def ? colors.dim("  recommended") : "";
+		return { name: `${RESOURCE_TIER_LABEL[t]}${price}${avail}${rec}`, value: t };
+	});
+	return select<ResourcePlan>(message, choices, {
+		field: kind === "database" ? "database_plan" : "storage_plan",
+		flag:
+			kind === "database" ? "--database-plan <tier>" : "--storage-plan <tier>",
+		context: {
+			default: def,
+			tiers: tiers.map((t) => ({ tier: t.tier, canCreate: t.canCreate })),
+		},
+	});
 }
 
 async function createAndAttachDatabase(
@@ -1835,7 +2305,7 @@ async function resolveDatabaseProvisioning(
 	}
 
 	if (candidates.length === 0 || isJsonMode() || shouldSkipConfirmation()) {
-		return buildDatabaseCreateDecision(app, kind, requestedPlan);
+		return buildDatabaseCreateDecision(client, app, kind, requestedPlan);
 	}
 
 	const label = formatDatabaseKind(kind);
@@ -1865,7 +2335,13 @@ async function resolveDatabaseProvisioning(
 
 	if (picked === "__create__") {
 		const plan =
-			requestedPlan ?? (await resolveResourcePlan(undefined, "Database plan:"));
+			requestedPlan ??
+			(await resolveResourcePlan(
+				client,
+				"database",
+				undefined,
+				"Database plan:",
+			));
 		return {
 			action: "create",
 			plan,
@@ -1905,7 +2381,7 @@ async function resolveStorageProvisioning(
 	}
 
 	if (candidates.length === 0 || isJsonMode() || shouldSkipConfirmation()) {
-		return buildStorageCreateDecision(app, requestedPlan);
+		return buildStorageCreateDecision(client, app, requestedPlan);
 	}
 
 	const choices = [
@@ -1930,7 +2406,8 @@ async function resolveStorageProvisioning(
 
 	if (picked === "__create__") {
 		const plan =
-			requestedPlan ?? (await resolveResourcePlan(undefined, "Storage plan:"));
+			requestedPlan ??
+			(await resolveResourcePlan(client, "storage", undefined, "Storage plan:"));
 		return {
 			action: "create",
 			plan,
@@ -2370,13 +2847,14 @@ async function attachExistingStorage(
 }
 
 async function buildDatabaseCreateDecision(
+	client: any,
 	app: AppSummary,
 	kind: "postgres" | "mysql",
 	requestedPlan: ResourcePlan | undefined,
 ): Promise<Extract<DatabaseDecision, { action: "create" }>> {
 	const plan =
 		requestedPlan ??
-		(await resolveResourcePlan(undefined, "Database plan:"));
+		(await resolveResourcePlan(client, "database", undefined, "Database plan:"));
 	return {
 		action: "create",
 		plan,
@@ -2385,11 +2863,13 @@ async function buildDatabaseCreateDecision(
 }
 
 async function buildStorageCreateDecision(
+	client: any,
 	app: AppSummary,
 	requestedPlan: ResourcePlan | undefined,
 ): Promise<Extract<StorageDecision, { action: "create" }>> {
 	const plan =
-		requestedPlan ?? (await resolveResourcePlan(undefined, "Storage plan:"));
+		requestedPlan ??
+		(await resolveResourcePlan(client, "storage", undefined, "Storage plan:"));
 	return {
 		action: "create",
 		plan,
@@ -2741,6 +3221,14 @@ export function registerDeployCommands(program: Command) {
 			"--reuse-storage <ref>",
 			"Reuse an existing storage bucket in this project: <id>, <name>, or 'auto' (exactly one match)",
 		)
+		.option(
+			"--new-app",
+			"Create a new app instead of being prompted to reuse an existing one",
+		)
+		.option(
+			"--name <name>",
+			"Name for a newly created app (defaults to the directory name)",
+		)
 		.option("--token <token>", "API token to use for this deployment")
 		.option("-r, --region <region>", "Deployment region", DEFAULT_REGION)
 		.option("--description <text>", "Description for a newly created app")
@@ -2854,9 +3342,16 @@ export function registerDeployCommands(program: Command) {
 					const message =
 						err instanceof Error ? err.message : "Plan upgrade required";
 
-					// JSON / non-TTY / --yes path: preserve the machine-readable
-					// contract so external agents and CI don't regress.
-					if (isJsonMode() || shouldSkipConfirmation()) {
+					// Any non-interactive context (JSON, no TTY, or --yes) gets the
+					// machine-readable NEEDS_UPGRADE envelope — which now lists BOTH
+					// the buy-addon and upgrade-plan options so the agent asks the
+					// human which to run rather than deciding. Only a real interactive
+					// TTY reaches the inline chooser below.
+					if (
+						isJsonMode() ||
+						isNonInteractiveMode() ||
+						shouldSkipConfirmation()
+					) {
 						await emitNeedsUpgrade(
 							getApiClient(),
 							err,
@@ -2869,7 +3364,18 @@ export function registerDeployCommands(program: Command) {
 					log("");
 					log(colors.warn(message));
 
-					const upgraded = await promptUpgradeFromEntitlementError(
+					// Free DB/storage slots are 1-per-org and granted only by the free
+					// plan, so "buy an addon" is a dead end. Name what's holding the
+					// slot and steer to reuse/delete/upgrade before the plan picker.
+					const failedKey = extractEntitlementKeyFromError(err);
+					if (
+						failedKey === "db.free.slots" ||
+						failedKey === "storage.free.slots"
+					) {
+						await explainFreeResourceSlotExhaustion(getApiClient(), failedKey);
+					}
+
+					const upgraded = await promptEntitlementRemedy(
 						getApiClient(),
 						err,
 						options.plan,
@@ -2888,7 +3394,7 @@ export function registerDeployCommands(program: Command) {
 					// Don't resume from inside the catch — the deploy may have
 					// created partial state (app row, source upload). Re-running
 					// `tarout deploy` re-enters the resolver chain safely.
-					box("Upgrade complete", [
+					box("Billing updated", [
 						colors.success("Subscription updated."),
 						`Run ${colors.cyan("tarout deploy")} again to deploy on the new plan.`,
 					]);

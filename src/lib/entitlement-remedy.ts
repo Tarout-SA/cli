@@ -120,6 +120,27 @@ export function resolveEntitlementRemedy(
 		};
 	}
 
+	// Free-tier resource slots (`db.free.slots`, `storage.free.slots`) are
+	// capped by the free plan's single grant — NO addon grants them, so the
+	// generic `db.`/`storage.` branch below would wrongly suggest a dead-end
+	// `addon:buy db.free`. The only ways to get another are to free the existing
+	// one or move to a paid plan (which unlocks the paid resource addons).
+	if (failedKey === "db.free.slots" || failedKey === "storage.free.slots") {
+		const target = nextPlanForRequested(opts?.requestedPlan);
+		const plan = plans.find((p) => planKeyOf(p) === target);
+		const resource =
+			failedKey === "db.free.slots" ? "database" : "storage bucket";
+		return {
+			kind: "plan",
+			failedKey,
+			targetKey: target,
+			targetName: plan?.name,
+			priceHalalas: plan?.priceHalalas,
+			command: `tarout billing upgrade ${target} --wait`,
+			hint: `The free plan includes a single ${resource} for the whole org — delete the existing free ${resource}, or upgrade to ${plan?.name ?? target} to add more.`,
+		};
+	}
+
 	// db.* / storage.* / domain.* / email_service.* → resource addon.
 	if (
 		failedKey?.startsWith("db.") ||

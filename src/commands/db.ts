@@ -3,6 +3,11 @@ import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
 import { getCurrentProfile, isLoggedIn } from "../lib/config.js";
 import {
+	type ResourcePlan,
+	loadResourceTiers,
+	pickDefaultResourceTier,
+} from "./deploy.js";
+import {
 	AuthError,
 	CliError,
 	findSimilar,
@@ -25,6 +30,35 @@ import { confirm, input, select } from "../utils/prompts.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
 
 type DatabaseType = "postgres" | "mysql";
+
+function normalizeDbPlan(value: string | undefined): ResourcePlan | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().toUpperCase();
+	if (
+		normalized === "FREE" ||
+		normalized === "STARTER" ||
+		normalized === "STANDARD" ||
+		normalized === "PRO"
+	) {
+		return normalized as ResourcePlan;
+	}
+	throw new CliError(
+		`Invalid database plan "${value}". Use free, starter, standard, or pro.`,
+		ExitCode.INVALID_ARGUMENTS,
+	);
+}
+
+// An explicit --plan wins; otherwise default to the tier the org is actually
+// entitled to (postgres entitlements cover both Postgres and MySQL).
+async function resolveDbPlan(
+	client: any,
+	explicit: string | undefined,
+): Promise<ResourcePlan> {
+	const normalized = normalizeDbPlan(explicit);
+	if (normalized) return normalized;
+	const tiers = await loadResourceTiers(client, "database");
+	return pickDefaultResourceTier(tiers);
+}
 
 export function registerDbCommands(program: Command) {
 	const db = program.command("db").description("Manage databases");
@@ -122,6 +156,10 @@ export function registerDbCommands(program: Command) {
 		.argument("[name]", "Database name")
 		.description("Create a new database")
 		.option("-t, --type <type>", "Database type (postgres, mysql)", "postgres")
+		.option(
+			"-p, --plan <plan>",
+			"Database plan: free, starter, standard, or pro (defaults to your org's entitled tier)",
+		)
 		.option("-d, --description <description>", "Database description")
 		.option("--name <name>", "Database name (alternative to positional argument)")
 		.action(async (name, options) => {
@@ -161,6 +199,13 @@ export function registerDbCommands(program: Command) {
 				const slug = generateSlug(dbName);
 
 				const client = getApiClient();
+
+				// Resolve the tier from the connected org's entitlements instead of
+				// letting the server fall back to its STARTER default — that default
+				// produced `db.starter.slots: 1/0` for orgs that actually hold a
+				// db.standard (or other) slot. An explicit --plan always wins.
+				const plan = await resolveDbPlan(client, options.plan);
+
 				const _spinner = startSpinner(`Creating ${dbType} database...`);
 
 				let database: any;
@@ -173,6 +218,7 @@ export function registerDbCommands(program: Command) {
 							dockerImage: "postgres:17",
 							organizationId: profile.organizationId,
 							description: options.description,
+							plan,
 						});
 						break;
 					case "mysql":
@@ -182,6 +228,7 @@ export function registerDbCommands(program: Command) {
 							dockerImage: "mysql:8",
 							organizationId: profile.organizationId,
 							description: options.description,
+							plan,
 						});
 						break;
 					default:

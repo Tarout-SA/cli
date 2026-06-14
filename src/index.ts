@@ -58,10 +58,18 @@ program
 	.option("--no-color", "Disable colored output")
 	.hook("preAction", (thisCommand) => {
 		const opts = thisCommand.opts();
+		// Auto-detect non-interactive sessions: when stdin is not a TTY (agent
+		// background runs, pipes, CI), inquirer can't prompt — falling through
+		// would hang then force-close with exit 1. Treating it as
+		// `--non-interactive` instead makes annotated prompts emit a structured
+		// needs_input (exit 6) and skips interactive-only blocks (e.g. the
+		// billing-upgrade addon bundle questions). `--json` and `--yes` retain
+		// their own handling.
+		const stdinIsTTY = Boolean(process.stdin.isTTY);
 		setGlobalOptions({
 			json: opts.json || false,
 			yes: opts.yes || false,
-			nonInteractive: opts.nonInteractive || false,
+			nonInteractive: opts.nonInteractive || !stdinIsTTY,
 			quiet: opts.quiet || false,
 			verbose: opts.verbose || false,
 			noColor: opts.color === false,
