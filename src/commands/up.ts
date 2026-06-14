@@ -35,8 +35,8 @@ import {
 	type AppSummary,
 	configureOptionalResources,
 	createAppFromCurrentDirectory,
+	emitNeedsUpgrade,
 	ensureAuthenticatedForDeploy,
-	extractEntitlementKeyFromError,
 	findApp,
 	inferSuggestedPlan,
 	inspectCurrentProject,
@@ -325,11 +325,7 @@ export function registerUpCommand(program: Command): void {
 
 							// JSON / non-TTY / --yes: keep the machine-readable contract.
 							if (isJsonMode() || shouldSkipConfirmation()) {
-								outputError("NEEDS_UPGRADE", message, {
-									suggestedPlan: inferSuggestedPlan(options.plan),
-									failedEntitlementKey: extractEntitlementKeyFromError(err),
-									hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout up`.",
-								});
+								await emitNeedsUpgrade(client, err, options.plan, "tarout up");
 								exit(ExitCode.PERMISSION_DENIED);
 							}
 
@@ -343,11 +339,7 @@ export function registerUpCommand(program: Command): void {
 							);
 
 							if (!upgraded) {
-								outputError("NEEDS_UPGRADE", message, {
-									suggestedPlan: inferSuggestedPlan(options.plan),
-									failedEntitlementKey: extractEntitlementKeyFromError(err),
-									hint: "Run `tarout billing upgrade <plan> --wait`, then retry `tarout up`.",
-								});
+								await emitNeedsUpgrade(client, err, options.plan, "tarout up");
 								exit(ExitCode.PERMISSION_DENIED);
 							}
 

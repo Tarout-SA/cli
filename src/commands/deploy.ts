@@ -16,6 +16,12 @@ import open from "open";
 import { getApiClient, resetApiClient } from "../lib/api.js";
 import { startAuthServer } from "../lib/auth-server.js";
 import {
+	type Catalog,
+	nextPlanForRequested,
+	resolveEntitlementRemedy,
+} from "../lib/entitlement-remedy.js";
+import { performBillingChange } from "../lib/billing-upgrade.js";
+import {
 	isCredentialError,
 	resolveProfileFromCredential,
 } from "../lib/auth-profile.js";
@@ -49,6 +55,7 @@ import {
 	log,
 	outputData,
 	outputError,
+	outputJsonLine,
 	quietOutput,
 	shouldSkipConfirmation,
 	success,
@@ -1064,65 +1071,49 @@ export async function runInlineUpgrade(
 	client: any,
 	planKey: string,
 ): Promise<boolean> {
-	const { pollCheckoutUntilTerminal } = await import("./billing.js");
-
+	// Interactive-only path (callers short-circuit to NEEDS_UPGRADE in JSON
+	// mode). Delegate to the shared billing engine so the changePlan → branch →
+	// poll behavior is identical to `tarout billing upgrade`.
 	const _changing = startSpinner(`Switching to plan "${planKey}"...`);
-	const result = await client.subscription.changePlan.mutate({ planKey });
+	const result = await performBillingChange(client, {
+		kind: "plan",
+		planKey,
+		wait: true,
+		timeoutMs: 600_000,
+		openBrowser: isJsonMode()
+			? undefined
+			: async (url: string) => {
+					await open(url);
+				},
+		onCheckoutOpened: ({ orderId, paymentUrl }) => {
+			log("");
+			log("Open this URL to complete payment:");
+			log(`  ${colors.cyan(paymentUrl)}`);
+			log(`Order ID: ${colors.dim(orderId)}`);
+		},
+	});
 
-	if (result?.applied) {
+	if (result.status === "applied" || result.status === "paid") {
 		succeedSpinner("Plan applied.");
 		return true;
 	}
 
-	if (!result?.paymentUrl || !result?.orderId) {
-		// Downgrade staged for period rollover, or applied without
-		// payment. Treat as not-confirmed for deploy purposes.
-		failSpinner("Plan change did not return a payment URL.");
-		return false;
-	}
-
-	succeedSpinner("Checkout opened — waiting for payment confirmation.");
-
-	const orderId: string = result.orderId;
-	const paymentUrl: string = result.paymentUrl;
-
-	log("");
-	log(`Open this URL to complete payment:`);
-	log(`  ${colors.cyan(paymentUrl)}`);
-	log(`Order ID: ${colors.dim(orderId)}`);
-
-	try {
-		await open(paymentUrl);
-	} catch {
-		// Headless — the URL printed above is the fallback.
-	}
-
-	const _pollSpinner = startSpinner("Polling for payment confirmation...");
-	const final = await pollCheckoutUntilTerminal(client, orderId, {
-		timeoutMs: 600_000,
-		intervalMs: 4_000,
-	});
-
-	if (final.status === "PAID") {
-		succeedSpinner("Payment confirmed.");
-		return true;
-	}
-
 	failSpinner(
-		final.status === "PENDING"
-			? "Payment still pending after 10 minutes."
-			: `Payment ${final.status.toLowerCase()}.`,
+		result.status === "deferred"
+			? "Plan change did not require an immediate payment."
+			: result.status === "pending_timeout"
+				? "Payment still pending after 10 minutes."
+				: `Payment ${result.status}.`,
 	);
 
-	if (final.failureReason) {
-		log(colors.error(final.failureReason));
+	if (result.failureReason) log(colors.error(result.failureReason));
+	if (result.orderId) {
+		log(
+			colors.dim(
+				`Resume later with: tarout billing wait ${result.orderId.slice(0, 8)} --timeout 600`,
+			),
+		);
 	}
-
-	log(
-		colors.dim(
-			`Resume later with: tarout billing wait ${orderId.slice(0, 8)} --timeout 600`,
-		),
-	);
 
 	return false;
 }
@@ -1230,13 +1221,7 @@ export function isEntitlementError(err: unknown): boolean {
 // requested plan. Returns the next tier so an agent has something concrete
 // to ask for: "free" → "shared" → "dedicated_small".
 export function inferSuggestedPlan(requested?: string): string {
-	const r = (requested ?? "free").trim().toLowerCase();
-	if (!r || r === "free") return "shared";
-	if (r === "shared") return "shared";
-	if (r === "dedicated" || r === "dedicated_small") return "dedicated_small";
-	if (r === "dedicated_medium") return "dedicated_medium";
-	if (r === "dedicated_large") return "dedicated_large";
-	return r;
+	return nextPlanForRequested(requested);
 }
 
 // Short human labels for entitlement keys used in the plan-includes summary.
@@ -1292,6 +1277,34 @@ export function extractEntitlementKeyFromError(
 	const msg = err instanceof Error ? err.message : "";
 	const m = msg.match(/Plan limit reached for ([\w.]+)/i);
 	return m?.[1];
+}
+
+/**
+ * Emit the structured NEEDS_UPGRADE envelope for an entitlement gate, derived
+ * from the *correct* remedy (plan upgrade vs addon purchase vs quantity bump)
+ * instead of always suggesting a plan. Pairs with ExitCode.PERMISSION_DENIED at
+ * the call site so an agent gets one parseable, actionable response.
+ */
+export async function emitNeedsUpgrade(
+	client: any,
+	err: unknown,
+	requestedPlan: string | undefined,
+	retryCommand: string,
+): Promise<void> {
+	const message = err instanceof Error ? err.message : "Plan upgrade required";
+	const failedKey = extractEntitlementKeyFromError(err);
+	const catalog = (await fetchCatalogSafely(client)) as Catalog | null;
+	const remedy = resolveEntitlementRemedy(failedKey, catalog, { requestedPlan });
+	outputError("NEEDS_UPGRADE", message, {
+		failedEntitlementKey: failedKey,
+		remedyKind: remedy.kind,
+		// `suggestedPlan` retained for back-compat; now correct for every gate
+		// (the plan key, addon key, or quantity-aware plan to act on).
+		suggestedPlan: remedy.targetKey,
+		suggestedTarget: remedy.targetKey,
+		nextCommand: remedy.command,
+		hint: `${remedy.hint} Then retry: ${retryCommand}.`,
+	});
 }
 
 /**
@@ -2094,7 +2107,28 @@ function resolveExplicitStorageRef(
 	return match;
 }
 
-async function finalizeDatabaseReuse(
+/**
+ * Surface a reuse-plan decision that did NOT result in an automatic upgrade.
+ * Replaces the old silent `return false` so an agent (JSON) — or a `--yes`
+ * scripted run — always learns the reused resource stayed on its current plan
+ * and gets the exact command to upgrade it. Plan upgrades are billing-mutating
+ * (and may require a checkout), so they are never performed unprompted.
+ */
+function emitReuseNotice(payload: {
+	event: string;
+	humanMessage: string;
+	humanHint?: string;
+	details: Record<string, unknown>;
+}): void {
+	if (isJsonMode()) {
+		outputJsonLine({ type: "event", event: payload.event, ...payload.details });
+		return;
+	}
+	log(colors.warn(payload.humanMessage));
+	if (payload.humanHint) log(colors.dim(`  ${payload.humanHint}`));
+}
+
+export async function finalizeDatabaseReuse(
 	client: any,
 	candidate: DatabaseCandidate,
 	kind: "postgres" | "mysql",
@@ -2106,23 +2140,45 @@ async function finalizeDatabaseReuse(
 
 	if (planExplicit && requestedPlan) {
 		const cmp = compareResourcePlan(requestedPlan, candidate.plan);
+		const upgradeCommand = `tarout db upgrade ${candidate.name} --plan ${requestedPlan.toLowerCase()}`;
 		if (cmp > 0) {
-			const ok = await confirmUpgrade(
-				`${formatDatabaseKind(kind)} ${candidate.name} is on ${candidate.plan}. Upgrade to ${requestedPlan} before attaching?`,
-				true,
-				kind === "postgres" ? "upgrade_postgres" : "upgrade_mysql",
-			);
-			if (ok) {
-				await runDatabaseUpgrade(client, kind, candidate.id, requestedPlan);
-				plan = requestedPlan;
-				upgraded = true;
+			if (isJsonMode() || shouldSkipConfirmation()) {
+				emitReuseNotice({
+					event: "reuse_plan_unchanged",
+					humanMessage: `${formatDatabaseKind(kind)} ${candidate.name} stays on ${candidate.plan}; requested ${requestedPlan} was not applied automatically.`,
+					humanHint: `Upgrade explicitly with: ${upgradeCommand}`,
+					details: {
+						resourceType: "database",
+						name: candidate.name,
+						currentPlan: candidate.plan,
+						requestedPlan,
+						nextCommand: upgradeCommand,
+						hint: "Database plan upgrades are billing-mutating and may require checkout; run the command above to upgrade.",
+					},
+				});
+			} else {
+				const ok = await confirmUpgrade(
+					`${formatDatabaseKind(kind)} ${candidate.name} is on ${candidate.plan}. Upgrade to ${requestedPlan} before attaching?`,
+					true,
+					kind === "postgres" ? "upgrade_postgres" : "upgrade_mysql",
+				);
+				if (ok) {
+					await runDatabaseUpgrade(client, kind, candidate.id, requestedPlan);
+					plan = requestedPlan;
+					upgraded = true;
+				}
 			}
-		} else if (cmp < 0 && !isJsonMode()) {
-			log(
-				colors.warn(
-					`Requested ${requestedPlan} is lower than existing ${candidate.plan}; attaching at current plan.`,
-				),
-			);
+		} else if (cmp < 0) {
+			emitReuseNotice({
+				event: "reuse_plan_lower",
+				humanMessage: `Requested ${requestedPlan} is lower than existing ${candidate.plan}; attaching at current plan.`,
+				details: {
+					resourceType: "database",
+					name: candidate.name,
+					currentPlan: candidate.plan,
+					requestedPlan,
+				},
+			});
 		}
 	}
 
@@ -2135,7 +2191,7 @@ async function finalizeDatabaseReuse(
 	};
 }
 
-async function finalizeStorageReuse(
+export async function finalizeStorageReuse(
 	client: any,
 	candidate: StorageCandidate,
 	requestedPlan: ResourcePlan | undefined,
@@ -2146,19 +2202,17 @@ async function finalizeStorageReuse(
 
 	if (planExplicit && requestedPlan) {
 		const cmp = compareResourcePlan(requestedPlan, candidate.plan);
+		const upgradeCommand = `tarout storage upgrade ${candidate.name} --plan ${requestedPlan.toLowerCase()}`;
 		if (cmp > 0) {
-			if (candidate.plan !== "FREE") {
-				if (!isJsonMode()) {
-					log(
-						colors.warn(
-							`Storage bucket ${candidate.name} is on ${candidate.plan}. Inline upgrades to ${requestedPlan} are only supported from FREE — upgrade from the dashboard. Attaching at current plan.`,
-						),
-					);
-				}
-			} else if (
+			const isPaidUpgradeable =
 				requestedPlan === "STARTER" ||
 				requestedPlan === "STANDARD" ||
-				requestedPlan === "PRO"
+				requestedPlan === "PRO";
+			if (
+				candidate.plan === "FREE" &&
+				isPaidUpgradeable &&
+				!isJsonMode() &&
+				!shouldSkipConfirmation()
 			) {
 				const ok = await confirmUpgrade(
 					`Storage bucket ${candidate.name} is on FREE. Upgrade to ${requestedPlan} before attaching?`,
@@ -2170,13 +2224,34 @@ async function finalizeStorageReuse(
 					plan = requestedPlan;
 					upgraded = true;
 				}
+			} else {
+				// Agent/--yes mode, or a paid→paid bump: never silent — tell the
+				// caller it stayed put and how to upgrade.
+				emitReuseNotice({
+					event: "reuse_plan_unchanged",
+					humanMessage: `Storage bucket ${candidate.name} stays on ${candidate.plan}; requested ${requestedPlan} was not applied automatically.`,
+					humanHint: `Upgrade explicitly with: ${upgradeCommand}`,
+					details: {
+						resourceType: "storage",
+						name: candidate.name,
+						currentPlan: candidate.plan,
+						requestedPlan,
+						nextCommand: upgradeCommand,
+						hint: "Storage plan upgrades are billing-mutating; run the command above to upgrade.",
+					},
+				});
 			}
-		} else if (cmp < 0 && !isJsonMode()) {
-			log(
-				colors.warn(
-					`Requested ${requestedPlan} is lower than existing ${candidate.plan}; attaching at current plan.`,
-				),
-			);
+		} else if (cmp < 0) {
+			emitReuseNotice({
+				event: "reuse_plan_lower",
+				humanMessage: `Requested ${requestedPlan} is lower than existing ${candidate.plan}; attaching at current plan.`,
+				details: {
+					resourceType: "storage",
+					name: candidate.name,
+					currentPlan: candidate.plan,
+					requestedPlan,
+				},
+			});
 		}
 	}
 
@@ -2194,10 +2269,8 @@ async function confirmUpgrade(
 	defaultValue: boolean,
 	field: string,
 ): Promise<boolean> {
-	if (isJsonMode() || shouldSkipConfirmation()) {
-		// Non-interactive: do not silently upgrade — billing-mutating. Skip.
-		return false;
-	}
+	// Only reached in interactive mode — agent/--yes paths emit a notice
+	// instead (see finalizeDatabaseReuse / finalizeStorageReuse).
 	return confirm(message, defaultValue, {
 		field,
 		flag: "--yes (default attaches at current plan; pass --database-plan/--storage-plan with --yes to force an upgrade)",
@@ -2784,11 +2857,12 @@ export function registerDeployCommands(program: Command) {
 					// JSON / non-TTY / --yes path: preserve the machine-readable
 					// contract so external agents and CI don't regress.
 					if (isJsonMode() || shouldSkipConfirmation()) {
-						outputError("NEEDS_UPGRADE", message, {
-							suggestedPlan: inferSuggestedPlan(options.plan),
-							failedEntitlementKey: extractEntitlementKeyFromError(err),
-							hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout deploy`.",
-						});
+						await emitNeedsUpgrade(
+							getApiClient(),
+							err,
+							options.plan,
+							"tarout deploy",
+						);
 						exit(ExitCode.PERMISSION_DENIED);
 					}
 
@@ -2802,11 +2876,12 @@ export function registerDeployCommands(program: Command) {
 					);
 
 					if (!upgraded) {
-						outputError("NEEDS_UPGRADE", message, {
-							suggestedPlan: inferSuggestedPlan(options.plan),
-							failedEntitlementKey: extractEntitlementKeyFromError(err),
-							hint: "Run `tarout billing upgrade <plan> --wait`, then retry `tarout deploy`.",
-						});
+						await emitNeedsUpgrade(
+							getApiClient(),
+							err,
+							options.plan,
+							"tarout deploy",
+						);
 						exit(ExitCode.PERMISSION_DENIED);
 					}
 

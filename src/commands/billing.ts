@@ -1,6 +1,13 @@
 import { type Command, InvalidArgumentError } from "commander";
 import open from "open";
 import { getApiClient } from "../lib/api.js";
+import {
+	type BillingChangeResult,
+	emitBillingResult,
+	finalizeBillingMutation,
+	performBillingChange,
+	pollCheckoutUntilTerminal,
+} from "../lib/billing-upgrade.js";
 import { isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
@@ -17,6 +24,40 @@ import {
 import { confirm, select } from "../utils/prompts.js";
 import { ExitCode, exit } from "../utils/exit-codes.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
+
+// Re-exported for back-compat: callers (e.g. deploy.ts dynamic import, tests)
+// historically imported the poll helper from this module before it moved into
+// the shared billing engine.
+export { pollCheckoutUntilTerminal };
+
+/**
+ * Map a billing-engine result to output + exit. Centralizes the
+ * `emitBillingResult` + `exit(code)` pattern used by every billing-mutating
+ * command so the agent JSON envelope and exit codes stay identical everywhere.
+ */
+function reportBillingResult(
+	result: BillingChangeResult,
+	label: string,
+): void {
+	const code = emitBillingResult(result, { label });
+	if (code !== ExitCode.SUCCESS) exit(code);
+}
+
+/** Browser opener injected into the engine — suppressed in JSON/agent mode. */
+function browserOpener(
+	noOpen: boolean,
+): ((url: string) => Promise<void>) | undefined {
+	if (isJsonMode() || noOpen) return undefined;
+	return async (url: string) => {
+		await open(url);
+	};
+}
+
+/** True when a tRPC error carries a CONFLICT code (either v10 shape). */
+function isConflictError(err: unknown): boolean {
+	const e = err as { code?: string; data?: { code?: string } };
+	return (e?.code ?? e?.data?.code) === "CONFLICT";
+}
 
 export function registerBillingCommands(program: Command) {
 	const billing = program
@@ -254,9 +295,22 @@ export function registerBillingCommands(program: Command) {
 								.join(", ")}`,
 						);
 					}
-					if (preview?.amountDue !== undefined) {
+					// `previewPlanChange` returns `proratedChargeHalalas` (amount due
+					// now) and `newPeriodTotalHalalas` (new recurring total). There is
+					// no `amountDue` field — reading it left this line permanently
+					// blank.
+					const amountDueHalalas: number | undefined =
+						typeof preview?.proratedChargeHalalas === "number"
+							? preview.proratedChargeHalalas
+							: undefined;
+					if (amountDueHalalas !== undefined) {
 						log(
-							`Amount due now: ${colors.bold(`${(preview.amountDue / 100).toFixed(2)} SAR`)}`,
+							`Amount due now: ${colors.bold(`${(amountDueHalalas / 100).toFixed(2)} SAR`)} ${colors.dim("(incl. 15% VAT for SA orgs at checkout)")}`,
+						);
+					}
+					if (typeof preview?.newPeriodTotalHalalas === "number") {
+						log(
+							`New recurring total: ${(preview.newPeriodTotalHalalas / 100).toFixed(2)} SAR`,
 						);
 					}
 					log("");
@@ -272,7 +326,7 @@ export function registerBillingCommands(program: Command) {
 								quantity: options.quantity,
 								billingPeriod,
 								addons,
-								amountDueHalalas: preview?.amountDue,
+								amountDueHalalas,
 							},
 						},
 					);
@@ -285,149 +339,35 @@ export function registerBillingCommands(program: Command) {
 
 				const _changeSpinner = startSpinner("Changing plan...");
 
-				const result = await client.subscription.changePlan.mutate({
+				const result = await performBillingChange(client, {
+					kind: "plan",
 					planKey: targetPlan,
-					planQuantity: options.quantity,
+					quantity: options.quantity,
 					billingPeriod,
 					addons,
-				});
-
-				succeedSpinner("Plan changed!");
-
-				// Three outcomes:
-				//  (a) applied: true  — free upgrade or stored payment method;
-				//      entitlements are already updated, nothing more to do.
-				//  (b) applied: false + paymentUrl/orderId — user must finish
-				//      checkout in the browser. If --wait, we open and poll.
-				//  (c) applied: false + no paymentUrl — downgrade staged for
-				//      period rollover; nothing to wait on.
-				if (result?.applied) {
-					if (isJsonMode()) {
-						outputData({ ...result, status: "applied" });
-					} else {
-						box("Plan Changed", [
-							`Plan: ${colors.cyan(targetPlan)}`,
-							colors.success("Applied immediately"),
-						]);
-					}
-					return;
-				}
-
-				if (!result?.paymentUrl || !result?.orderId) {
-					if (isJsonMode()) {
-						outputData({ ...result, status: "deferred" });
-					} else {
-						box("Plan Change Staged", [
-							`Plan: ${colors.cyan(targetPlan)}`,
-							"Will apply at the end of the current billing period.",
-						]);
-					}
-					return;
-				}
-
-				const orderId: string = result.orderId;
-				const paymentUrl: string = result.paymentUrl;
-
-				if (!options.wait) {
-					if (isJsonMode()) {
-						outputData({
-							...result,
-							status: "payment_required",
-							hint: "Re-run with --wait to poll until checkout completes, or call `tarout billing confirm <orderId>` after the browser flow.",
-						});
-					} else {
-						box("Payment Required", [
-							`Plan: ${colors.cyan(targetPlan)}`,
-							`Open: ${colors.cyan(paymentUrl)}`,
-							`Order ID: ${colors.dim(orderId)}`,
-							`Then: ${colors.dim(`tarout billing confirm ${orderId.slice(0, 8)}`)} or rerun upgrade with --wait`,
-						]);
-					}
-					return;
-				}
-
-				// --wait path: open the browser, poll the order until it
-				// resolves. The success/failure URLs the platform set on the
-				// checkout fire confirmCheckout/markCheckoutFailed when the
-				// user lands on them, which flips status. Mock mode (set on
-				// the server) returns the success URL immediately as the
-				// "payment URL"; opening it flips status too.
-				if (options.open !== false) {
-					try {
-						await open(paymentUrl);
-					} catch {
-						// Headless / no-display — surface the URL via stdout
-						// below and rely on the user to open it manually.
-					}
-				}
-				if (isJsonMode()) {
-					outputJsonLine({
-						type: "event",
-						event: "checkout_started",
-						orderId,
-						paymentUrl,
-					});
-				} else {
-					log("");
-					log(`Open this URL to complete payment:`);
-					log(`  ${colors.cyan(paymentUrl)}`);
-					log(`Order ID: ${colors.dim(orderId)}`);
-					log(`Polling for confirmation (up to ${options.timeout}s)...`);
-				}
-
-				const final = await pollCheckoutUntilTerminal(client, orderId, {
+					wait: options.wait,
 					timeoutMs: options.timeout * 1000,
-					intervalMs: 4000,
+					openBrowser: browserOpener(options.open === false),
+					onCheckoutOpened: ({ orderId, paymentUrl }) => {
+						if (isJsonMode()) {
+							outputJsonLine({
+								type: "event",
+								event: "checkout_started",
+								orderId,
+								paymentUrl,
+							});
+						} else {
+							log("");
+							log("Open this URL to complete payment:");
+							log(`  ${colors.cyan(paymentUrl)}`);
+							log(`Order ID: ${colors.dim(orderId)}`);
+							log(`Polling for confirmation (up to ${options.timeout}s)...`);
+						}
+					},
 				});
 
-				if (final.status === "PAID") {
-					if (isJsonMode()) {
-						outputData({
-							applied: true,
-							orderId,
-							status: "paid",
-							paidAt: final.paidAt,
-						});
-					} else {
-						box("Payment Confirmed", [
-							`Plan: ${colors.cyan(targetPlan)}`,
-							colors.success("Subscription is active. Retry your last action."),
-						]);
-					}
-					return;
-				}
-
-				if (final.status === "FAILED" || final.status === "EXPIRED") {
-					outputError(
-						final.status === "EXPIRED"
-							? "CHECKOUT_EXPIRED"
-							: "CHECKOUT_FAILED",
-						final.failureReason ?? `Checkout ${final.status.toLowerCase()}`,
-						{ orderId, status: final.status, failedAt: final.failedAt },
-					);
-					if (!isJsonMode()) {
-						box("Payment Failed", [
-							`Order ID: ${colors.dim(orderId)}`,
-							`Reason: ${final.failureReason ?? final.status}`,
-						]);
-					}
-					exit(ExitCode.GENERAL_ERROR);
-					return;
-				}
-
-				// timeout still PENDING
-				outputError(
-					"CHECKOUT_TIMEOUT",
-					`Checkout still PENDING after ${options.timeout}s; the agent should keep polling or surface the URL.`,
-					{ orderId, status: final.status, paymentUrl },
-				);
-				if (!isJsonMode()) {
-					box("Still Waiting", [
-						`Order ID: ${colors.dim(orderId)}`,
-						`Run: ${colors.dim(`tarout billing wait ${orderId.slice(0, 8)} --timeout 600`)}`,
-					]);
-				}
-				exit(ExitCode.GENERAL_ERROR);
+				succeedSpinner("Plan change processed.");
+				reportBillingResult(result, `Plan: ${targetPlan}`);
 			} catch (err) {
 				handleError(err);
 			}
@@ -449,14 +389,14 @@ export function registerBillingCommands(program: Command) {
 					orderId,
 				});
 				succeedSpinner("Checkout confirmed.");
-				if (isJsonMode()) {
-					outputData(result);
-				} else {
-					box("Confirmed", [
-						`Order ID: ${colors.dim(orderId)}`,
-						colors.success("Subscription is active."),
-					]);
-				}
+				const mapped: BillingChangeResult = {
+					status: result?.applied ? "paid" : "payment_required",
+					kind: "plan",
+					target: orderId,
+					orderId,
+					...(result?.paymentUrl ? { paymentUrl: result.paymentUrl } : {}),
+				};
+				reportBillingResult(mapped, `Order ${orderId.slice(0, 8)}`);
 			} catch (err) {
 				handleError(err);
 			}
@@ -490,32 +430,21 @@ export function registerBillingCommands(program: Command) {
 					timeoutMs: options.timeout * 1000,
 					intervalMs: 4000,
 				});
-				if (final.status === "PAID") {
-					if (isJsonMode()) {
-						outputData({ orderId, status: "paid", paidAt: final.paidAt });
-					} else {
-						box("Confirmed", [
-							`Order ID: ${colors.dim(orderId)}`,
-							colors.success("Payment confirmed."),
-						]);
-					}
-					return;
-				}
-				if (final.status === "PENDING") {
-					outputError("CHECKOUT_TIMEOUT", "Still pending after timeout", {
-						orderId,
-					});
-					exit(ExitCode.GENERAL_ERROR);
-					return;
-				}
-				outputError(
-					final.status === "EXPIRED"
-						? "CHECKOUT_EXPIRED"
-						: "CHECKOUT_FAILED",
-					final.failureReason ?? `Checkout ${final.status.toLowerCase()}`,
-					{ orderId, status: final.status },
-				);
-				exit(ExitCode.GENERAL_ERROR);
+				const result: BillingChangeResult = {
+					status:
+						final.status === "PAID"
+							? "paid"
+							: final.status === "FAILED"
+								? "failed"
+								: final.status === "EXPIRED"
+									? "expired"
+									: "pending_timeout",
+					kind: "plan",
+					target: orderId,
+					orderId,
+					failureReason: final.failureReason,
+				};
+				reportBillingResult(result, `Order ${orderId.slice(0, 8)}`);
 			} catch (err) {
 				handleError(err);
 			}
@@ -608,7 +537,18 @@ export function registerBillingCommands(program: Command) {
 		.command("addon:add")
 		.argument("<addon>", "Addon key to add")
 		.option("-q, --quantity <n>", "Addon quantity", Number.parseInt)
-		.description("Purchase an addon slot")
+		.option(
+			"-w, --wait",
+			"After hosted-checkout opens, poll status until the payment is confirmed",
+		)
+		.option(
+			"--timeout <seconds>",
+			"Maximum wait time in seconds (default 600)",
+			(v) => Number.parseInt(v, 10),
+			600,
+		)
+		.option("--no-open", "Do not auto-open the payment URL in the browser")
+		.description("Add a new addon line (extra db/storage/etc. slot)")
 		.action(async (addonKey, options) => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
@@ -640,24 +580,47 @@ export function registerBillingCommands(program: Command) {
 				const client = getApiClient();
 				const _spinner = startSpinner("Adding addon...");
 
-				const result = await client.subscription.addAddon.mutate({
-					addonKey,
-					quantity,
-				});
-
-				succeedSpinner("Addon added!");
-
-				if (isJsonMode()) {
-					outputData(result);
-				} else {
-					box("Addon Added", [
-						`Addon: ${colors.cyan(addonKey)}`,
-						`Quantity: ${quantity}`,
-						result?.paymentUrl
-							? `Payment: ${colors.cyan(result.paymentUrl)}`
-							: colors.success("Applied immediately"),
-					]);
+				// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC result.
+				let raw: any;
+				try {
+					raw = await client.subscription.addAddon.mutate({
+						addonKey,
+						quantity,
+					});
+				} catch (err) {
+					failSpinner();
+					// `addAddon` is create-only — it rejects with CONFLICT when the
+					// addon already exists. Translate that into the actionable path
+					// instead of leaking a raw tRPC error.
+					if (isConflictError(err)) {
+						const nextCommand = `tarout billing addon:quantity ${addonKey} <newQty>`;
+						outputError(
+							"ADDON_EXISTS",
+							`Addon "${addonKey}" is already on your subscription — change its quantity instead of adding it again.`,
+							{ addonKey, nextCommand },
+						);
+						if (!isJsonMode()) {
+							box("Addon already present", [
+								`Use: ${colors.dim(nextCommand)}`,
+								`Or buy more slots: ${colors.dim(`tarout billing addon:buy ${addonKey} --wait`)}`,
+							]);
+						}
+						exit(ExitCode.INVALID_ARGUMENTS);
+						return;
+					}
+					throw err;
 				}
+
+				succeedSpinner("Addon processed.");
+
+				const result = await finalizeBillingMutation(client, raw, {
+					kind: "addon",
+					target: addonKey,
+					wait: options.wait,
+					timeoutMs: options.timeout * 1000,
+					openBrowser: browserOpener(options.open === false),
+				});
+				reportBillingResult(result, `Addon: ${addonKey} ×${quantity}`);
 			} catch (err) {
 				handleError(err);
 			}
@@ -703,21 +666,36 @@ export function registerBillingCommands(program: Command) {
 			}
 		});
 
-	// Set plan quantity
+	// Set plan quantity (adds/removes app slots on the quantity-aware plan)
 	billing
 		.command("plan:quantity")
 		.argument("<quantity>", "New plan quantity", Number.parseInt)
-		.description("Set quantity for a multi-slot plan")
-		.action(async (quantity) => {
+		.option(
+			"-w, --wait",
+			"After hosted-checkout opens, poll status until the payment is confirmed",
+		)
+		.option(
+			"--timeout <seconds>",
+			"Maximum wait time in seconds (default 600)",
+			(v) => Number.parseInt(v, 10),
+			600,
+		)
+		.option("--no-open", "Do not auto-open the payment URL in the browser")
+		.description("Set quantity for a multi-slot plan (adds/removes app slots)")
+		.action(async (quantity, options) => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
 				const client = getApiClient();
 				const _spinner = startSpinner("Updating plan quantity...");
-				const result = await client.subscription.setPlanQuantity.mutate({
+				const result = await performBillingChange(client, {
+					kind: "plan_quantity",
 					quantity,
-				} as any);
-				succeedSpinner("Plan quantity updated!");
-				if (isJsonMode()) outputData(result);
+					wait: options.wait,
+					timeoutMs: options.timeout * 1000,
+					openBrowser: browserOpener(options.open === false),
+				});
+				succeedSpinner("Plan quantity processed.");
+				reportBillingResult(result, `Plan quantity: ${quantity}`);
 			} catch (err) {
 				handleError(err);
 			}
@@ -764,14 +742,23 @@ export function registerBillingCommands(program: Command) {
 					outputData(preview);
 					return;
 				}
+				// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC result.
 				const p = preview as any;
+				// `previewAddonsPurchase` returns `totalProratedHalalas` (due now)
+				// and `newPeriodTotalHalalas` (new recurring total) — there is no
+				// `amountDue` field, so the old read never printed anything.
 				log("");
 				log(colors.bold("Addon Purchase Preview"));
 				log(`  Addon:      ${colors.cyan(addonKey)}`);
 				log(`  Quantity:   ${options.quantity || 1}`);
-				if (p.amountDue !== undefined) {
+				if (typeof p?.totalProratedHalalas === "number") {
 					log(
-						`  Amount Due: ${colors.bold(`${(p.amountDue / 100).toFixed(2)} SAR`)}`,
+						`  Amount Due: ${colors.bold(`${(p.totalProratedHalalas / 100).toFixed(2)} SAR`)} ${colors.dim("(incl. 15% VAT for SA orgs at checkout)")}`,
+					);
+				}
+				if (typeof p?.newPeriodTotalHalalas === "number") {
+					log(
+						`  New total:  ${(p.newPeriodTotalHalalas / 100).toFixed(2)} SAR`,
 					);
 				}
 				log("");
@@ -780,12 +767,24 @@ export function registerBillingCommands(program: Command) {
 			}
 		});
 
-	// Purchase addons
+	// Purchase addon slots (extra db/storage/etc.) — the canonical
+	// engine-driven purchase path with hosted-checkout + --wait support.
 	billing
 		.command("addon:buy")
 		.argument("<addon>", "Addon key")
 		.option("-q, --quantity <n>", "Quantity", Number.parseInt)
-		.description("Purchase addon slots")
+		.option(
+			"-w, --wait",
+			"After hosted-checkout opens, poll status until the payment is confirmed",
+		)
+		.option(
+			"--timeout <seconds>",
+			"Maximum wait time in seconds (default 600)",
+			(v) => Number.parseInt(v, 10),
+			600,
+		)
+		.option("--no-open", "Do not auto-open the payment URL in the browser")
+		.description("Purchase addon slots (extra db/storage/etc.)")
 		.action(async (addonKey, options) => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
@@ -804,16 +803,16 @@ export function registerBillingCommands(program: Command) {
 				}
 				const client = getApiClient();
 				const _spinner = startSpinner("Purchasing addon...");
-				const result = await client.subscription.purchaseAddons.mutate({
-					addons: [{ addonKey, quantity }],
-				} as any);
-				succeedSpinner("Addon purchased!");
-				if (isJsonMode()) outputData(result);
-				else if ((result as any)?.paymentUrl) {
-					log(
-						`\nPayment required: ${colors.cyan((result as any).paymentUrl)}\n`,
-					);
-				}
+				const result = await performBillingChange(client, {
+					kind: "addon",
+					addonKey,
+					quantity,
+					wait: options.wait,
+					timeoutMs: options.timeout * 1000,
+					openBrowser: browserOpener(options.open === false),
+				});
+				succeedSpinner("Addon purchase processed.");
+				reportBillingResult(result, `Addon: ${addonKey} ×${quantity}`);
 			} catch (err) {
 				handleError(err);
 			}
@@ -1103,57 +1102,6 @@ export function registerBillingCommands(program: Command) {
 				handleError(err);
 			}
 		});
-}
-
-/**
- * Poll `subscription.pollCheckoutStatus` every `intervalMs` until the
- * checkout reaches a terminal status (PAID/FAILED/EXPIRED) or `timeoutMs`
- * elapses. Emits one JSON event line per status read when --json is on,
- * so an external agent can show progress without buffering.
- */
-export async function pollCheckoutUntilTerminal(
-	client: any,
-	orderId: string,
-	opts: { timeoutMs: number; intervalMs: number },
-): Promise<{
-	status: "PENDING" | "PAID" | "FAILED" | "EXPIRED";
-	paidAt: Date | null;
-	failedAt: Date | null;
-	failureReason: string | null;
-}> {
-	const deadline = Date.now() + opts.timeoutMs;
-	let lastStatus = "";
-	while (Date.now() < deadline) {
-		const r = await client.subscription.pollCheckoutStatus.query({ orderId });
-		if (r.status !== lastStatus) {
-			if (isJsonMode()) {
-				outputJsonLine({
-					type: "event",
-					event: "checkout_status",
-					orderId,
-					status: r.status,
-				});
-			}
-			lastStatus = r.status;
-		}
-		if (r.status !== "PENDING") {
-			return {
-				status: r.status,
-				paidAt: r.paidAt,
-				failedAt: r.failedAt,
-				failureReason: r.failureReason,
-			};
-		}
-		await new Promise((res) => setTimeout(res, opts.intervalMs));
-	}
-	// Timeout — return last seen status (PENDING).
-	const r = await client.subscription.pollCheckoutStatus.query({ orderId });
-	return {
-		status: r.status,
-		paidAt: r.paidAt,
-		failedAt: r.failedAt,
-		failureReason: r.failureReason,
-	};
 }
 
 /**

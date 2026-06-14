@@ -16,6 +16,11 @@ export const ExitCode = {
 	DEPLOYMENT_FAILED: 10,
 	DEPLOYMENT_TIMEOUT: 11,
 	BUILD_FAILED: 12,
+	// A hosted checkout is still PENDING (not paid yet, not failed). The agent
+	// should resume polling (`tarout billing wait <orderId>`) or surface the
+	// payment URL to a human — distinct from GENERAL_ERROR so a resumable
+	// checkout isn't treated as a hard failure.
+	CHECKOUT_PENDING: 13,
 } as const;
 
 export type ExitCodeValue = (typeof ExitCode)[keyof typeof ExitCode];
