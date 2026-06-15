@@ -26,6 +26,18 @@ import {
 	outputJsonLine,
 } from "./output.js";
 
+/**
+ * Agent-facing guidance attached to every NEEDS_UPGRADE envelope. If the
+ * agent's OWN permission layer blocks the billing command (e.g. a coding-agent
+ * harness that gates paid-looking commands), the CLI can't print anything —
+ * it never runs. So we surface the fix one step earlier, on the upgrade-needed
+ * result the agent DOES receive, and tell it to have the user allowlist billing
+ * once. Running an upgrade is non-destructive: it only opens the hosted payment
+ * page; the user still completes payment in the browser.
+ */
+export const AGENT_BILLING_PERMISSION_HINT =
+	'If your agent\'s permission system blocks this billing command, ask the user to allowlist Tarout billing once so you can run it directly (Claude Code: add "Bash(tarout billing:*)" to .claude/settings.json). Running an upgrade only opens the hosted payment page — the user still completes payment in the browser.';
+
 export type BillingChangeKind = "plan" | "addon" | "plan_quantity";
 
 export type BillingChangeStatus =
@@ -178,6 +190,24 @@ export async function finalizeBillingMutation(
 	const orderId: string = result.orderId;
 	const paymentUrl: string = result.paymentUrl;
 
+	// Surface the checkout URL before opening, but only when we're about to
+	// poll — `onCheckoutOpened` carries wait-specific copy ("Polling for
+	// confirmation…") in some callers.
+	if (ctx.wait) ctx.onCheckoutOpened?.({ orderId, paymentUrl });
+
+	// Auto-open the hosted checkout whenever a browser opener is injected
+	// (interactive / non-JSON agent), for BOTH the --wait and no-wait paths:
+	// surfacing the payment page is the whole point of a positive-charge result.
+	// JSON/agent callers inject no opener and read `paymentUrl` from the
+	// envelope instead. Failures are swallowed — the URL is always in the box.
+	if (ctx.openBrowser) {
+		try {
+			await ctx.openBrowser(paymentUrl);
+		} catch {
+			// Headless / no display — the paymentUrl is surfaced in the envelope.
+		}
+	}
+
 	if (!ctx.wait) {
 		return {
 			status: "payment_required",
@@ -187,16 +217,6 @@ export async function finalizeBillingMutation(
 			paymentUrl,
 			amountHalalas,
 		};
-	}
-
-	ctx.onCheckoutOpened?.({ orderId, paymentUrl });
-
-	if (ctx.openBrowser) {
-		try {
-			await ctx.openBrowser(paymentUrl);
-		} catch {
-			// Headless / no display — the paymentUrl is surfaced in the envelope.
-		}
 	}
 
 	const final = await pollCheckoutUntilTerminal(client, orderId, {

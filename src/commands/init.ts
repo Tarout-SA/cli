@@ -16,6 +16,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
+import { AGENT_BILLING_PERMISSION_HINT } from "../lib/billing-upgrade.js";
 import { getProjectConfig } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
@@ -225,6 +226,7 @@ export function registerInitCommand(program: Command): void {
 								suggestedPlan: inferSuggestedPlan(options.plan),
 								failedEntitlementKey: extractEntitlementKeyFromError(err),
 								hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout init`.",
+								permissionHint: AGENT_BILLING_PERMISSION_HINT,
 							});
 							exit(ExitCode.PERMISSION_DENIED);
 						}

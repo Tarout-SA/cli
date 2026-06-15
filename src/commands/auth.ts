@@ -2,6 +2,7 @@ import type { Command } from "commander";
 import open from "open";
 import { startAuthServer } from "../lib/auth-server.js";
 import { resolveProfileFromCredential } from "../lib/auth-profile.js";
+import { canLaunchBrowser } from "../lib/browser.js";
 import {
 	clearConfig,
 	getApiUrl,
@@ -16,7 +17,6 @@ import {
 	box,
 	colors,
 	isJsonMode,
-	isNonInteractiveMode,
 	log,
 	outputData,
 	outputError,
@@ -27,11 +27,11 @@ import { input, promptOrEmit } from "../utils/prompts.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
 
 /**
- * Browser-only auth (`tarout login`, `tarout register`) can't satisfy an
- * unattended agent — there's no way to drive the OAuth round-trip from a
- * non-TTY parent. Emit a structured AUTH_BOOTSTRAP_REQUIRED error so the
- * calling agent knows to surface the API-token path to its user instead
- * of waiting on a never-arriving browser callback.
+ * Browser auth (`tarout login`, `tarout register`) needs a reachable GUI, and
+ * a programmatic `--json` caller can't watch a browser at all. When neither
+ * holds, emit a structured AUTH_BOOTSTRAP_REQUIRED error so the calling agent
+ * surfaces the API-token path to its user instead of waiting on a
+ * never-arriving browser callback.
  */
 function refuseBrowserAuthForAgent(action: "login" | "register"): never {
 	const message = `tarout ${action} requires a browser. Agents should ask the user to run \`tarout token <api-token>\` or set TAROUT_TOKEN — generate one at https://tarout.sa/dashboard/settings/profile.`;
@@ -76,7 +76,7 @@ export function registerAuthCommands(program: Command) {
 					}
 				}
 
-				if (isJsonMode() || isNonInteractiveMode()) {
+				if (isJsonMode() || !canLaunchBrowser()) {
 					refuseBrowserAuthForAgent("login");
 				}
 
@@ -91,7 +91,12 @@ export function registerAuthCommands(program: Command) {
 				// Open browser to auth page
 				const authUrl = `${apiUrl}/cli-authorize?callback=${encodeURIComponent(callbackUrl)}`;
 
-				await open(authUrl);
+				try {
+					await open(authUrl);
+				} catch {
+					authServer.close();
+					refuseBrowserAuthForAgent("login");
+				}
 
 				const _spinner = startSpinner("Waiting for authentication...");
 
@@ -211,7 +216,7 @@ export function registerAuthCommands(program: Command) {
 					}
 				}
 
-				if (isJsonMode() || isNonInteractiveMode()) {
+				if (isJsonMode() || !canLaunchBrowser()) {
 					refuseBrowserAuthForAgent("register");
 				}
 
@@ -223,7 +228,12 @@ export function registerAuthCommands(program: Command) {
 					const callbackUrl = `http://localhost:${authServer.port}/callback?state=${encodeURIComponent(authServer.state)}`;
 				const authUrl = `${apiUrl}/cli-authorize?action=register&callback=${encodeURIComponent(callbackUrl)}`;
 
-				await open(authUrl);
+				try {
+					await open(authUrl);
+				} catch {
+					authServer.close();
+					refuseBrowserAuthForAgent("register");
+				}
 
 				const _spinner = startSpinner("Waiting for account creation...");
 

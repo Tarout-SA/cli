@@ -1,5 +1,4 @@
 import { type Command, InvalidArgumentError } from "commander";
-import open from "open";
 import { getApiClient } from "../lib/api.js";
 import {
 	type BillingChangeResult,
@@ -8,6 +7,10 @@ import {
 	performBillingChange,
 	pollCheckoutUntilTerminal,
 } from "../lib/billing-upgrade.js";
+import {
+	paymentBrowserOpener,
+	shouldAutoConfirmPaidCheckout,
+} from "../lib/browser.js";
 import { isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
@@ -47,16 +50,6 @@ function reportBillingResult(
 ): void {
 	const code = emitBillingResult(result, { label });
 	if (code !== ExitCode.SUCCESS) exit(code);
-}
-
-/** Browser opener injected into the engine — suppressed in JSON/agent mode. */
-function browserOpener(
-	noOpen: boolean,
-): ((url: string) => Promise<void>) | undefined {
-	if (isJsonMode() || noOpen) return undefined;
-	return async (url: string) => {
-		await open(url);
-	};
 }
 
 /** True when a tRPC error carries a CONFLICT code (either v10 shape). */
@@ -359,25 +352,40 @@ export function registerBillingCommands(program: Command) {
 					}
 					log("");
 
-					const confirmed = await confirm(
-						`Switch to plan "${targetPlan}"?`,
-						false,
-						{
-							field: "confirm_upgrade",
-							flag: "--yes",
-							context: {
-								plan: targetPlan,
-								quantity: planQuantity,
-								billingPeriod,
-								addons,
-								amountDueHalalas,
+					// Agent path: a paid upgrade goes through StreamPay hosted
+					// checkout, where the user reviews the amount and enters card
+					// details in the browser — that page is the real consent surface.
+					// So when we're driving an agent (non-TTY) that can open a browser
+					// and this is a positive charge, skip the local y/n (which would
+					// otherwise halt with `needs_input`) and let the payment page below
+					// collect consent. `--json` agents keep the structured handoff;
+					// net-zero/free changes (no amount due) still confirm, since those
+					// apply instantly with no payment page to gate them.
+					if (shouldAutoConfirmPaidCheckout(amountDueHalalas)) {
+						log(
+							"Opening the secure payment page in your browser to complete the upgrade...",
+						);
+					} else {
+						const confirmed = await confirm(
+							`Switch to plan "${targetPlan}"?`,
+							false,
+							{
+								field: "confirm_upgrade",
+								flag: "--yes",
+								context: {
+									plan: targetPlan,
+									quantity: planQuantity,
+									billingPeriod,
+									addons,
+									amountDueHalalas,
+								},
 							},
-						},
-					);
+						);
 
-					if (!confirmed) {
-						log("Cancelled.");
-						return;
+						if (!confirmed) {
+							log("Cancelled.");
+							return;
+						}
 					}
 				}
 
@@ -391,7 +399,7 @@ export function registerBillingCommands(program: Command) {
 					addons,
 					wait: options.wait,
 					timeoutMs: options.timeout * 1000,
-					openBrowser: browserOpener(options.open === false),
+					openBrowser: paymentBrowserOpener({ noOpen: options.open === false }),
 					onCheckoutOpened: ({ orderId, paymentUrl }) => {
 						if (isJsonMode()) {
 							outputJsonLine({
@@ -662,7 +670,7 @@ export function registerBillingCommands(program: Command) {
 					target: addonKey,
 					wait: options.wait,
 					timeoutMs: options.timeout * 1000,
-					openBrowser: browserOpener(options.open === false),
+					openBrowser: paymentBrowserOpener({ noOpen: options.open === false }),
 				});
 				reportBillingResult(result, `Addon: ${addonKey} ×${quantity}`);
 			} catch (err) {
@@ -736,7 +744,7 @@ export function registerBillingCommands(program: Command) {
 					quantity,
 					wait: options.wait,
 					timeoutMs: options.timeout * 1000,
-					openBrowser: browserOpener(options.open === false),
+					openBrowser: paymentBrowserOpener({ noOpen: options.open === false }),
 				});
 				succeedSpinner("Plan quantity processed.");
 				reportBillingResult(result, `Plan quantity: ${quantity}`);
@@ -853,7 +861,7 @@ export function registerBillingCommands(program: Command) {
 					quantity,
 					wait: options.wait,
 					timeoutMs: options.timeout * 1000,
-					openBrowser: browserOpener(options.open === false),
+					openBrowser: paymentBrowserOpener({ noOpen: options.open === false }),
 				});
 				succeedSpinner("Addon purchase processed.");
 				reportBillingResult(result, `Addon: ${addonKey} ×${quantity}`);

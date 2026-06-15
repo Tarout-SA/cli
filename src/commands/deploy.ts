@@ -15,6 +15,7 @@ import type { Command } from "commander";
 import open from "open";
 import { getApiClient, resetApiClient } from "../lib/api.js";
 import { startAuthServer } from "../lib/auth-server.js";
+import { paymentBrowserOpener } from "../lib/browser.js";
 import {
 	type Catalog,
 	type EntitlementRemedy,
@@ -22,6 +23,7 @@ import {
 	resolveEntitlementRemedy,
 } from "../lib/entitlement-remedy.js";
 import {
+	AGENT_BILLING_PERMISSION_HINT,
 	type PerformBillingChangeInput,
 	performBillingChange,
 } from "../lib/billing-upgrade.js";
@@ -761,7 +763,7 @@ function formatDatabaseKind(kind: DatabaseKind): string {
 	return "none";
 }
 
-async function resolveDeploymentTarget(
+export async function resolveDeploymentTarget(
 	client: any,
 	profile: Profile,
 	appIdentifier?: string,
@@ -799,15 +801,24 @@ async function resolveDeploymentTarget(
 		return createNewAppTarget(client, profile, options);
 	}
 
-	// Resolve the linked app (if a `tarout link` config points at a real app).
-	// It's the recommended reuse default, but we no longer silently deploy to
-	// it — the user (or the agent, on the user's behalf) must choose.
+	// Resolve the linked app (a prior `tarout link` or deploy wrote
+	// `.tarout/project.json`). A linked app is an explicit prior choice, so a
+	// bare redeploy targets it WITHOUT prompting — the documented "redeploy just
+	// works" path agents depend on for a deterministic redeploy. `--new-app`
+	// (handled above) overrides it; `--source upload` is honored downstream by
+	// resolveShouldUploadSource. `promptForSource: false` suppresses the
+	// source-override needs_input so the redeploy stays non-interactive.
 	const linkedProject = getProjectConfig();
 	const linkedApp = linkedProject
 		? findApp(apps, linkedProject.applicationId) ??
 			findApp(apps, linkedProject.name)
 		: undefined;
-	if (linkedProject && !linkedApp && !isJsonMode()) {
+	if (linkedApp) {
+		return reuseAppTarget(client, profile, linkedApp, {
+			promptForSource: false,
+		});
+	}
+	if (linkedProject && !isJsonMode()) {
 		log("");
 		log(
 			colors.warn(
@@ -816,27 +827,22 @@ async function resolveDeploymentTarget(
 		);
 	}
 
-	// Nothing to reuse — creating is the only path, so no choice to surface.
+	// No linked app. Nothing else to reuse — creating is the only path.
 	if (apps.length === 0) {
 		assertConfiguredSourceAllowsCreate(sourcePreference, true);
 		return createNewAppTarget(client, profile, options);
 	}
 
-	// `--yes` is the explicit "don't ask me" escape hatch: accept the default
-	// (the linked app if present, otherwise create a new one).
+	// `--yes` with no linked app: accept the default (create a new app).
 	if (shouldSkipConfirmation()) {
-		if (linkedApp) return reuseAppTarget(client, profile, linkedApp);
 		assertConfiguredSourceAllowsCreate(sourcePreference, true);
 		return createNewAppTarget(client, profile, options);
 	}
 
-	// Otherwise ASK. Interactive shows the menu; agent mode (--json / no TTY)
-	// emits a structured needs_input naming the exact re-invoke flags — so the
-	// human decides through the agent instead of the CLI silently reusing.
+	// Apps exist but none is linked — ASK which to use. Interactive shows the
+	// menu; agent mode (--json / no TTY) emits a structured needs_input naming
+	// the exact re-invoke mechanisms so the human decides through the agent.
 	const createValue = "__create__";
-	const orderedApps = linkedApp
-		? [linkedApp, ...apps.filter((a) => a.applicationId !== linkedApp.applicationId)]
-		: apps;
 	const selected = await select<string>(
 		"Create a new app or reuse an existing one?",
 		[
@@ -844,23 +850,16 @@ async function resolveDeploymentTarget(
 				name: `Create a new app from ${colors.cyan(basename(process.cwd()) || "this directory")}`,
 				value: createValue,
 			},
-			...orderedApps.map((app) => ({
-				name: `Reuse ${app.name} ${colors.dim(`(${app.applicationId.slice(0, 8)})`)}${
-					linkedApp && app.applicationId === linkedApp.applicationId
-						? colors.dim(" — linked")
-						: ""
-				}`,
+			...apps.map((app) => ({
+				name: `Reuse ${app.name} ${colors.dim(`(${app.applicationId.slice(0, 8)})`)}`,
 				value: app.applicationId,
 			})),
 		],
 		{
 			field: "deploy_app",
-			flag: "--new-app to create a new app, or --app <id|name> to reuse an existing one",
+			flag: "--new-app to create a new app, or pass the app id or name as the positional argument (tarout deploy <id|name>) to reuse an existing one",
 			context: {
-				linkedApp: linkedApp
-					? { id: linkedApp.applicationId, name: linkedApp.name }
-					: null,
-				apps: orderedApps.map((a) => ({
+				apps: apps.map((a) => ({
 					id: a.applicationId,
 					name: a.name,
 				})),
@@ -912,6 +911,7 @@ async function reuseAppTarget(
 	client: any,
 	profile: Profile,
 	app: AppSummary,
+	opts: { promptForSource?: boolean } = {},
 ): Promise<DeploymentTarget> {
 	setProjectConfig({
 		applicationId: app.applicationId,
@@ -924,7 +924,14 @@ async function reuseAppTarget(
 		app,
 		createdApp: false,
 		hasConfiguredSource: hasConfiguredSource(details),
-		shouldUploadSource: await promptForLocalSourceIfNeeded(details),
+		// A deterministic redeploy (linked app) must not prompt for a source
+		// override — it silently reuses the app's existing source, or the current
+		// folder when `--source upload` is set downstream. Only an interactive
+		// menu reuse offers the override.
+		shouldUploadSource:
+			opts.promptForSource === false
+				? shouldUseLocalSource(details, { linkedProject: true })
+				: await promptForLocalSourceIfNeeded(details),
 	};
 }
 
@@ -1158,11 +1165,7 @@ export async function runInlineUpgrade(
 		planKey,
 		wait: true,
 		timeoutMs: 600_000,
-		openBrowser: isJsonMode()
-			? undefined
-			: async (url: string) => {
-					await open(url);
-				},
+		openBrowser: paymentBrowserOpener(),
 		onCheckoutOpened: ({ orderId, paymentUrl }) => {
 			log("");
 			log("Open this URL to complete payment:");
@@ -1233,11 +1236,7 @@ export async function runInlineTargetedRemedy(
 		...input,
 		wait: true,
 		timeoutMs: 600_000,
-		openBrowser: isJsonMode()
-			? undefined
-			: async (url: string) => {
-					await open(url);
-				},
+		openBrowser: paymentBrowserOpener(),
 		onCheckoutOpened: ({ orderId, paymentUrl }) => {
 			log("");
 			log("Open this URL to complete payment:");
@@ -1581,6 +1580,7 @@ export async function emitNeedsUpgrade(
 		nextCommand: remedy.command,
 		options,
 		hint,
+		permissionHint: AGENT_BILLING_PERMISSION_HINT,
 	});
 }
 
