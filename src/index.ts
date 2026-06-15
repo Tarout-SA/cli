@@ -38,6 +38,7 @@ import { registerStorageCommands } from "./commands/storage.js";
 import { registerTicketsCommands } from "./commands/tickets.js";
 import { registerUpCommand } from "./commands/up.js";
 import { registerWalletCommands } from "./commands/wallet.js";
+import { emitAgentSetupHint } from "./lib/agent-setup.js";
 import { outputError, setGlobalOptions } from "./lib/output.js";
 import { ExitCode } from "./utils/exit-codes.js";
 
@@ -57,7 +58,7 @@ program
 	.option("-q, --quiet", "Minimal output")
 	.option("-v, --verbose", "Extra debug information")
 	.option("--no-color", "Disable colored output")
-	.hook("preAction", (thisCommand) => {
+	.hook("preAction", (thisCommand, actionCommand) => {
 		const opts = thisCommand.opts();
 		// Auto-detect non-interactive sessions: when stdin is not a TTY (agent
 		// background runs, pipes, CI), inquirer can't prompt — falling through
@@ -75,6 +76,16 @@ program
 			verbose: opts.verbose || false,
 			noColor: opts.color === false,
 		});
+
+		// In agent mode, nudge the agent to run `tarout agent init` first when the
+		// project isn't allowlisted yet. Skipped for the `agent` namespace itself
+		// and for up/deploy/init, which auto-scaffold the allowlist in their action.
+		const sub = actionCommand?.name();
+		const isAgentNamespace = actionCommand?.parent?.name() === "agent";
+		const autoRunsSetup = !!sub && ["up", "deploy", "init"].includes(sub);
+		if (!isAgentNamespace && !autoRunsSetup) {
+			emitAgentSetupHint(process.cwd());
+		}
 	});
 
 // Register all commands

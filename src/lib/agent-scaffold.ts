@@ -122,6 +122,25 @@ interface ClaudeSettings {
 }
 
 /**
+ * True when `.claude/settings.local.json` under `cwd` already allowlists
+ * `Bash(tarout:*)` — i.e. an agent can run tarout commands without per-command
+ * approval. Used to decide whether onboarding still needs `tarout agent init`.
+ */
+export function hasTaroutAllowlist(cwd: string): boolean {
+	const settingsPath = join(cwd, ".claude", "settings.local.json");
+	if (!existsSync(settingsPath)) return false;
+	try {
+		const settings = JSON.parse(
+			readFileSync(settingsPath, "utf-8"),
+		) as ClaudeSettings;
+		const allow = settings?.permissions?.allow;
+		return Array.isArray(allow) && allow.includes(TAROUT_ALLOW_ENTRY);
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Ensure `.claude/settings.local.json` allows `Bash(tarout:*)`. Merges into any
  * existing file (preserving other keys and allow entries) and never destroys a
  * file whose JSON can't be parsed — that case returns "skipped" with a reason.

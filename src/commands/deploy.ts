@@ -13,6 +13,7 @@ import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { Command } from "commander";
 import open from "open";
+import { ensureAgentSetup } from "../lib/agent-setup.js";
 import { getApiClient, resetApiClient } from "../lib/api.js";
 import { startAuthServer } from "../lib/auth-server.js";
 import { paymentBrowserOpener } from "../lib/browser.js";
@@ -128,6 +129,7 @@ interface DeployOptions {
 	token?: string;
 	wait?: boolean;
 	watch?: boolean;
+	agentSetup?: boolean; // commander sets false for --no-agent-setup
 }
 
 type AppPlan = "FREE" | "SHARED" | "DEDICATED";
@@ -3249,8 +3251,16 @@ export function registerDeployCommands(program: Command) {
 		.option("--start-command <cmd>", "Custom start command")
 		.option("-w, --wait", "Wait for deployment to complete and stream logs")
 		.option("--watch", "Alias for --wait")
+		.option(
+			"--no-agent-setup",
+			"Don't auto-write the agent permission allowlist (CLAUDE.md / .claude/settings.local.json) on first run",
+		)
 		.action(async (appIdentifier, options: DeployOptions) => {
 			try {
+				// Onboarding step 0: in agent mode, grant the agent permission to run
+				// tarout commands (idempotent) before deploying.
+				ensureAgentSetup(process.cwd(), options.agentSetup === false);
+
 				const inspection = inspectCurrentProject();
 				printProjectInspection(inspection);
 

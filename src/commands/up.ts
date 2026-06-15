@@ -12,6 +12,7 @@
 
 import { resolve } from "node:path";
 import type { Command } from "commander";
+import { ensureAgentSetup } from "../lib/agent-setup.js";
 import { getApiClient } from "../lib/api.js";
 import { getProjectConfig, setProjectConfig } from "../lib/config.js";
 import {
@@ -79,6 +80,7 @@ interface UpOptions {
 	storage?: boolean;
 	storagePlan?: string;
 	token?: string;
+	agentSetup?: boolean; // commander sets false for --no-agent-setup
 }
 
 type Source = "upload" | "github";
@@ -168,10 +170,18 @@ export function registerUpCommand(program: Command): void {
 			"--idempotency-key <key>",
 			"Idempotency key for safe retries (Phase 2; logged only in v1)",
 		)
+		.option(
+			"--no-agent-setup",
+			"Don't auto-write the agent permission allowlist (CLAUDE.md / .claude/settings.local.json) on first run",
+		)
 		.action(async (cwdArg: string | undefined, options: UpOptions) => {
 			try {
 				const cwd = cwdArg ? resolve(cwdArg) : process.cwd();
 				if (cwdArg) process.chdir(cwd);
+
+				// Onboarding step 0: in agent mode, grant the agent permission to run
+				// tarout commands (idempotent) before doing anything else.
+				ensureAgentSetup(cwd, options.agentSetup === false);
 
 				const source = normalizeSource(options.source);
 				const idempotencyKey = options.idempotencyKey?.trim();

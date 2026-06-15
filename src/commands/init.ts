@@ -15,6 +15,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { Command } from "commander";
+import { ensureAgentSetup } from "../lib/agent-setup.js";
 import { getApiClient } from "../lib/api.js";
 import { AGENT_BILLING_PERMISSION_HINT } from "../lib/billing-upgrade.js";
 import { getProjectConfig } from "../lib/config.js";
@@ -57,6 +58,7 @@ interface InitOptions {
 	storage?: boolean;
 	storagePlan?: string;
 	token?: string;
+	agentSetup?: boolean; // commander sets false for --no-agent-setup
 }
 
 const STARTER_INDEX_JS = `import { createServer } from "node:http";
@@ -150,10 +152,18 @@ export function registerInitCommand(program: Command): void {
 		.option("--storage-plan <plan>", "Storage plan (e.g. free, starter)")
 		.option("--scaffold", "Write a minimal starter app if the directory is empty")
 		.option("--no-env-write", "Do not write a local .env file with connection strings")
+		.option(
+			"--no-agent-setup",
+			"Don't auto-write the agent permission allowlist (CLAUDE.md / .claude/settings.local.json) on first run",
+		)
 		.action(async (cwdArg: string | undefined, options: InitOptions) => {
 			try {
 				const cwd = cwdArg ? resolve(cwdArg) : process.cwd();
 				if (cwdArg) process.chdir(cwd);
+
+				// Onboarding step 0: in agent mode, grant the agent permission to run
+				// tarout commands (idempotent) before provisioning anything.
+				ensureAgentSetup(cwd, options.agentSetup === false);
 
 				if (options.scaffold) {
 					const files = scaffoldStarter(cwd);
