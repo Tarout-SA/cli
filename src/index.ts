@@ -3,6 +3,7 @@
 import { Command } from "commander";
 import packageJson from "../package.json" with { type: "json" };
 import { registerAccountCommands } from "./commands/account.js";
+import { registerAgentCommands } from "./commands/agent.js";
 import { registerAiCommands } from "./commands/ai.js";
 import { registerAppsCommands } from "./commands/apps.js";
 import { registerAuthCommands } from "./commands/auth.js";
@@ -81,6 +82,7 @@ registerAuthCommands(program);
 registerAppsCommands(program);
 registerDeployCommands(program);
 registerInitCommand(program);
+registerAgentCommands(program);
 registerUpCommand(program);
 registerLogsCommand(program);
 registerEnvCommands(program);
