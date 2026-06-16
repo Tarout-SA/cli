@@ -1,5 +1,6 @@
 import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
+import { paymentBrowserOpener } from "../lib/browser.js";
 import { isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
@@ -157,11 +158,20 @@ export function registerWalletCommands(program: Command) {
 					return;
 				}
 
+				const paymentUrl = result.paymentUrl || result.url || "";
+
 				box("Wallet Top-Up", [
 					`Order ID: ${colors.cyan(result.orderId || "")}`,
 					`Amount: ${result.amount ? `${(result.amount / 100).toFixed(2)} SAR` : "Default"}`,
-					`Payment URL: ${colors.cyan(result.paymentUrl || result.url || "")}`,
+					`Payment URL: ${colors.cyan(paymentUrl)}`,
 				]);
+
+				// Auto-open the hosted checkout (the URL above is the copy/paste
+				// fallback). Opener is undefined with --no-display / opt-out.
+				if (paymentUrl) {
+					const openPayment = paymentBrowserOpener();
+					if (openPayment) await openPayment(paymentUrl);
+				}
 
 				log("Complete payment in your browser to credit the wallet.");
 				log(

@@ -17,7 +17,6 @@ import { basename, join, resolve } from "node:path";
 import type { Command } from "commander";
 import { ensureAgentSetup } from "../lib/agent-setup.js";
 import { getApiClient } from "../lib/api.js";
-import { AGENT_BILLING_PERMISSION_HINT } from "../lib/billing-upgrade.js";
 import { getProjectConfig } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
@@ -25,7 +24,6 @@ import {
 	colors,
 	isJsonMode,
 	log,
-	outputError,
 	outputJsonLine,
 } from "../lib/output.js";
 import { envVarsToObject } from "../lib/process.js";
@@ -35,10 +33,9 @@ import {
 	type AppSummary,
 	configureOptionalResources,
 	createAppFromCurrentDirectory,
+	emitNeedsUpgrade,
 	ensureAuthenticatedForDeploy,
-	extractEntitlementKeyFromError,
 	findApp,
-	inferSuggestedPlan,
 	inspectCurrentProject,
 	isEntitlementError,
 } from "./deploy.js";
@@ -229,15 +226,17 @@ export function registerInitCommand(program: Command): void {
 							plan: app.plan ?? options.plan ?? "free",
 						});
 					} catch (err) {
+						// `init` is agent-first/non-interactive: hand back the structured
+						// NEEDS_UPGRADE envelope (both buy-addon and upgrade-plan options,
+						// current-plan-aware) so the agent asks the user which to run, then
+						// retries `tarout init`.
 						if (isEntitlementError(err)) {
-							const message =
-								err instanceof Error ? err.message : "Plan upgrade required";
-							outputError("NEEDS_UPGRADE", message, {
-								suggestedPlan: inferSuggestedPlan(options.plan),
-								failedEntitlementKey: extractEntitlementKeyFromError(err),
-								hint: "Run `tarout billing upgrade <plan> --wait` to add slots, then retry `tarout init`.",
-								permissionHint: AGENT_BILLING_PERMISSION_HINT,
-							});
+							await emitNeedsUpgrade(
+								getApiClient(),
+								err,
+								options.plan,
+								"tarout init",
+							);
 							exit(ExitCode.PERMISSION_DENIED);
 						}
 						throw err;

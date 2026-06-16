@@ -16,12 +16,13 @@ import open from "open";
 import { ensureAgentSetup } from "../lib/agent-setup.js";
 import { getApiClient, resetApiClient } from "../lib/api.js";
 import { startAuthServer } from "../lib/auth-server.js";
-import { paymentBrowserOpener } from "../lib/browser.js";
+import { openInBrowser, paymentBrowserOpener } from "../lib/browser.js";
 import {
 	type Catalog,
 	type EntitlementRemedy,
 	nextPlanForRequested,
 	resolveEntitlementRemedy,
+	upgradeTargetPlan,
 } from "../lib/entitlement-remedy.js";
 import {
 	AGENT_BILLING_PERMISSION_HINT,
@@ -294,7 +295,12 @@ async function authenticateViaBrowser(
 			? "Opening browser to create your account..."
 			: "Opening browser to authenticate...",
 	);
-	await open(authUrl);
+	await openInBrowser(authUrl, {
+		hint:
+			action === "register"
+				? "If the browser didn't open, visit this URL to create your account:"
+				: "If the browser didn't open, visit this URL to authenticate:",
+	});
 
 	const _spinner = startSpinner(
 		action === "register"
@@ -1211,6 +1217,22 @@ async function getCurrentPlanQuantitySafely(client: any): Promise<number> {
 	}
 }
 
+// The org's current plan key (e.g. "free", "shared", "dedicated_small"), used
+// to compute the "upgrade the plan" ladder (free → shared → dedicated_*). A
+// null subscription means the org is still on the implicit free tier. Never
+// throws — a failed lookup yields undefined and callers fall back to the
+// requested-plan heuristic.
+async function getCurrentPlanKeySafely(
+	client: any,
+): Promise<string | undefined> {
+	try {
+		const sub = await client.subscription.getCurrent.query();
+		return sub?.planKey ?? "free";
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Inline targeted remedy — the "add just the missing resource" counterpart to
  * {@link runInlineUpgrade}: buy a single resource addon, or bump the
@@ -1288,12 +1310,23 @@ export async function promptEntitlementRemedy(
 	requestedPlan?: string,
 ): Promise<boolean> {
 	const failedKey = extractEntitlementKeyFromError(err);
-	const catalog = (await fetchCatalogSafely(client)) as Catalog | null;
-	const remedy = resolveEntitlementRemedy(failedKey, catalog, { requestedPlan });
+	const [catalog, currentPlanKey] = await Promise.all([
+		fetchCatalogSafely(client) as Promise<Catalog | null>,
+		getCurrentPlanKeySafely(client),
+	]);
+	const remedy = resolveEntitlementRemedy(failedKey, catalog, {
+		requestedPlan,
+		currentPlanKey,
+	});
 
 	// No cheaper targeted action — only a full plan change unlocks these.
 	if (remedy.kind === "plan") {
-		return promptUpgradeFromEntitlementError(client, err, requestedPlan);
+		return promptUpgradeFromEntitlementError(
+			client,
+			err,
+			requestedPlan,
+			currentPlanKey,
+		);
 	}
 
 	const price =
@@ -1304,6 +1337,13 @@ export async function promptEntitlementRemedy(
 		remedy.kind === "plan_quantity"
 			? `Add one more app slot${price}`
 			: `Add just the ${remedy.targetName ?? remedy.targetKey}${price}`;
+	// Name the upgrade target (free → Starter, shared → Pro Small, …) so the
+	// choice reads as a concrete tier change rather than a vague "upgrade".
+	const upgradePlanKey = upgradeTargetPlan({ currentPlanKey, requestedPlan });
+	const upgradePlanDef = (catalog?.plans ?? []).find(
+		(p) => (p.planKey ?? p.key) === upgradePlanKey,
+	);
+	const upgradeLabel = `Upgrade to ${upgradePlanDef?.name ?? upgradePlanKey}`;
 
 	log("");
 	log(colors.warn("That resource isn't included in your current plan."));
@@ -1316,7 +1356,7 @@ export async function promptEntitlementRemedy(
 	const choice = await select<string>(
 		"How would you like to add it?",
 		[
-			{ name: "Upgrade the plan", value: UPGRADE },
+			{ name: upgradeLabel, value: UPGRADE },
 			{ name: targetedLabel, value: TARGETED },
 			{ name: "Cancel", value: CANCEL },
 		],
@@ -1328,13 +1368,19 @@ export async function promptEntitlementRemedy(
 				remedyKind: remedy.kind,
 				targetKey: remedy.targetKey,
 				command: remedy.command,
+				upgradePlanKey,
 			},
 		},
 	);
 
 	if (choice === CANCEL) return false;
 	if (choice === UPGRADE) {
-		return promptUpgradeFromEntitlementError(client, err, requestedPlan);
+		return promptUpgradeFromEntitlementError(
+			client,
+			err,
+			requestedPlan,
+			currentPlanKey,
+		);
 	}
 	return runInlineTargetedRemedy(client, remedy);
 }
@@ -1524,9 +1570,13 @@ export function buildRemedyOptions(
 	remedy: EntitlementRemedy,
 	requestedPlan: string | undefined,
 	catalog: Catalog | null,
+	currentPlanKey?: string,
 ): RemedyOption[] {
 	if (remedy.kind === "addon" || remedy.kind === "plan_quantity") {
-		const upgradePlan = nextPlanForRequested(requestedPlan);
+		// The "upgrade the plan" alternative follows the current-plan ladder
+		// (free → shared, shared → dedicated_small, …) when we know the org's
+		// plan; otherwise it falls back to the requested-plan heuristic.
+		const upgradePlan = upgradeTargetPlan({ currentPlanKey, requestedPlan });
 		const planDef = (catalog?.plans ?? []).find(
 			(p) => (p.planKey ?? p.key) === upgradePlan,
 		);
@@ -1563,9 +1613,20 @@ export async function emitNeedsUpgrade(
 ): Promise<void> {
 	const message = err instanceof Error ? err.message : "Plan upgrade required";
 	const failedKey = extractEntitlementKeyFromError(err);
-	const catalog = (await fetchCatalogSafely(client)) as Catalog | null;
-	const remedy = resolveEntitlementRemedy(failedKey, catalog, { requestedPlan });
-	const options = buildRemedyOptions(remedy, requestedPlan, catalog);
+	const [catalog, currentPlanKey] = await Promise.all([
+		fetchCatalogSafely(client) as Promise<Catalog | null>,
+		getCurrentPlanKeySafely(client),
+	]);
+	const remedy = resolveEntitlementRemedy(failedKey, catalog, {
+		requestedPlan,
+		currentPlanKey,
+	});
+	const options = buildRemedyOptions(
+		remedy,
+		requestedPlan,
+		catalog,
+		currentPlanKey,
+	);
 
 	const hint =
 		options.length > 1
@@ -1682,6 +1743,7 @@ export async function promptUpgradeFromEntitlementError(
 	client: any,
 	err: unknown,
 	requestedPlan?: string,
+	currentPlanKey?: string,
 ): Promise<boolean> {
 	const catalog = await fetchCatalogSafely(client);
 	const allPlans: any[] = catalog?.plans ?? [];
@@ -1695,15 +1757,24 @@ export async function promptUpgradeFromEntitlementError(
 		return false;
 	}
 
+	// Recommend the next tier up from the org's current plan (free → Starter,
+	// shared → Pro Small, …). Only when that target isn't an upgradeable plan do
+	// we fall back to a plan whose grants cover the failed entitlement key.
 	const failedKey = extractEntitlementKeyFromError(err);
+	const ladderKey = upgradeTargetPlan({ currentPlanKey, requestedPlan });
+	const ladderPlan = upgradeable.find(
+		(p) => (p.planKey || p.key) === ladderKey,
+	);
 	const matchingPlan = failedKey
 		? upgradeable.find((p) =>
 				p.grants?.some((g: any) => g.entitlementKey === failedKey),
 			)
 		: undefined;
-	const recommendedKey: string | undefined = matchingPlan
-		? (matchingPlan.planKey || matchingPlan.key)
-		: inferSuggestedPlan(requestedPlan);
+	const recommendedKey: string | undefined = ladderPlan
+		? ladderKey
+		: matchingPlan
+			? (matchingPlan.planKey || matchingPlan.key)
+			: inferSuggestedPlan(requestedPlan);
 
 	// Details block printed before the selector so users can read full
 	// price + includes lines (inquirer's list collapses each choice to

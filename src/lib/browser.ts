@@ -1,5 +1,5 @@
 import open from "open";
-import { isJsonMode, isNonInteractiveMode } from "./output.js";
+import { colors, isJsonMode, isNonInteractiveMode, log } from "./output.js";
 
 /**
  * Whether a browser can plausibly be launched from this process. A non-TTY
@@ -14,6 +14,34 @@ export function canLaunchBrowser(): boolean {
 		return true;
 	}
 	return Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+}
+
+/**
+ * Launch `url` in the user's default browser for an interactive flow and always
+ * print it as a copy/paste fallback, so a silent launch failure (common over
+ * SSH/WSL, or when `xdg-open` exits 0 without raising a window) never strands
+ * the user. Returns whether the launch was attempted and succeeded. Skips the
+ * launch — but still prints the URL — when no GUI is reachable or the caller
+ * opted out via `noOpen`. `--json` callers should surface the URL through their
+ * structured envelope instead of calling this (it prints nothing in JSON mode).
+ */
+export async function openInBrowser(
+	url: string,
+	opts?: { hint?: string; noOpen?: boolean },
+): Promise<boolean> {
+	if (!isJsonMode()) {
+		log(
+			colors.dim(opts?.hint ?? "If the browser didn't open, visit this URL:"),
+		);
+		log(`  ${colors.cyan(url)}`);
+	}
+	if (opts?.noOpen || !canLaunchBrowser()) return false;
+	try {
+		await open(url);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -33,7 +61,18 @@ export function paymentBrowserOpener(opts?: {
 		try {
 			await open(url);
 		} catch {
-			// Headless / no display — caller surfaces the URL textually.
+			// A display was reported reachable but the launch still failed (no
+			// default browser, xdg-open missing, sandboxed spawn). Don't fail the
+			// purchase — but say so, instead of swallowing silently, so the user
+			// knows to use the payment link printed by the caller. Stay quiet in
+			// `--json` so the structured envelope isn't polluted.
+			if (!isJsonMode()) {
+				log(
+					colors.dim(
+						"Couldn't open the browser automatically — use the payment link to complete checkout.",
+					),
+				);
+			}
 		}
 	};
 }

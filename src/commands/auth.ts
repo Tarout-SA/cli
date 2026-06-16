@@ -1,8 +1,7 @@
 import type { Command } from "commander";
-import open from "open";
 import { startAuthServer } from "../lib/auth-server.js";
 import { resolveProfileFromCredential } from "../lib/auth-profile.js";
-import { canLaunchBrowser } from "../lib/browser.js";
+import { canLaunchBrowser, openInBrowser } from "../lib/browser.js";
 import {
 	clearConfig,
 	getApiUrl,
@@ -88,15 +87,14 @@ export function registerAuthCommands(program: Command) {
 					const authServer = await startAuthServer();
 					const callbackUrl = `http://localhost:${authServer.port}/callback?state=${encodeURIComponent(authServer.state)}`;
 
-				// Open browser to auth page
+				// Open browser to auth page. The launch may silently no-op (SSH/WSL,
+				// missing xdg-open) — openInBrowser also prints the URL so the user
+				// can complete auth by pasting it, while the callback server keeps
+				// waiting below.
 				const authUrl = `${apiUrl}/cli-authorize?callback=${encodeURIComponent(callbackUrl)}`;
-
-				try {
-					await open(authUrl);
-				} catch {
-					authServer.close();
-					refuseBrowserAuthForAgent("login");
-				}
+				await openInBrowser(authUrl, {
+					hint: "If the browser didn't open, visit this URL to authenticate:",
+				});
 
 				const _spinner = startSpinner("Waiting for authentication...");
 
@@ -227,13 +225,9 @@ export function registerAuthCommands(program: Command) {
 					const authServer = await startAuthServer();
 					const callbackUrl = `http://localhost:${authServer.port}/callback?state=${encodeURIComponent(authServer.state)}`;
 				const authUrl = `${apiUrl}/cli-authorize?action=register&callback=${encodeURIComponent(callbackUrl)}`;
-
-				try {
-					await open(authUrl);
-				} catch {
-					authServer.close();
-					refuseBrowserAuthForAgent("register");
-				}
+				await openInBrowser(authUrl, {
+					hint: "If the browser didn't open, visit this URL to create your account:",
+				});
 
 				const _spinner = startSpinner("Waiting for account creation...");
 

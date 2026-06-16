@@ -6,6 +6,7 @@ import {
 	finalizeBillingMutation,
 	performBillingChange,
 	pollCheckoutUntilTerminal,
+	storageSlotTierForAddonKey,
 } from "../lib/billing-upgrade.js";
 import {
 	paymentBrowserOpener,
@@ -56,6 +57,43 @@ function reportBillingResult(
 function isConflictError(err: unknown): boolean {
 	const e = err as { code?: string; data?: { code?: string } };
 	return (e?.code ?? e?.data?.code) === "CONFLICT";
+}
+
+/**
+ * Best-effort prorated amount-due (in halalas) for adding `quantity` of an
+ * addon. Used only to decide whether an agent context can auto-confirm the
+ * hosted checkout (a positive charge sends consent to the payment page). Returns
+ * `undefined` if the preview can't be fetched — callers then fall back to the
+ * explicit confirm prompt rather than auto-confirming.
+ */
+async function previewAddonAmountDue(
+	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
+	client: any,
+	addonKey: string,
+	quantity: number,
+): Promise<number | undefined> {
+	try {
+		// Per-tier storage bucket slots aren't `purchaseAddons` lines (that path
+		// rejects them via `assertResourceAddonsMatchPlan`), so price them from the
+		// catalog instead — enough to know it's a paid checkout for auto-confirm.
+		if (storageSlotTierForAddonKey(addonKey)) {
+			const catalog = await client.subscription.getCatalog.query();
+			const addon = (catalog?.addons ?? []).find(
+				(a: any) => (a.key ?? a.addonKey) === addonKey,
+			);
+			return typeof addon?.priceHalalas === "number"
+				? addon.priceHalalas * quantity
+				: undefined;
+		}
+		const preview = await client.subscription.previewAddonsPurchase.query({
+			items: [{ addonKey, quantity }],
+		});
+		return typeof preview?.totalProratedHalalas === "number"
+			? preview.totalProratedHalalas
+			: undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 export function registerBillingCommands(program: Command) {
@@ -606,30 +644,41 @@ export function registerBillingCommands(program: Command) {
 				if (!isLoggedIn()) throw new AuthError();
 
 				const quantity = options.quantity || 1;
+				const client = getApiClient();
 
 				if (!shouldSkipConfirmation()) {
-					log("");
-					log(`Addon: ${colors.cyan(addonKey)}`);
-					log(`Quantity: ${quantity}`);
-					log("");
-
-					const confirmed = await confirm(
-						`Add addon "${addonKey}" × ${quantity}?`,
-						false,
-						{
-							field: "confirm_addon_add",
-							flag: "--yes",
-							context: { addonKey, quantity },
-						},
+					const amountDueHalalas = await previewAddonAmountDue(
+						client,
+						addonKey,
+						quantity,
 					);
+					if (shouldAutoConfirmPaidCheckout(amountDueHalalas)) {
+						log(
+							`\nAdding ${colors.cyan(addonKey)} × ${quantity} — opening the secure payment page...`,
+						);
+					} else {
+						log("");
+						log(`Addon: ${colors.cyan(addonKey)}`);
+						log(`Quantity: ${quantity}`);
+						log("");
 
-					if (!confirmed) {
-						log("Cancelled.");
-						return;
+						const confirmed = await confirm(
+							`Add addon "${addonKey}" × ${quantity}?`,
+							false,
+							{
+								field: "confirm_addon_add",
+								flag: "--yes",
+								context: { addonKey, quantity, amountDueHalalas },
+							},
+						);
+
+						if (!confirmed) {
+							log("Cancelled.");
+							return;
+						}
 					}
 				}
 
-				const client = getApiClient();
 				const _spinner = startSpinner("Adding addon...");
 
 				// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC result.
@@ -841,19 +890,37 @@ export function registerBillingCommands(program: Command) {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
 				const quantity = options.quantity || 1;
+				const client = getApiClient();
+
 				if (!shouldSkipConfirmation()) {
-					log(`\nPurchase ${quantity}× ${colors.cyan(addonKey)}?`);
-					const confirmed = await confirm("Proceed?", false, {
-						field: "confirm_addon_buy",
-						flag: "--yes",
-						context: { addonKey, quantity },
-					});
-					if (!confirmed) {
-						log("Cancelled.");
-						return;
+					const amountDueHalalas = await previewAddonAmountDue(
+						client,
+						addonKey,
+						quantity,
+					);
+					// Parity with `billing upgrade`: a paid addon goes through the
+					// StreamPay hosted checkout, which is the real consent surface. In
+					// a non-TTY agent context that can open a browser, skip the local
+					// y/n (it would otherwise halt with `needs_input`) and let the
+					// payment page collect consent. `--json` keeps the structured
+					// handoff; net-zero charges still confirm.
+					if (shouldAutoConfirmPaidCheckout(amountDueHalalas)) {
+						log(
+							`\nPurchasing ${quantity}× ${colors.cyan(addonKey)} — opening the secure payment page...`,
+						);
+					} else {
+						log(`\nPurchase ${quantity}× ${colors.cyan(addonKey)}?`);
+						const confirmed = await confirm("Proceed?", false, {
+							field: "confirm_addon_buy",
+							flag: "--yes",
+							context: { addonKey, quantity, amountDueHalalas },
+						});
+						if (!confirmed) {
+							log("Cancelled.");
+							return;
+						}
 					}
 				}
-				const client = getApiClient();
 				const _spinner = startSpinner("Purchasing addon...");
 				const result = await performBillingChange(client, {
 					kind: "addon",

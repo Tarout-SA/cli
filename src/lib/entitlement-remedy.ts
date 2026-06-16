@@ -13,7 +13,15 @@
  * Resolution is catalog-driven where possible (find the plan/addon whose
  * `grants` include the failed key), with deterministic prefix fallbacks so it
  * still produces a sensible command when the catalog can't be fetched.
+ *
+ * Plan-upgrade targets follow the org's CURRENT plan family — free → shared,
+ * shared → dedicated_small, dedicated_small → _medium → _large — so the
+ * "upgrade the plan" path always moves *up* a tier. (`requestedPlan`, the plan
+ * the user asked to deploy as, is only a fallback when the current plan is
+ * unknown.)
  */
+
+import { planFamily } from "./plan-cart.js";
 
 export type RemedyKind = "plan" | "addon" | "plan_quantity";
 
@@ -77,10 +85,53 @@ export function nextPlanForRequested(requested?: string): string {
 	return r;
 }
 
+/**
+ * The next tier *up* from the org's CURRENT plan — this is the "upgrade the
+ * plan" ladder the user asked for:
+ *   free / none    → shared (Starter)
+ *   shared family  → dedicated_small (Pro Small)
+ *   dedicated_small → dedicated_medium
+ *   dedicated_medium → dedicated_large
+ *   dedicated_large → dedicated_large (already the top tier)
+ * Unlike {@link nextPlanForRequested} (which never escalates shared → dedicated)
+ * this always moves up so the upgrade option is a real change.
+ */
+export function nextPlanForCurrent(currentPlanKey?: string): string {
+	const family = planFamily(currentPlanKey);
+	if (family === "SHARED") return "dedicated_small";
+	if (family === "DEDICATED") {
+		const k = (currentPlanKey ?? "").trim().toLowerCase();
+		if (k === "dedicated_large") return "dedicated_large";
+		if (k === "dedicated_medium") return "dedicated_large";
+		// bare "dedicated" or "dedicated_small"
+		return "dedicated_medium";
+	}
+	// FREE / unknown → first paid tier.
+	return "shared";
+}
+
+/**
+ * The plan key the "upgrade the plan" option should target. Prefer the
+ * current-plan ladder when the caller knows the org's plan; otherwise fall back
+ * to the requested-plan heuristic (keeps behavior stable for callers/tests that
+ * don't pass `currentPlanKey`).
+ */
+export function upgradeTargetPlan(opts?: {
+	currentPlanKey?: string;
+	requestedPlan?: string;
+}): string {
+	if (opts?.currentPlanKey) return nextPlanForCurrent(opts.currentPlanKey);
+	return nextPlanForRequested(opts?.requestedPlan);
+}
+
 export function resolveEntitlementRemedy(
 	failedKey: string | undefined,
 	catalog: Catalog | null,
-	opts?: { requestedPlan?: string; currentSharedQuantity?: number },
+	opts?: {
+		requestedPlan?: string;
+		currentPlanKey?: string;
+		currentSharedQuantity?: number;
+	},
 ): EntitlementRemedy {
 	const plans = catalog?.plans ?? [];
 	const addons = catalog?.addons ?? [];
@@ -104,10 +155,14 @@ export function resolveEntitlementRemedy(
 	// app.dedicated.slots / host.* → (bigger) dedicated plan.
 	if (failedKey?.startsWith("app.dedicated") || failedKey?.startsWith("host.")) {
 		const requested = opts?.requestedPlan;
+		// On a dedicated plan already → escalate to the next dedicated tier.
+		// Otherwise honor an explicit dedicated request, else the smallest Pro.
 		const target =
-			requested && requested.toLowerCase().startsWith("dedicated")
-				? nextPlanForRequested(requested)
-				: "dedicated_small";
+			planFamily(opts?.currentPlanKey) === "DEDICATED"
+				? nextPlanForCurrent(opts?.currentPlanKey)
+				: requested && requested.toLowerCase().startsWith("dedicated")
+					? nextPlanForRequested(requested)
+					: "dedicated_small";
 		const plan = plans.find((p) => planKeyOf(p) === target);
 		return {
 			kind: "plan",
@@ -126,7 +181,7 @@ export function resolveEntitlementRemedy(
 	// `addon:buy db.free`. The only ways to get another are to free the existing
 	// one or move to a paid plan (which unlocks the paid resource addons).
 	if (failedKey === "db.free.slots" || failedKey === "storage.free.slots") {
-		const target = nextPlanForRequested(opts?.requestedPlan);
+		const target = upgradeTargetPlan(opts);
 		const plan = plans.find((p) => planKeyOf(p) === target);
 		const resource =
 			failedKey === "db.free.slots" ? "database" : "storage bucket";
@@ -165,7 +220,7 @@ export function resolveEntitlementRemedy(
 	}
 
 	// app.free.slots, "no active subscription", or unmatched → plan upgrade.
-	const target = nextPlanForRequested(opts?.requestedPlan);
+	const target = upgradeTargetPlan(opts);
 	const plan = plans.find((p) => planKeyOf(p) === target);
 	return {
 		kind: "plan",

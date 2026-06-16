@@ -88,6 +88,34 @@ export interface FinalizeContext {
 	onCheckoutOpened?: (info: { orderId: string; paymentUrl: string }) => void;
 }
 
+/**
+ * Map a per-tier storage *slot* addon key to its tier for
+ * `storage.purchaseStorageSlot`. Returns null for anything else — including the
+ * metered per-GB `storage.gb` capacity addon, which is a real `purchaseAddons`
+ * line, not a bucket-slot purchase.
+ *
+ * Storage bucket slots (`storage.{starter,standard,pro}.slots`) are gated and
+ * sold differently from db/app: the generic `purchaseAddons` path runs
+ * `assertResourceAddonsMatchPlan`, which rejects `storage.standard` on a shared
+ * plan (it only allows `storage.gb`). The dashboard buys bucket slots through
+ * the dedicated `purchaseStorageSlot` mutation instead, so the CLI mirrors that
+ * here — same logic, same server endpoint.
+ */
+export function storageSlotTierForAddonKey(
+	addonKey: string,
+): "STARTER" | "STANDARD" | "PRO" | null {
+	switch (addonKey) {
+		case "storage.starter":
+			return "STARTER";
+		case "storage.standard":
+			return "STANDARD";
+		case "storage.pro":
+			return "PRO";
+		default:
+			return null;
+	}
+}
+
 function resolveTarget(input: PerformBillingChangeInput): string {
 	if (input.kind === "plan") return input.planKey ?? "";
 	if (input.kind === "addon") {
@@ -125,15 +153,31 @@ export async function performBillingChange(
 			addons: input.addons,
 		});
 	} else if (kind === "addon") {
-		const items =
-			input.addons ??
-			(input.addonKey
-				? [{ addonKey: input.addonKey, quantity: input.quantity ?? 1 }]
-				: []);
-		// Server contract: `purchaseAddons` takes `{ items }` (see
-		// validations/subscription.ts `purchaseAddonsInput`). `changePlan` is the
-		// one that takes `addons` — they are not interchangeable.
-		result = await client.subscription.purchaseAddons.mutate({ items });
+		// Per-tier storage bucket slots go through the dedicated
+		// `storage.purchaseStorageSlot` mutation (same path the dashboard uses),
+		// not `purchaseAddons` — which would reject `storage.standard`/`storage.pro`
+		// via `assertResourceAddonsMatchPlan`. Only the single-addon form is routed
+		// this way; a multi-line `addons` cart stays on `purchaseAddons`.
+		const storageTier =
+			!input.addons && input.addonKey
+				? storageSlotTierForAddonKey(input.addonKey)
+				: null;
+		if (storageTier) {
+			result = await client.storage.purchaseStorageSlot.mutate({
+				tier: storageTier,
+				quantity: input.quantity ?? 1,
+			});
+		} else {
+			const items =
+				input.addons ??
+				(input.addonKey
+					? [{ addonKey: input.addonKey, quantity: input.quantity ?? 1 }]
+					: []);
+			// Server contract: `purchaseAddons` takes `{ items }` (see
+			// validations/subscription.ts `purchaseAddonsInput`). `changePlan` is the
+			// one that takes `addons` — they are not interchangeable.
+			result = await client.subscription.purchaseAddons.mutate({ items });
+		}
 	} else {
 		result = await client.subscription.setPlanQuantity.mutate({
 			quantity: input.quantity,
