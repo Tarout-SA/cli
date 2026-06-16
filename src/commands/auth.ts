@@ -50,20 +50,93 @@ export function announceAuthUrl(
 	if (!canLaunchBrowser()) {
 		log(
 			colors.dim(
-				"On a remote/headless host? Run `tarout token <api-token>` instead — generate one at https://tarout.sa/dashboard/settings/profile.",
+				"On a remote/headless host? Run `tarout login --token <api-token>` instead — create one at https://tarout.sa/dashboard/agent/keys.",
 			),
 		);
 	}
+}
+
+/**
+ * Headless authentication with an existing API key. Shared by `tarout login
+ * --token` and `tarout token` — both resolve the key to a full profile (org,
+ * project, environment) and persist it as the `default` profile. Unlike browser
+ * `login`, this is an explicit re-auth and overwrites any existing session.
+ */
+export async function authenticateWithToken(
+	apiToken: string,
+	apiUrl: string,
+): Promise<void> {
+	const previous = isLoggedIn() ? getCurrentProfile() : null;
+
+	const _spinner = startSpinner("Verifying token...");
+	let profile: Awaited<ReturnType<typeof resolveProfileFromCredential>>;
+	try {
+		profile = await resolveProfileFromCredential({ token: apiToken, apiUrl });
+	} catch (err) {
+		failSpinner("Token verification failed");
+		throw err;
+	}
+	succeedSpinner("Token verified!");
+
+	setProfile("default", profile);
+	setCurrentProfile("default");
+
+	const replacedEmail =
+		previous && previous.userEmail && previous.userEmail !== profile.userEmail
+			? previous.userEmail
+			: undefined;
+
+	if (isJsonMode()) {
+		outputData({
+			success: true,
+			replacedProfile: replacedEmail ? { userEmail: replacedEmail } : undefined,
+			user: {
+				id: profile.userId,
+				email: profile.userEmail,
+				name: profile.userName,
+			},
+			organization: {
+				id: profile.organizationId,
+				name: profile.organizationName,
+			},
+			environment: {
+				id: profile.environmentId,
+				name: profile.environmentName,
+			},
+		});
+		return;
+	}
+
+	log("");
+	if (replacedEmail) {
+		log(colors.dim(`Replaced previous session for ${replacedEmail}.`));
+	}
+	success(`Authenticated as ${colors.cyan(profile.userEmail)}`);
+	box("Account", [
+		`Organization: ${colors.bold(profile.organizationName || "None")}`,
+		`Environment: ${colors.bold(profile.environmentName || "None")}`,
+	]);
 }
 
 export function registerAuthCommands(program: Command) {
 	// Login command
 	program
 		.command("login")
-		.description("Authenticate with Tarout via browser")
+		.description("Authenticate with Tarout via browser, or headlessly with --token")
 		.option("--api-url <url>", "Custom API URL", "https://tarout.sa")
+		.option(
+			"--token <api-token>",
+			"Authenticate with an existing API key instead of opening the browser (for headless/CI). Create one at /dashboard/agent/keys",
+		)
 		.action(async (options) => {
 			try {
+				// Headless path: a pasted API key skips the browser entirely and is an
+				// explicit re-auth, so it overwrites any current session.
+				if (options.token) {
+					await authenticateWithToken(options.token, options.apiUrl);
+					return;
+				}
+
 				if (isLoggedIn()) {
 					const profile = getCurrentProfile();
 					if (profile) {
@@ -305,40 +378,7 @@ export function registerAuthCommands(program: Command) {
 		.option("--api-url <url>", "Custom API URL", "https://tarout.sa")
 		.action(async (apiToken, options) => {
 			try {
-				const apiUrl = options.apiUrl;
-				const _spinner = startSpinner("Verifying token...");
-
-				const profile = await resolveProfileFromCredential({
-					token: apiToken,
-					apiUrl,
-				});
-
-				succeedSpinner("Token verified!");
-
-				setProfile("default", profile);
-				setCurrentProfile("default");
-
-				if (isJsonMode()) {
-					outputData({
-						success: true,
-						user: {
-							id: profile.userId,
-							email: profile.userEmail,
-							name: profile.userName,
-						},
-						organization: {
-							id: profile.organizationId,
-							name: profile.organizationName,
-						},
-					});
-				} else {
-					log("");
-					success(`Authenticated as ${colors.cyan(profile.userEmail)}`);
-					box("Account", [
-						`Organization: ${colors.bold(profile.organizationName || "None")}`,
-						`Environment: ${colors.bold(profile.environmentName || "None")}`,
-					]);
-				}
+				await authenticateWithToken(apiToken, options.apiUrl);
 			} catch (err) {
 				handleError(err);
 			}
