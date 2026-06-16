@@ -5,12 +5,16 @@
  * Writes an instruction block to the agent's memory file (CLAUDE.md for Claude,
  * AGENTS.md for codex/cursor/other) and, for Claude, merges Tarout permission
  * rules into `.claude/settings.local.json`:
- *   - an `allow` rule so read-only tarout commands run without prompts,
- *   - `ask` rules so deploys and paid/destructive commands PROMPT for in-editor
- *     approval (these run *before* the auto-mode classifier, which otherwise
- *     silently denies "production deploy" commands), and
- *   - an `autoMode` trust block so the classifier treats the user's own Tarout
- *     resources as trusted infrastructure instead of exfiltration targets.
+ *   - an `allow` rule (`Bash(tarout:*)`) so tarout commands — including deploys —
+ *     run without a permission-layer prompt,
+ *   - `ask` rules so only paid/destructive commands (billing, wallet, undeploy)
+ *     still prompt, and
+ *   - an `autoMode` trust block that declares Tarout the user's own infrastructure
+ *     and explicitly authorizes `tarout` deploys, so the auto-mode classifier (a
+ *     separate gate that soft-denies "production deploy" / `--yes` blind-apply by
+ *     default) lets them through hands-free. The classifier is a judgment layer,
+ *     so a deploy can still be denied; the CLAUDE.md block then tells the agent to
+ *     hand it to the user rather than retry or self-edit settings.
  * Pure file I/O, no auth/network — all paths derive from the passed `cwd` so
  * tests can run against a temp dir.
  * @module lib/agent-scaffold
@@ -32,18 +36,16 @@ export const AGENT_TYPES: readonly AgentType[] = [
 export const TAROUT_ALLOW_ENTRY = "Bash(tarout:*)";
 
 /**
- * `ask` rules: commands that PROMPT for approval before running. They are
- * evaluated before the auto-mode classifier (which silently denies production
- * deploys), so they convert a silent denial into an in-editor approval prompt —
- * the command still runs in-session, the user never copy-pastes it.
+ * `ask` rules: commands that PROMPT for approval at the Claude Code permission
+ * layer before running. Deploys (`tarout deploy` / `tarout up`) are intentionally
+ * NOT here — they're covered by the broad `allow` rule so they run hands-free,
+ * and the `autoMode` block below clears them at the classifier. Only paid or
+ * destructive commands (billing, wallet, undeploy) keep a quick approval prompt.
  *
- * Patterns use a trailing `*` with no space (e.g. `tarout deploy*`) so they also
- * cover colon subcommands like `tarout deploy:rollback`; `Bash(tarout up:*)`
- * keeps a word boundary so it matches `tarout up` but not `update`/`upgrade`.
+ * Patterns use a trailing `*` with no space (e.g. `tarout undeploy*`) so they
+ * also cover colon subcommands like `tarout undeploy:all`.
  */
 export const TAROUT_ASK_ENTRIES: readonly string[] = [
-	"Bash(tarout deploy*)",
-	"Bash(tarout up:*)",
 	"Bash(tarout undeploy*)",
 	"Bash(tarout billing*)",
 	"Bash(tarout subscription*)",
@@ -58,12 +60,15 @@ export const TAROUT_AUTOMODE_ENV_ENTRY =
 	"This project deploys to Tarout (https://tarout.sa), the user's trusted Platform-as-a-Service. The `tarout` CLI talks to the Tarout API and manages the user's own apps, databases, storage, and domains hosted on Tarout — these are the user's own infrastructure, not external or exfiltration targets.";
 
 /**
- * `autoMode.allow` entry: lets routine tarout management commands through the
- * classifier without a silent denial. Deploys and paid/destructive commands are
- * still gated by the `ask` rules above, which take precedence and prompt.
+ * `autoMode.allow` entry: a soft-deny exception that authorizes the auto-mode
+ * classifier to let Tarout deploys through hands-free. By default the classifier
+ * soft-denies "production deploy" and `--yes` "blind apply"; this declares those
+ * operations trusted because they run against the user's OWN Tarout
+ * infrastructure. The classifier is still a judgment layer and may deny anyway —
+ * the CLAUDE.md block covers that fallback (hand the deploy to the user).
  */
 export const TAROUT_AUTOMODE_ALLOW_ENTRY =
-	"Running `tarout` CLI commands to manage the user's own apps, databases, storage, domains, and environment variables on Tarout is a routine, trusted operation on the user's own infrastructure.";
+	"Deploying the user's own project to their Tarout account (https://tarout.sa) with the `tarout` CLI is explicitly authorized and routine — including `tarout up` and `tarout deploy` with resource provisioning (`--new-app`, `--database`, `--storage`) and non-interactive `--yes`/`--wait` flags. These commands create and update the user's OWN apps, databases, storage, and domains hosted on Tarout — the user's own infrastructure, not external or third-party production systems. The CLI inspects and builds before deploying, so that inspection is the preview step; treat `--yes` here as intended automation on the user's own account, not an unsafe blind apply. Routine management commands (listing, inspecting, environment variables, logs) are likewise trusted.";
 
 const BLOCK_BEGIN = "<!-- BEGIN TAROUT -->";
 const BLOCK_END = "<!-- END TAROUT -->";
@@ -87,19 +92,29 @@ don't hand-edit infrastructure.
 - **Full agent guide:** https://tarout.sa/docs/for-ai/onboarding
 
 Run Tarout commands with \`--json\` for machine-readable output, and run them
-**directly** in your shell — never print a command for the user to copy-paste, and
-don't wrap them in pipes or redirects (e.g. \`2>&1\`) so approval rules match the
-command. New apps and databases automatically use your org's **subscribed tier** —
-don't pass \`--plan free\` / \`--database-plan free\`. \`tarout login\` opens the browser
-for you; the user just signs in.
+**directly** in your shell (don't wrap them in pipes or redirects like \`2>&1\`, so
+approval rules match the command). New apps and databases automatically use your
+org's **subscribed tier** — don't pass \`--plan free\` / \`--database-plan free\`.
+\`tarout login\` opens the browser for you; the user just signs in. On a headless or
+CI host with no browser, log in with \`tarout login --token <key>\` — create a key at
+https://tarout.sa/dashboard/agent/keys.
 
-Deploys and paid or destructive commands (\`tarout deploy\`, \`tarout up\`,
-\`tarout billing …\`, \`tarout undeploy\`) pop an in-editor approval prompt before they
-run — this is expected. Run the command and let the user approve it in place; do
-**not** fall back to asking the user to run it themselves. A \`NEEDS_UPGRADE\` error
-means the org is out of slots for its tier: surface the two options (buy the add-on
-vs upgrade the plan) and let the user pick — the chosen command opens the payment
-page and waits until it's confirmed.
+**Deploys run hands-free.** \`tarout agent init\` set this project up so \`tarout up\`
+and \`tarout deploy\` run without an approval prompt, and it declares Tarout as the
+user's own trusted infrastructure so the auto-mode classifier clears deploys. So
+just run the deploy directly (e.g. \`tarout up --json --yes\` or \`tarout deploy
+--wait\`) and read the JSON result's \`success\` / \`data.url\`. Paid or destructive
+commands (\`tarout billing …\`, \`tarout wallet …\`, \`tarout undeploy\`) still pop a
+quick approval prompt — run them directly and let the user approve in place.
+
+If a deploy ever comes back **"Denied by auto mode classifier"** (the classifier
+can still override the project config), do **not** retry it unchanged and do **not**
+edit \`.claude/settings*.json\` to self-approve — both are blocked on purpose. Ask the
+user to approve it instead: in the permission dialog / \`/permissions\`, or by running
+it inline with a leading \`!\` (e.g. \`! tarout deploy --wait\`). Continue once it
+succeeds. A \`NEEDS_UPGRADE\` error means the org is out of slots for its tier:
+surface the two options (buy the add-on vs upgrade the plan) and let the user pick —
+the chosen command opens the payment page and waits until it's confirmed.
 ${BLOCK_END}`;
 
 export type FileAction =
@@ -230,10 +245,10 @@ function applyTaroutRules(settings: ClaudeSettings): boolean {
 
 /**
  * True when `.claude/settings.local.json` under `cwd` already carries the Tarout
- * allow rule *and* every ask rule — i.e. the agent can run tarout commands with
- * read-only ones auto-approved and deploys prompting instead of being blocked.
- * A partial (allow-only) config returns false so onboarding re-runs and upgrades
- * it. Used to decide whether onboarding still needs `tarout agent init`.
+ * allow rule *and* every ask rule — i.e. tarout commands (including deploys) are
+ * auto-approved and only paid/destructive commands keep an ask prompt. A partial
+ * (allow-only) config returns false so onboarding re-runs and upgrades it. Used
+ * to decide whether onboarding still needs `tarout agent init`.
  */
 export function hasTaroutAgentConfig(cwd: string): boolean {
 	const settingsPath = join(cwd, ".claude", "settings.local.json");

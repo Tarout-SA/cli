@@ -21,7 +21,7 @@ import {
 } from "./output.js";
 
 const SETUP_HINT =
-	"Run `tarout agent init` to set up Tarout permissions: read-only commands run without prompts, and deploys/paid actions ask for in-editor approval instead of being blocked.";
+	"Run `tarout agent init` to set up Tarout permissions: tarout commands (including deploys) run without prompts and are declared trusted for auto mode; only paid/destructive actions (billing, wallet, undeploy) keep a quick approval prompt.";
 
 /** An agent (not a human at a TTY) is driving when JSON or non-interactive mode is on. */
 export function isAgentDriven(): boolean {
