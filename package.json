@@ -18,6 +18,10 @@
 		"dev": "tsup src/index.ts src/mcp/stdio.ts --format esm --watch",
 		"typecheck": "tsc --noEmit",
 		"lint": "biome check src/",
+		"test": "vitest run && bun test",
+		"test:vitest": "vitest run",
+		"test:bun": "bun test",
+		"test:watch": "vitest",
 		"start": "node dist/index.js",
 		"prepublishOnly": "bun run build"
 	},
@@ -41,7 +45,8 @@
 		"@types/node": "^22.0.0",
 		"@types/ws": "^8.5.10",
 		"tsup": "^8.3.0",
-		"typescript": "^5.6.0"
+		"typescript": "^5.6.0",
+		"vitest": "^1.6.1"
 	},
 	"engines": {
 		"node": ">=18.0.0"

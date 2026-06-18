@@ -1,0 +1,6 @@
+# `bun test` runs ONLY the bun:test-native specs under __test__/bun. They use
+# bun's `mock.module` to stub the `open` package by its resolved path — a bun
+# runner feature Vitest can't replicate cleanly. Everything else runs under
+# Vitest (`bun run test:vitest`). `bun run test` runs both.
+[test]
+root = "./__test__/bun"

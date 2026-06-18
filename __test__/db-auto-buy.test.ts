@@ -1,0 +1,216 @@
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ensureDatabasePlan } from "../src/commands/deploy";
+import { setGlobalOptions } from "../src/lib/output";
+
+/**
+ * `ensureDatabasePlan` defaults a new database to the org's subscribed tier and
+ * auto-buys the plan-matched managed db add-on when there's no open slot. These
+ * tests drive it with a scripted fake tRPC client — no DB, no payment gateway.
+ *
+ * Display is forced OFF so the auto-buy path's injected `paymentBrowserOpener()`
+ * is `undefined` (canLaunchBrowser() === false) and never spawns a real browser;
+ * the purchase still runs through the billing engine against the fake client.
+ */
+
+type Tier = {
+	tier: string;
+	canCreate: boolean;
+	limit: number;
+	available: number;
+	monthlyHalalas: number;
+};
+
+function tier(
+	t: string,
+	limit: number,
+	used: number,
+	monthlyHalalas: number,
+): Tier {
+	return {
+		tier: t,
+		limit,
+		available: Math.max(0, limit - used),
+		canCreate: used < limit,
+		monthlyHalalas,
+	};
+}
+
+function fakeClient(opts: {
+	planKey?: string | null;
+	tiers?: Tier[];
+	purchaseAddons?: unknown;
+	pollStatus?: {
+		status: "PENDING" | "PAID" | "FAILED" | "EXPIRED";
+		failureReason?: string | null;
+	};
+	onPurchase?: (input: unknown) => void;
+	onTiers?: () => void;
+}) {
+	return {
+		subscription: {
+			getCurrent: {
+				query: async () => ({ planKey: opts.planKey ?? "free" }),
+			},
+			purchaseAddons: {
+				mutate: async (input: unknown) => {
+					opts.onPurchase?.(input);
+					return opts.purchaseAddons ?? { applied: true };
+				},
+			},
+			pollCheckoutStatus: {
+				query: async () => ({
+					orderId: "o",
+					status: opts.pollStatus?.status ?? "PENDING",
+					paidAt: null,
+					failedAt: null,
+					failureReason: opts.pollStatus?.failureReason ?? null,
+				}),
+			},
+		},
+		postgres: {
+			getEntitlements: {
+				query: async () => {
+					opts.onTiers?.();
+					return { tiers: opts.tiers ?? [] };
+				},
+			},
+		},
+	};
+}
+
+const savedDisplay = process.env.DISPLAY;
+const savedWayland = process.env.WAYLAND_DISPLAY;
+
+beforeEach(() => {
+	// Agent context, no browser → auto-buy never launches a real one.
+	setGlobalOptions({ json: true, nonInteractive: true });
+	delete process.env.DISPLAY;
+	delete process.env.WAYLAND_DISPLAY;
+});
+
+afterEach(() => {
+	setGlobalOptions({ json: false, nonInteractive: false });
+	if (savedDisplay === undefined) delete process.env.DISPLAY;
+	else process.env.DISPLAY = savedDisplay;
+	if (savedWayland === undefined) delete process.env.WAYLAND_DISPLAY;
+	else process.env.WAYLAND_DISPLAY = savedWayland;
+});
+
+describe("ensureDatabasePlan", () => {
+	it("Starter org with no open DB slot → auto-buys db.standard, resolves STANDARD", async () => {
+		let purchased: unknown;
+		const client = fakeClient({
+			planKey: "shared",
+			tiers: [
+				tier("FREE", 0, 0, 0),
+				tier("STARTER", 0, 0, 2900),
+				tier("STANDARD", 0, 0, 4900),
+				tier("PRO", 0, 0, 9900),
+			],
+			purchaseAddons: { applied: true },
+			onPurchase: (i) => {
+				purchased = i;
+			},
+		});
+		const r = await ensureDatabasePlan(client, undefined);
+		expect(r).toEqual({ ok: true, plan: "STANDARD" });
+		// db.standard (not db.starter) — the key assertResourceAddonsMatchPlan accepts on Shared.
+		expect(purchased).toEqual({
+			items: [{ addonKey: "db.standard", quantity: 1 }],
+		});
+	});
+
+	it("Dedicated org with a bundled db.standard slot → STANDARD, NO purchase", async () => {
+		let purchaseCalled = false;
+		const client = fakeClient({
+			planKey: "dedicated_small",
+			tiers: [
+				tier("FREE", 0, 0, 0),
+				tier("STARTER", 0, 0, 2900),
+				tier("STANDARD", 5, 0, 4900), // bundled with the dedicated plan
+				tier("PRO", 0, 0, 9900),
+			],
+			onPurchase: () => {
+				purchaseCalled = true;
+			},
+		});
+		const r = await ensureDatabasePlan(client, undefined);
+		expect(r).toEqual({ ok: true, plan: "STANDARD" });
+		expect(purchaseCalled).toBe(false); // never buys db.pro when db.standard is free
+	});
+
+	it("Dedicated org with bundled db.standard exhausted → auto-buys db.pro, resolves PRO", async () => {
+		let purchased: unknown;
+		const client = fakeClient({
+			planKey: "dedicated_small",
+			tiers: [tier("STANDARD", 5, 5, 4900), tier("PRO", 0, 0, 9900)],
+			purchaseAddons: { applied: true },
+			onPurchase: (i) => {
+				purchased = i;
+			},
+		});
+		const r = await ensureDatabasePlan(client, undefined);
+		expect(r).toEqual({ ok: true, plan: "PRO" });
+		expect(purchased).toEqual({ items: [{ addonKey: "db.pro", quantity: 1 }] });
+	});
+
+	it("free org with an open free DB slot → FREE, no purchase", async () => {
+		let purchaseCalled = false;
+		const client = fakeClient({
+			planKey: "free",
+			tiers: [tier("FREE", 1, 0, 0), tier("STARTER", 0, 0, 2900)],
+			onPurchase: () => {
+				purchaseCalled = true;
+			},
+		});
+		const r = await ensureDatabasePlan(client, undefined);
+		expect(r).toEqual({ ok: true, plan: "FREE" });
+		expect(purchaseCalled).toBe(false);
+	});
+
+	it("explicit non-free tier wins — no tier lookup, no purchase", async () => {
+		let tiersCalled = false;
+		let purchaseCalled = false;
+		const client = fakeClient({
+			planKey: "shared",
+			onTiers: () => {
+				tiersCalled = true;
+			},
+			onPurchase: () => {
+				purchaseCalled = true;
+			},
+		});
+		const r = await ensureDatabasePlan(client, "PRO");
+		expect(r).toEqual({ ok: true, plan: "PRO" });
+		expect(tiersCalled).toBe(false);
+		expect(purchaseCalled).toBe(false);
+	});
+
+	it("explicit FREE on a paid org is dropped → resolves the org's real tier", async () => {
+		const client = fakeClient({
+			planKey: "shared",
+			tiers: [tier("FREE", 0, 0, 0), tier("STANDARD", 1, 0, 4900)],
+		});
+		const r = await ensureDatabasePlan(client, "FREE");
+		expect(r).toEqual({ ok: true, plan: "STANDARD" });
+	});
+
+	it("paid org whose auto-buy checkout does not complete → ok:false with the result", async () => {
+		const client = fakeClient({
+			planKey: "shared",
+			tiers: [tier("STANDARD", 0, 0, 4900)],
+			purchaseAddons: {
+				applied: false,
+				paymentUrl: "https://pay.test/x",
+				orderId: "o",
+			},
+			pollStatus: { status: "FAILED", failureReason: "card declined" },
+		});
+		const r = await ensureDatabasePlan(client, undefined);
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.result.status).toBe("failed");
+			expect(r.result.kind).toBe("addon");
+		}
+	});
+});
