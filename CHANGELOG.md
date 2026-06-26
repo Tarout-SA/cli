@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0]
+
+### Changed
+
+- **`tarout deploy` clears a tier/entitlement gate inline and resumes — no manual
+  re-run.** When a deploy hits a plan limit on an interactive terminal, it now
+  shows the arrow-key upgrade picker, opens the hosted checkout, and waits for
+  payment confirmation in the background; once the new plan is active the deploy
+  continues automatically on it. Previously it printed "run `tarout deploy` again"
+  and stopped. Non-interactive callers (`--json` / `--yes` / no TTY) are
+  unchanged — they still get the structured `NEEDS_UPGRADE` envelope and exit.
+
 ## [0.13.2]
 
 ### Changed
