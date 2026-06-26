@@ -2015,6 +2015,151 @@ export async function configureOptionalResources(
 	}
 }
 
+/**
+ * The provision-and-deploy phase of `tarout deploy`, split out so an entitlement
+ * gate can be cleared inline and the deploy *resumed* without a manual re-run.
+ * On a FORBIDDEN entitlement error we prompt the upgrade (interactive: arrow-key
+ * plan picker + background payment polling via {@link clearDeployEntitlementGate});
+ * once the new plan is active we loop and re-resolve the target on it — exactly
+ * what re-running `tarout deploy` would do, but seamless. A second gate after a
+ * fresh upgrade, or any non-interactive caller, is handed off via NEEDS_UPGRADE.
+ */
+async function deployResolvedTarget(
+	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
+	client: any,
+	profile: Profile,
+	appIdentifier: string | undefined,
+	options: DeployOptions,
+	inspection: ProjectInspection,
+	sourcePreference: SourcePreference,
+): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			const target = await resolveDeploymentTarget(
+				client,
+				profile,
+				appIdentifier,
+				options,
+				sourcePreference,
+			);
+			const { app, createdApp } = target;
+			const shouldUploadSource = resolveShouldUploadSource(
+				target,
+				sourcePreference,
+			);
+
+			if (createdApp) {
+				await configureOptionalResources(
+					client,
+					profile,
+					app,
+					options,
+					inspection,
+				);
+			}
+
+			if (shouldUploadSource) {
+				await uploadCurrentDirectorySource(
+					client,
+					app.applicationId,
+					app.name,
+				);
+			}
+
+			const _deploySpinner = startSpinner(`Deploying ${app.name}...`);
+
+			const result = await client.application.deployToCloud.mutate({
+				applicationId: app.applicationId,
+			});
+
+			if (options.wait || options.watch) {
+				await streamDeploymentWithLogs(
+					client,
+					result.deploymentId,
+					app.name,
+					app.applicationId,
+				);
+				return;
+			}
+
+			succeedSpinner("Deployment started!");
+
+			if (isJsonMode()) {
+				outputData({
+					deploymentId: result.deploymentId,
+					status: "deploying",
+				});
+			} else {
+				quietOutput(result.deploymentId);
+				log("");
+				log(`Deployment ID: ${colors.cyan(result.deploymentId)}`);
+				log("");
+				log("Deployment is running in the background.");
+				log(
+					`Check status: ${colors.dim(`tarout deploy:status ${app.applicationId.slice(0, 8)}`)}`,
+				);
+				log(
+					`View logs: ${colors.dim(`tarout deploy:logs ${result.deploymentId.slice(0, 8)}`)}`,
+				);
+				log("");
+			}
+			return;
+		} catch (err) {
+			if (!isEntitlementError(err)) throw err;
+
+			// Clear a gate inline only ONCE — a second gate after a fresh upgrade is
+			// handed off rather than looping on the payment page.
+			if (attempt === 0) {
+				// Returns once the plan is active (the prompt waits for payment);
+				// exits the process for a non-interactive caller or a user cancel.
+				await clearDeployEntitlementGate(client, err, options);
+				continue;
+			}
+			await emitNeedsUpgrade(client, err, options.plan, "tarout deploy");
+			exit(ExitCode.PERMISSION_DENIED);
+		}
+	}
+}
+
+/**
+ * Clear a deploy-time entitlement gate. Interactive TTY: print the failed-slot
+ * context, prompt the upgrade (arrow-key picker), and wait — the billing engine
+ * opens the hosted checkout and polls until payment is confirmed — then return
+ * so the caller resumes the deploy on the new plan. Non-interactive (JSON / no
+ * TTY / --yes) or a user cancel: emit the NEEDS_UPGRADE envelope and exit.
+ */
+async function clearDeployEntitlementGate(
+	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
+	client: any,
+	err: unknown,
+	options: DeployOptions,
+): Promise<void> {
+	if (isJsonMode() || isNonInteractiveMode() || shouldSkipConfirmation()) {
+		await emitNeedsUpgrade(client, err, options.plan, "tarout deploy");
+		exit(ExitCode.PERMISSION_DENIED);
+	}
+
+	const message = err instanceof Error ? err.message : "Plan upgrade required";
+	log("");
+	log(colors.warn(message));
+
+	// Free DB/storage slots are 1-per-org and granted only by the free plan, so
+	// "buy an addon" is a dead end. Name what's holding the slot first.
+	const failedKey = extractEntitlementKeyFromError(err);
+	if (failedKey === "db.free.slots" || failedKey === "storage.free.slots") {
+		await explainFreeResourceSlotExhaustion(client, failedKey);
+	}
+
+	const upgraded = await promptEntitlementRemedy(client, err, options.plan);
+	if (!upgraded) {
+		await emitNeedsUpgrade(client, err, options.plan, "tarout deploy");
+		exit(ExitCode.PERMISSION_DENIED);
+	}
+
+	log("");
+	log(colors.success("Plan updated — continuing the deployment..."));
+}
+
 async function resolveDatabaseChoice(
 	options: DeployOptions,
 	inspection: ProjectInspection,
@@ -3437,140 +3582,19 @@ export function registerDeployCommands(program: Command) {
 					await openGitProviderSetup();
 					return;
 				}
-				const target =
-					await resolveDeploymentTarget(
-						client,
-						profile,
-						appIdentifier,
-						options,
-						sourcePreference,
-					);
-				const { app, createdApp } = target;
-				const shouldUploadSource = resolveShouldUploadSource(
-					target,
+
+				// Provision + deploy. A tier/entitlement gate is cleared inline (an
+				// interactive upgrade picker that waits for payment confirmation) and
+				// the deploy resumes on the new plan — no manual re-run.
+				await deployResolvedTarget(
+					client,
+					profile,
+					appIdentifier,
+					options,
+					inspection,
 					sourcePreference,
 				);
-
-				if (createdApp) {
-					await configureOptionalResources(
-						client,
-						profile,
-						app,
-						options,
-						inspection,
-					);
-				}
-
-				if (shouldUploadSource) {
-					await uploadCurrentDirectorySource(
-						client,
-						app.applicationId,
-						app.name,
-					);
-				}
-
-				const _deploySpinner = startSpinner(`Deploying ${app.name}...`);
-
-				// Trigger deployment
-				const result = await client.application.deployToCloud.mutate({
-					applicationId: app.applicationId,
-				});
-
-				if (options.wait || options.watch) {
-					// Stream logs and wait for completion
-					await streamDeploymentWithLogs(
-						client,
-						result.deploymentId,
-						app.name,
-						app.applicationId,
-					);
-					return;
-				}
-
-				succeedSpinner("Deployment started!");
-
-				if (isJsonMode()) {
-					outputData({
-						deploymentId: result.deploymentId,
-						status: "deploying",
-					});
-				} else {
-					quietOutput(result.deploymentId);
-					log("");
-					log(`Deployment ID: ${colors.cyan(result.deploymentId)}`);
-					log("");
-					log("Deployment is running in the background.");
-					log(
-						`Check status: ${colors.dim(`tarout deploy:status ${app.applicationId.slice(0, 8)}`)}`,
-					);
-					log(
-						`View logs: ${colors.dim(`tarout deploy:logs ${result.deploymentId.slice(0, 8)}`)}`,
-					);
-					log("");
-				}
 			} catch (err) {
-				if (isEntitlementError(err)) {
-					const message =
-						err instanceof Error ? err.message : "Plan upgrade required";
-
-					// Any non-interactive context (JSON, no TTY, or --yes) gets the
-					// machine-readable NEEDS_UPGRADE envelope — which now lists BOTH
-					// the buy-addon and upgrade-plan options so the agent asks the
-					// human which to run rather than deciding. Only a real interactive
-					// TTY reaches the inline chooser below.
-					if (
-						isJsonMode() ||
-						isNonInteractiveMode() ||
-						shouldSkipConfirmation()
-					) {
-						await emitNeedsUpgrade(
-							getApiClient(),
-							err,
-							options.plan,
-							"tarout deploy",
-						);
-						exit(ExitCode.PERMISSION_DENIED);
-					}
-
-					log("");
-					log(colors.warn(message));
-
-					// Free DB/storage slots are 1-per-org and granted only by the free
-					// plan, so "buy an addon" is a dead end. Name what's holding the
-					// slot and steer to reuse/delete/upgrade before the plan picker.
-					const failedKey = extractEntitlementKeyFromError(err);
-					if (
-						failedKey === "db.free.slots" ||
-						failedKey === "storage.free.slots"
-					) {
-						await explainFreeResourceSlotExhaustion(getApiClient(), failedKey);
-					}
-
-					const upgraded = await promptEntitlementRemedy(
-						getApiClient(),
-						err,
-						options.plan,
-					);
-
-					if (!upgraded) {
-						await emitNeedsUpgrade(
-							getApiClient(),
-							err,
-							options.plan,
-							"tarout deploy",
-						);
-						exit(ExitCode.PERMISSION_DENIED);
-					}
-
-					// Don't resume from inside the catch — the deploy may have
-					// created partial state (app row, source upload). Re-running
-					// `tarout deploy` re-enters the resolver chain safely.
-					box("Billing updated", [
-						colors.success("Subscription updated."),
-						`Run ${colors.cyan("tarout deploy")} again to deploy on the new plan.`,
-					]);
-					return;
-				}
 				handleError(err);
 			}
 		});
