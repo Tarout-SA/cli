@@ -26,8 +26,6 @@ import {
 } from "../lib/entitlement-remedy.js";
 import {
 	AGENT_BILLING_PERMISSION_HINT,
-	type BillingChangeResult,
-	emitBillingResult,
 	type PerformBillingChangeInput,
 	performBillingChange,
 } from "../lib/billing-upgrade.js";
@@ -1365,7 +1363,7 @@ export async function promptEntitlementRemedy(
 		],
 		{
 			field: "entitlement_remedy",
-			flag: "--plan <key> (upgrade) | tarout billing addon:buy <key> (addon)",
+			flag: "--plan <key> (upgrade) | tarout billing plan:quantity <n> (add app slot)",
 			context: {
 				failedEntitlementKey: failedKey,
 				remedyKind: remedy.kind,
@@ -2193,23 +2191,17 @@ async function resolveResourcePlan(
 	});
 }
 
-/** The DB tier a managed db addon grants once purchased. */
-function dbTierForAddonKey(addonKey: string): ResourcePlan {
-	if (addonKey === "db.pro") return "PRO";
-	if (addonKey === "db.standard") return "STANDARD";
-	return "STARTER";
-}
-
 export type DbPlanResolution =
 	| { ok: true; plan: ResourcePlan }
-	| { ok: false; result: BillingChangeResult };
+	| { ok: false; failedKey: string; currentPlanKey?: string };
 
 /**
- * Decide the tier for a NEW database, defaulting to the org's subscribed tier
- * and AUTO-BUYING the plan-matched managed db add-on when the org has no open
- * slot (Starter→`db.standard`, Pro→`db.pro`). Decision-only and unit-testable:
- * never calls `process.exit`; returns `{ok:false, result}` when an auto-buy
- * checkout didn't complete so the caller can surface it.
+ * Decide the tier for a NEW database, defaulting to the org's subscribed tier.
+ * Decision-only and unit-testable: never calls `process.exit` and never buys
+ * anything. Add-ons are not sold standalone — an org uses only the db slots its
+ * plan already grants — so a paid org with no open slot resolves to
+ * `{ok:false}` carrying the exhausted entitlement key, and the caller surfaces
+ * a plan-upgrade prompt.
  *
  * Resolution order:
  *  1. An explicit tier wins — except explicit `FREE` on a paid org (the server
@@ -2217,8 +2209,9 @@ export type DbPlanResolution =
  *  2. Any creatable/owned slot is used as-is via {@link pickDefaultResourceTier}
  *     — this is what makes a Dedicated org use its BUNDLED `db.standard` slots
  *     (→ STANDARD) with NO purchase, and keeps a free org on FREE.
- *  3. A paid org with NO creatable slot buys the plan-matched add-on (Shared→
- *     `db.standard`), then creates on the granted tier.
+ *  3. A paid org with NO creatable slot needs a plan upgrade (no add-on buy):
+ *     return the exhausted db key off the org's owned/default tier so the
+ *     upgrade remedy reads as a real db gate.
  */
 export async function ensureDatabasePlan(
 	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
@@ -2226,8 +2219,7 @@ export async function ensureDatabasePlan(
 	requested: ResourcePlan | undefined,
 ): Promise<DbPlanResolution> {
 	const currentPlanKey = await getCurrentPlanKeySafely(client);
-	const addonKey = dbAddonKeyForPlanFamily(currentPlanKey);
-	const orgIsPaid = addonKey !== null;
+	const orgIsPaid = dbAddonKeyForPlanFamily(currentPlanKey) !== null;
 
 	// Explicit tier wins, except explicit FREE on a paid org → drop and resolve.
 	if (requested && !(requested === "FREE" && orgIsPaid)) {
@@ -2242,51 +2234,46 @@ export async function ensureDatabasePlan(
 		return { ok: true, plan: pickDefaultResourceTier(tiers) };
 	}
 
-	// Paid org with no open DB slot → buy the plan-matched managed db add-on.
-	if (!isJsonMode()) {
-		log("");
-		log(
-			colors.dim(
-				`Your plan has no open database slot — adding the ${addonKey} add-on. Complete payment in the browser to continue.`,
-			),
-		);
-	}
-	const result = await performBillingChange(client, {
-		kind: "addon",
-		addonKey: addonKey as string,
-		quantity: 1,
-		wait: true,
-		timeoutMs: 600_000,
-		openBrowser: paymentBrowserOpener(),
-		onCheckoutOpened: ({ orderId, paymentUrl }) => {
-			if (!isJsonMode()) {
-				log("");
-				log("Open this URL to complete payment:");
-				log(`  ${colors.cyan(paymentUrl)}`);
-				log(`Order ID: ${colors.dim(orderId)}`);
-			}
-		},
-	});
-	if (result.status === "applied" || result.status === "paid") {
-		return { ok: true, plan: dbTierForAddonKey(addonKey as string) };
-	}
-	return { ok: false, result };
+	// Paid org with no open DB slot → a plan upgrade is required (add-ons aren't
+	// sold standalone). Name the exhausted key off the org's owned/default tier.
+	const tier = pickDefaultResourceTier(tiers);
+	return {
+		ok: false,
+		failedKey: `db.${tier.toLowerCase()}.slots`,
+		currentPlanKey,
+	};
 }
 
 /**
- * {@link ensureDatabasePlan} + surface-and-exit glue for the create call sites:
- * on an incomplete auto-buy it emits the billing result and exits with the
- * matching code (resumable for a pending checkout, error for a hard failure) so
- * we never create a database the org couldn't pay for.
+ * {@link ensureDatabasePlan} + surface-and-exit glue for the create call sites.
+ * When the org has no open slot, add-ons aren't sold standalone, so instead of a
+ * purchase we surface the plan-upgrade remedy: the structured NEEDS_UPGRADE
+ * envelope in agent/JSON mode, or the interactive upgrade prompt on a TTY (after
+ * which we re-resolve). Either way we never create a database the org's plan
+ * doesn't allow.
  */
 export async function resolveDatabasePlanOrExit(
 	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
 	client: any,
 	requested: ResourcePlan | undefined,
+	retryCommand = "tarout db create",
 ): Promise<ResourcePlan> {
 	const resolution = await ensureDatabasePlan(client, requested);
 	if (resolution.ok) return resolution.plan;
-	exit(emitBillingResult(resolution.result, { label: "Database add-on" }));
+
+	const err = new Error(`Plan limit reached for ${resolution.failedKey}`);
+	if (isJsonMode() || isNonInteractiveMode() || shouldSkipConfirmation()) {
+		await emitNeedsUpgrade(client, err, undefined, retryCommand);
+		exit(ExitCode.PERMISSION_DENIED);
+	}
+
+	const upgraded = await promptEntitlementRemedy(client, err);
+	if (upgraded) {
+		const retry = await ensureDatabasePlan(client, requested);
+		if (retry.ok) return retry.plan;
+	}
+	await emitNeedsUpgrade(client, err, undefined, retryCommand);
+	exit(ExitCode.PERMISSION_DENIED);
 }
 
 async function createAndAttachDatabase(
@@ -2506,7 +2493,11 @@ async function resolveDatabaseProvisioning(
 	);
 
 	if (picked === "__create__") {
-		const plan = await resolveDatabasePlanOrExit(client, requestedPlan);
+		const plan = await resolveDatabasePlanOrExit(
+			client,
+			requestedPlan,
+			"tarout deploy --wait",
+		);
 		return {
 			action: "create",
 			plan,
@@ -3017,7 +3008,11 @@ async function buildDatabaseCreateDecision(
 	kind: "postgres" | "mysql",
 	requestedPlan: ResourcePlan | undefined,
 ): Promise<Extract<DatabaseDecision, { action: "create" }>> {
-	const plan = await resolveDatabasePlanOrExit(client, requestedPlan);
+	const plan = await resolveDatabasePlanOrExit(
+		client,
+		requestedPlan,
+		"tarout deploy --wait",
+	);
 	return {
 		action: "create",
 		plan,
