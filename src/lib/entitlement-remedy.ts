@@ -7,7 +7,7 @@
  * resolved by a plan switch.
  *   - `app.shared.slots`        → bump the quantity-aware Starter plan
  *   - `app.dedicated.slots`/host → upgrade to a (bigger) dedicated plan
- *   - `db.*` / `storage.*` slots → upgrade the plan (add-ons aren't sold standalone)
+ *   - `db.*` / `storage.*` slots → buy a resource addon
  *   - `app.free.slots` / none    → upgrade Free → a paid plan
  *
  * Resolution is catalog-driven where possible (find the plan/addon whose
@@ -69,6 +69,7 @@ export interface EntitlementRemedy {
 }
 
 const planKeyOf = (p: CatalogPlan): string => p.planKey ?? p.key ?? "";
+const addonKeyOf = (a: CatalogAddon): string => a.addonKey ?? a.key ?? "";
 
 /**
  * Best-effort next paid tier. Mirrors the historical `inferSuggestedPlan`
@@ -133,6 +134,7 @@ export function resolveEntitlementRemedy(
 	},
 ): EntitlementRemedy {
 	const plans = catalog?.plans ?? [];
+	const addons = catalog?.addons ?? [];
 
 	// app.shared.slots → quantity bump on the quantity-aware Starter plan.
 	if (failedKey?.startsWith("app.shared")) {
@@ -194,37 +196,26 @@ export function resolveEntitlementRemedy(
 		};
 	}
 
-	// db.* / storage.* / domain.* / email_service.* → plan upgrade.
-	//
-	// Add-ons are NOT sold standalone through the CLI: an org uses only the
-	// resource slots its plan already grants, and the only way to get more is to
-	// move up a tier. (The free-tier db/storage cases above carry a tailored
-	// "delete or upgrade" message.) So every paid-tier resource gate resolves to
-	// the same "upgrade the plan" remedy the free tier already used — never an
-	// `addon:buy`.
+	// db.* / storage.* / domain.* / email_service.* → resource addon.
 	if (
 		failedKey?.startsWith("db.") ||
 		failedKey?.startsWith("storage.") ||
 		failedKey?.startsWith("domain") ||
 		failedKey?.startsWith("email")
 	) {
-		const target = upgradeTargetPlan(opts);
-		const plan = plans.find((p) => planKeyOf(p) === target);
-		const resource = failedKey.startsWith("db.")
-			? "database"
-			: failedKey.startsWith("storage.")
-				? "storage bucket"
-				: failedKey.startsWith("domain")
-					? "custom domain"
-					: "email service";
+		const matched =
+			addons.find((a) =>
+				a.grants?.some((g) => g.entitlementKey === failedKey),
+			) ?? addons.find((a) => addonKeyOf(a) === failedKey.replace(/\.slots$/, ""));
+		const targetKey = matched ? addonKeyOf(matched) : failedKey.replace(/\.slots$/, "");
 		return {
-			kind: "plan",
+			kind: "addon",
 			failedKey,
-			targetKey: target,
-			targetName: plan?.name,
-			priceHalalas: plan?.priceHalalas,
-			command: `tarout billing upgrade ${target} --wait`,
-			hint: `Add-ons aren't sold separately — upgrade to ${plan?.name ?? target} to add another ${resource}.`,
+			targetKey,
+			targetName: matched?.name,
+			priceHalalas: matched?.priceHalalas,
+			command: `tarout billing addon:buy ${targetKey} --wait`,
+			hint: `Add a ${matched?.name ?? targetKey} slot with an addon purchase.`,
 		};
 	}
 

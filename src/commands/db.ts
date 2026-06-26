@@ -51,9 +51,9 @@ function normalizeDbPlan(value: string | undefined): ResourcePlan | undefined {
 	);
 }
 
-// An explicit --plan wins; otherwise default to the org's subscribed tier. When
-// a paid org has no open slot the shared resolver surfaces a plan-upgrade prompt
-// (add-ons aren't sold standalone); a Dedicated org's bundled slots are used as-is.
+// An explicit --plan wins; otherwise default to the org's subscribed tier and
+// auto-buy the plan-matched managed db add-on when there's no open slot (the
+// shared resolver handles Free/Starter/Pro + the Dedicated bundled-slot case).
 async function resolveDbPlan(
 	client: any,
 	explicit: string | undefined,
@@ -266,13 +266,14 @@ export function registerDbCommands(program: Command) {
 				}
 				log("");
 			} catch (err) {
-				// A db.*.slots entitlement gate resolves by upgrading the plan —
-				// add-ons aren't sold standalone. `requestedPlan` stays undefined; the
-				// db gate maps to the current-plan upgrade ladder, not a requested tier.
+				// A db.*.slots entitlement gate has two ways out: buy just the
+				// database addon, or upgrade the plan. `requestedPlan` stays undefined
+				// — the db gate maps to an addon (or the current-plan upgrade ladder),
+				// not a requested tier.
 				if (isEntitlementError(err)) {
 					// Non-interactive (JSON / no TTY / --yes): hand the agent the
-					// structured NEEDS_UPGRADE envelope with the plan-upgrade option to
-					// run.
+					// structured NEEDS_UPGRADE envelope, which lists BOTH the buy-addon
+					// and upgrade-plan options so it asks the user which to run.
 					if (
 						isJsonMode() ||
 						isNonInteractiveMode() ||
@@ -292,8 +293,8 @@ export function registerDbCommands(program: Command) {
 					log("");
 					log(colors.warn(message));
 
-					// Interactive TTY: prompt the plan upgrade the deploy flow uses, and
-					// apply it inline.
+					// Interactive TTY: offer the same upgrade-vs-buy-addon chooser the
+					// deploy flow uses, and apply the chosen change inline.
 					const upgraded = await promptEntitlementRemedy(
 						getApiClient(),
 						err,

@@ -109,29 +109,17 @@ describe("resolveEntitlementRemedy", () => {
 		expect(host.targetKey).toBe("dedicated_small");
 	});
 
-	it("db.*.slots → plan upgrade, never a standalone addon purchase", () => {
+	it("db.*.slots → addon purchase (catalog-matched)", () => {
 		const r = resolveEntitlementRemedy("db.standard.slots", catalog);
-		expect(r.kind).toBe("plan");
-		expect(r.targetKey).toBe("shared");
-		expect(r.command).toContain("billing upgrade shared");
-		expect(r.command).not.toContain("addon:buy");
-		expect(r.hint).toMatch(/upgrade/i);
+		expect(r.kind).toBe("addon");
+		expect(r.targetKey).toBe("db.standard");
+		expect(r.command).toContain("addon:buy db.standard");
 	});
 
-	it("db.*.slots on a SHARED org → climbs to dedicated, not an addon", () => {
-		const r = resolveEntitlementRemedy("db.standard.slots", catalog, {
-			currentPlanKey: "shared",
-		});
-		expect(r.kind).toBe("plan");
-		expect(r.targetKey).toBe("dedicated_small");
-		expect(r.command).not.toContain("addon:buy");
-	});
-
-	it("storage.*.slots → plan upgrade, never a standalone addon purchase", () => {
+	it("storage.*.slots → addon purchase", () => {
 		const r = resolveEntitlementRemedy("storage.standard.slots", catalog);
-		expect(r.kind).toBe("plan");
-		expect(r.targetKey).toBe("shared");
-		expect(r.command).not.toContain("addon:buy");
+		expect(r.kind).toBe("addon");
+		expect(r.targetKey).toBe("storage.standard");
 	});
 
 	it("db.free.slots → plan upgrade, never a (non-existent) free-db addon", () => {
@@ -159,11 +147,10 @@ describe("resolveEntitlementRemedy", () => {
 		expect(r.targetKey).toBe("shared");
 	});
 
-	it("db gate with no catalog still resolves to a plan upgrade", () => {
+	it("strips '.slots' for addon keys when the catalog is unavailable", () => {
 		const r = resolveEntitlementRemedy("db.standard.slots", null);
-		expect(r.kind).toBe("plan");
-		expect(r.targetKey).toBe("shared");
-		expect(r.command).not.toContain("addon:buy");
+		expect(r.kind).toBe("addon");
+		expect(r.targetKey).toBe("db.standard");
 	});
 
 	it("plan-upgrade gate on a SHARED org → dedicated (not back to shared)", () => {
