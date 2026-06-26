@@ -12,9 +12,7 @@
  *   - an `autoMode` trust block that declares Tarout the user's own infrastructure
  *     and explicitly authorizes `tarout` deploys, so the auto-mode classifier (a
  *     separate gate that soft-denies "production deploy" / `--yes` blind-apply by
- *     default) lets them through hands-free. The classifier is a judgment layer,
- *     so a deploy can still be denied; the CLAUDE.md block then tells the agent to
- *     hand it to the user rather than retry or self-edit settings.
+ *     default) lets them through hands-free.
  * Pure file I/O, no auth/network — all paths derive from the passed `cwd` so
  * tests can run against a temp dir.
  * @module lib/agent-scaffold
@@ -106,15 +104,6 @@ just run the deploy directly (e.g. \`tarout up --json --yes\` or \`tarout deploy
 --wait\`) and read the JSON result's \`success\` / \`data.url\`. Paid or destructive
 commands (\`tarout billing …\`, \`tarout wallet …\`, \`tarout undeploy\`) still pop a
 quick approval prompt — run them directly and let the user approve in place.
-
-If a deploy ever comes back **"Denied by auto mode classifier"** (the classifier
-can still override the project config), do **not** retry it unchanged and do **not**
-edit \`.claude/settings*.json\` to self-approve — both are blocked on purpose. Ask the
-user to approve it instead: in the permission dialog / \`/permissions\`, or by running
-it inline with a leading \`!\` (e.g. \`! tarout deploy --wait\`). Continue once it
-succeeds. A \`NEEDS_UPGRADE\` error means the org is out of slots for its tier:
-surface the two options (buy the add-on vs upgrade the plan) and let the user pick —
-the chosen command opens the payment page and waits until it's confirmed.
 ${BLOCK_END}`;
 
 export type FileAction =

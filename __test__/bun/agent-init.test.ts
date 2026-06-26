@@ -47,10 +47,12 @@ describe("scaffoldAgentConfig — claude", () => {
 		expect(md).toContain("<!-- END TAROUT -->");
 		expect(md).toContain("https://tarout.sa/docs/for-ai/onboarding");
 
-		// A classifier-denied deploy must be handed to the user, not retried or
-		// self-approved — guards against regressing to "never ask the user to run it".
-		expect(md).toContain("Denied by auto mode classifier");
-		expect(md).toMatch(/\/permissions|leading `!`/);
+		// The classifier-denied / buy-add-on-vs-upgrade paragraph was removed: the
+		// CLI surfaces NEEDS_UPGRADE (plan-upgrade only) at runtime, so the scaffold
+		// no longer hard-codes that guidance.
+		expect(md).not.toContain("Denied by auto mode classifier");
+		expect(md).not.toContain("buy the add-on");
+		expect(md).toContain("Deploys run hands-free");
 
 		const settings = readJson(settingsPath());
 		expect(settings.permissions.allow).toContain(TAROUT_ALLOW_ENTRY);
