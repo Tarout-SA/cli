@@ -869,24 +869,16 @@ export async function resolveDeploymentTarget(
 		return createNewAppTarget(client, profile, options);
 	}
 
-	// Resolve the linked app (a prior `tarout link` or deploy wrote
-	// `.tarout/project.json`). A linked app is an explicit prior choice, so a
-	// bare redeploy targets it WITHOUT prompting — the documented "redeploy just
-	// works" path agents depend on for a deterministic redeploy. `--new-app`
-	// (handled above) overrides it; `--source upload` is honored downstream by
-	// resolveShouldUploadSource. `promptForSource: false` suppresses the
-	// source-override needs_input so the redeploy stays non-interactive.
+	// A linked app (`.tarout/project.json`) is no longer auto-reused — we ALWAYS
+	// ask whether to create a new app or reuse an existing one when any app
+	// exists. `--app <id|name>` / `--new-app` (handled above) are the explicit
+	// no-prompt escapes for a deterministic / hands-free deploy.
 	const linkedProject = getProjectConfig();
 	const linkedApp = linkedProject
 		? findApp(apps, linkedProject.applicationId) ??
 			findApp(apps, linkedProject.name)
 		: undefined;
-	if (linkedApp) {
-		return reuseAppTarget(client, profile, linkedApp, {
-			promptForSource: false,
-		});
-	}
-	if (linkedProject && !isJsonMode()) {
+	if (linkedProject && !linkedApp && !isJsonMode()) {
 		log("");
 		log(
 			colors.warn(
@@ -895,22 +887,23 @@ export async function resolveDeploymentTarget(
 		);
 	}
 
-	// No linked app. Nothing else to reuse — creating is the only path.
+	// Nothing to reuse — creating is the only path.
 	if (apps.length === 0) {
 		assertConfiguredSourceAllowsCreate(sourcePreference, true);
 		return createNewAppTarget(client, profile, options);
 	}
 
-	// `--yes` with no linked app: accept the default (create a new app).
-	if (shouldSkipConfirmation()) {
-		assertConfiguredSourceAllowsCreate(sourcePreference, true);
-		return createNewAppTarget(client, profile, options);
-	}
-
-	// Apps exist but none is linked — ASK which to use. Interactive shows the
-	// menu; agent mode (--json / no TTY) emits a structured needs_input naming
-	// the exact re-invoke mechanisms so the human decides through the agent.
+	// Apps exist — ASK which to use (no silent auto-reuse, even of a linked app).
+	// Interactive shows the menu; agent mode (--json / non-interactive) emits a
+	// structured needs_input naming the exact re-invoke mechanisms so the human
+	// decides through the agent. The linked app, if any, is listed first.
 	const createValue = "__create__";
+	const ordered = linkedApp
+		? [
+				linkedApp,
+				...apps.filter((a) => a.applicationId !== linkedApp.applicationId),
+			]
+		: apps;
 	const selected = await select<string>(
 		"Create a new app or reuse an existing one?",
 		[
@@ -918,8 +911,12 @@ export async function resolveDeploymentTarget(
 				name: `Create a new app from ${colors.cyan(basename(process.cwd()) || "this directory")}`,
 				value: createValue,
 			},
-			...apps.map((app) => ({
-				name: `Reuse ${app.name} ${colors.dim(`(${app.applicationId.slice(0, 8)})`)}`,
+			...ordered.map((app) => ({
+				name: `Reuse ${app.name} ${colors.dim(`(${app.applicationId.slice(0, 8)})`)}${
+					linkedApp && app.applicationId === linkedApp.applicationId
+						? colors.dim(" — linked")
+						: ""
+				}`,
 				value: app.applicationId,
 			})),
 		],
@@ -927,10 +924,13 @@ export async function resolveDeploymentTarget(
 			field: "deploy_app",
 			flag: "--new-app to create a new app, or pass the app id or name as the positional argument (tarout deploy <id|name>) to reuse an existing one",
 			context: {
-				apps: apps.map((a) => ({
+				apps: ordered.map((a) => ({
 					id: a.applicationId,
 					name: a.name,
 				})),
+				linkedApp: linkedApp
+					? { id: linkedApp.applicationId, name: linkedApp.name }
+					: null,
 			},
 		},
 	);

@@ -260,20 +260,17 @@ export function registerUpCommand(program: Command): void {
 					const apps = await loadApps();
 					reuse(resolveAppRef(apps, options.app), "--app");
 				} else if (!options.newApp) {
-					// No explicit choice: surface the create-vs-reuse decision instead
-					// of silently redeploying to the linked/existing app. `--yes` is the
-					// escape hatch that keeps the old idempotent behavior (reuse the
-					// linked app, else create). Otherwise ask — interactive shows a
-					// menu, agent mode emits a structured needs_input naming the exact
-					// re-invoke flags so the human decides through the agent.
+					// No explicit choice: ALWAYS surface the create-vs-reuse decision —
+					// never silently redeploy to the linked/existing app, even with
+					// `--yes`. `--app <id|name>` / `--new-app` are the no-prompt escapes.
+					// Interactive shows a menu; agent mode emits a structured needs_input
+					// naming the re-invoke flags so the human decides through the agent.
 					const apps = await loadApps();
 					const linkedApp = linked
 						? findApp(apps, linked.applicationId) ?? findApp(apps, linked.name)
 						: undefined;
 
-					if (shouldSkipConfirmation()) {
-						if (linkedApp) reuse(linkedApp, "linked");
-					} else if (apps.length > 0) {
+					if (apps.length > 0) {
 						const createValue = "__create__";
 						const orderedApps = linkedApp
 							? [

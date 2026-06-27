@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0]
+
+### Changed
+
+- **A deploy never silently reuses an app — it asks.** Previously a directory
+  linked to an app (`.tarout/project.json`) redeployed to it without prompting,
+  and `--yes` auto-reused the linked app. Now, whenever any app exists, `tarout up`
+  / `tarout deploy` prompt **create a new app vs. reuse an existing one** (the
+  linked app is listed first). Interactive shows an arrow-key picker; agent /
+  `--json` mode emits a `deploy_app` needs_input. `--app <id|name>` (reuse) and
+  `--new-app` (create) remain the explicit no-prompt escapes — pass one for a
+  hands-free / deterministic redeploy. The scaffolded `CLAUDE.md` is updated to
+  tell agents to pass `--app`/`--new-app`.
+
 ## [0.17.0]
 
 ### Changed
