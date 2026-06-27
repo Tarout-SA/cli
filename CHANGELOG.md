@@ -23,17 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TAROUT_NO_BROWSER` env var to suppress real browser launches (headless safety / tests).
 
 ## [0.19.0]
+## [0.20.1]
 
 ### Changed
 
-- **Scaffolded `CLAUDE.md` now tells agents how to survive an auto-mode denial.**
-  The `tarout agent init` guidance promised "deploys run hands-free" but said nothing
-  about what to do when Claude Code's auto-mode classifier holds or refuses a deploy
-  anyway (which it can, despite the trust block). The block now adds a fallback for the
-  deploy step: scope the command (`--new-app` / `--app <id|name>`), ask the user to
-  approve the one-tap prompt in place, and otherwise drop to the inspected plan +
-  create-vs-reuse options rather than dead-ending. Hands-free stays the happy path, and
-  read-only commands (never gated) are unaffected.
+- Maintenance re-release of 0.20.0 with no functional changes.
+
+## [0.20.0]
+
+### Reverted
+
+- **Rolled back the v0.19.0 deploy-denial fallback scaffolding.** `tarout agent
+  init` no longer injects the classifier-denial fallback block into the generated
+  CLAUDE.md; the agent scaffold returns to its 0.18.3 behavior. This release ships
+  the 0.18.3 code under a new version number.
 
 ## [0.18.3]
 
