@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1]
+
+### Changed
+
+- **Agents now log in by themselves instead of handing `tarout login` to the
+  user.** `tarout login` and the deploy flow already auto-open the browser, but an
+  agent that hit an `AUTH_ERROR` (e.g. from `tarout whoami`) would stop and ask the
+  user to run `! tarout login`. The `AUTH_ERROR` envelope now carries
+  `details.hint` + `details.nextCommand: "tarout login"` telling the agent to run
+  login directly (it opens a browser on the user's machine and waits for sign-in),
+  and the scaffolded `CLAUDE.md` ("Auth is hands-free — run it yourself") says the
+  same. The `--token` path remains the headless/CI fallback.
+
 ## [0.16.0]
 
 ### Fixed

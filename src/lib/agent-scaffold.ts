@@ -93,9 +93,15 @@ Run Tarout commands with \`--json\` for machine-readable output, and run them
 **directly** in your shell (don't wrap them in pipes or redirects like \`2>&1\`, so
 approval rules match the command). New apps and databases automatically use your
 org's **subscribed tier** — don't pass \`--plan free\` / \`--database-plan free\`.
-\`tarout login\` opens the browser for you; the user just signs in. On a headless or
-CI host with no browser, log in with \`tarout login --token <key>\` — create a key at
-https://tarout.sa/dashboard/agent/keys.
+
+**Auth is hands-free — run it yourself.** If a command reports you're not logged in
+(\`AUTH_ERROR\` / exit 3), run \`tarout login\` **directly**. It opens a browser on the
+user's machine and waits for sign-in — tell the user to finish in the browser, then
+continue. Do **not** ask the user to run \`tarout login\` for you, and don't treat it
+as interactive. Deploys (\`tarout up\` / \`tarout deploy\`) also auto-launch this login
+when needed, so you can usually just run the deploy directly. On a headless/CI host
+with no browser, use \`tarout login --token <key>\` (create one at
+https://tarout.sa/dashboard/agent/keys).
 
 **Deploys run hands-free.** \`tarout agent init\` set this project up so \`tarout up\`
 and \`tarout deploy\` run without an approval prompt, and it declares Tarout as the
