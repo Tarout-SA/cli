@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0]
+
+### Changed
+
+- **A storage entitlement gate no longer aborts the deploy — it prompts.** When a
+  plan doesn't include file storage (e.g. the Free tier) and the deploy would
+  provision a bucket, the deploy now asks the user to **continue without file
+  storage** or **upgrade the plan** instead of failing. Interactive shows an
+  arrow-key picker; choosing upgrade runs checkout, provisions the bucket, and
+  continues. In agent/`--json`/`--yes` mode it emits a `needs_input` naming
+  `--skip-storage`, so the agent asks the user and the re-run completes. (Database
+  gates are unchanged — the database is required, so they still surface
+  `NEEDS_UPGRADE`.)
+
+### Added
+
+- **`--skip-storage` and `--skip-database`** flags on `tarout up` / `tarout deploy`
+  to deploy without provisioning that resource (and to give the "continue without
+  storage" choice a clean, deterministic re-run).
+- **`tarout agent init`** auto-mode trust now explicitly covers redeploys to an
+  existing app (`--app`, `--reuse-database`/`--reuse-storage`, `--skip-*`), so the
+  Claude Code auto-mode classifier denies fewer agent-issued redeploy variants.
+
 ## [0.16.1]
 
 ### Changed

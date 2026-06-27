@@ -167,3 +167,61 @@ describe("configureOptionalResources on a redeploy (appReused)", () => {
 		expect(touched).toBe(false); // no provisioning attempted
 	});
 });
+
+describe("configureOptionalResources skip flags (first create)", () => {
+	const detected = { database: "postgres", storage: true } as any;
+
+	it("--skip-storage skips storage even when the project looks like it uses it", async () => {
+		let storageTouched = false;
+		const client = {
+			postgres: { allByOrganization: { query: async () => [] } },
+			mysql: { allByOrganization: { query: async () => [] } },
+			storage: {
+				allByOrganization: {
+					query: async () => {
+						storageTouched = true;
+						return [];
+					},
+				},
+			},
+		};
+
+		await configureOptionalResources(
+			client,
+			profile,
+			app,
+			{ database: "none", skipStorage: true } as any,
+			detected,
+		);
+
+		expect(storageTouched).toBe(false);
+	});
+
+	it("--skip-database skips the database even when detected", async () => {
+		let dbTouched = false;
+		const client = {
+			postgres: {
+				allByOrganization: {
+					query: async () => {
+						dbTouched = true;
+						return [];
+					},
+				},
+			},
+			mysql: { allByOrganization: { query: async () => [] } },
+			storage: { allByOrganization: { query: async () => [] } },
+		};
+
+		// DB-only inspection so this test isolates the database path.
+		const dbDetected = { database: "postgres", storage: false } as any;
+		await configureOptionalResources(
+			client,
+			profile,
+			app,
+			{ skipDatabase: true, storage: false } as any,
+			dbDetected,
+		);
+
+		expect(dbTouched).toBe(false);
+	});
+});

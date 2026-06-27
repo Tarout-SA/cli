@@ -76,6 +76,8 @@ interface UpOptions {
 	reuseDatabase?: string;
 	reuseStorage?: string;
 	rootDirectory?: string;
+	skipDatabase?: boolean;
+	skipStorage?: boolean;
 	source?: string;
 	startCommand?: string;
 	storage?: boolean;
@@ -144,8 +146,10 @@ export function registerUpCommand(program: Command): void {
 			"Provision and attach a database: none, postgres, or mysql (defaults to auto-detected)",
 		)
 		.option("--database-plan <plan>", "Database plan (e.g. free, starter)")
+		.option("--skip-database", "Deploy without provisioning a database")
 		.option("--storage", "Provision and attach file storage")
 		.option("--storage-plan <plan>", "Storage plan (e.g. free, starter)")
+		.option("--skip-storage", "Deploy without provisioning file storage")
 		.option(
 			"--reuse-database <ref>",
 			"Reuse an existing database in this project: <id>, <name>, or 'auto'",
@@ -404,6 +408,8 @@ export function registerUpCommand(program: Command): void {
 							storagePlan: options.storagePlan,
 							reuseDatabase: options.reuseDatabase,
 							reuseStorage: options.reuseStorage,
+							skipDatabase: options.skipDatabase,
+							skipStorage: options.skipStorage,
 						},
 						inspection,
 					);
@@ -431,6 +437,8 @@ export function registerUpCommand(program: Command): void {
 							storagePlan: options.storagePlan,
 							reuseDatabase: options.reuseDatabase,
 							reuseStorage: options.reuseStorage,
+							skipDatabase: options.skipDatabase,
+							skipStorage: options.skipStorage,
 						},
 						inspection,
 						{ appReused: true },
