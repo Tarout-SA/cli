@@ -130,6 +130,8 @@ interface DeployOptions {
 	reuseDatabase?: string;
 	reuseStorage?: string;
 	rootDirectory?: string;
+	skipDatabase?: boolean;
+	skipStorage?: boolean;
 	source?: string;
 	startCommand?: string;
 	storage?: boolean;
@@ -2029,6 +2031,7 @@ function explicitDatabaseKind(
 	options: DeployOptions,
 	inspection: ProjectInspection,
 ): DatabaseKind {
+	if (options.skipDatabase) return "none";
 	if (options.database) return normalizeDatabaseKind(options.database) ?? "none";
 	if (options.reuseDatabase) {
 		return inspection.database !== "none" ? inspection.database : "postgres";
@@ -2037,6 +2040,7 @@ function explicitDatabaseKind(
 }
 
 function explicitStorageRequested(options: DeployOptions): boolean {
+	if (options.skipStorage) return false;
 	return options.storage === true || Boolean(options.reuseStorage);
 }
 
@@ -2089,30 +2093,126 @@ export async function configureOptionalResources(
 		: await resolveStorageChoice(options, inspection);
 
 	if (wantStorage) {
-		const decision = await resolveStorageProvisioning(
-			client,
-			profile,
-			app,
-			options,
-			{ preferExisting: appReused },
-		);
-		if (decision.action === "reuse") {
-			await attachExistingStorage(client, app, decision);
-			createdResources.push(
-				`Storage ${appReused ? "attached" : "reused"} — ${decision.name} (${decision.plan})`,
+		try {
+			const decision = await resolveStorageProvisioning(
+				client,
+				profile,
+				app,
+				options,
+				{ preferExisting: appReused },
 			);
-		} else {
-			await createAndAttachStorage(client, app, {
-				name: decision.name,
-				plan: decision.plan,
-			});
-			createdResources.push(`Storage (${decision.plan})`);
+			if (decision.action === "reuse") {
+				await attachExistingStorage(client, app, decision);
+				createdResources.push(
+					`Storage ${appReused ? "attached" : "reused"} — ${decision.name} (${decision.plan})`,
+				);
+			} else {
+				await createAndAttachStorage(client, app, {
+					name: decision.name,
+					plan: decision.plan,
+				});
+				createdResources.push(`Storage (${decision.plan})`);
+			}
+		} catch (err) {
+			// File storage isn't on every plan (the Free tier has none). Rather than
+			// abort the whole deploy, ask the user to continue without a bucket or
+			// upgrade — storage is the optional part. Non-storage failures still throw.
+			if (!isEntitlementError(err)) throw err;
+			const outcome = await handleStorageEntitlementGate(
+				client,
+				err,
+				profile,
+				app,
+				options,
+			);
+			if (outcome === "provisioned") {
+				createdResources.push("Storage (provisioned after upgrade)");
+			}
 		}
 	}
 
 	if (createdResources.length > 0 && !isJsonMode()) {
 		box("Provisioned Resources", createdResources);
 	}
+}
+
+/**
+ * A storage entitlement gate (e.g. the Free plan includes no object storage) is
+ * NOT a hard deploy failure — file storage is the optional backend. Offer the
+ * two real choices instead of aborting:
+ *   - Continue without file storage (the deploy finishes; app runs DB-only).
+ *   - Upgrade the plan, then provision + attach the bucket and continue.
+ * Interactive shows an arrow-key picker; an agent (`--json`/`--yes`/no TTY) gets
+ * a `needs_input` naming `--skip-storage` (continue) so its re-run completes.
+ * Returns "skipped" (deploy continues without storage) or "provisioned".
+ */
+async function handleStorageEntitlementGate(
+	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
+	client: any,
+	err: unknown,
+	profile: Profile,
+	app: AppSummary,
+	options: DeployOptions,
+): Promise<"skipped" | "provisioned"> {
+	if (!isJsonMode()) {
+		log("");
+		log(colors.warn("Your current plan doesn't include file storage."));
+	}
+
+	const CONTINUE = "__continue__";
+	const UPGRADE = "__upgrade__";
+	const CANCEL = "__cancel__";
+	// `select` shows an arrow-key picker interactively, and emits a `needs_input`
+	// (naming the flag) then exits in agent/--json mode — so the agent re-runs
+	// with `--skip-storage` to continue, or upgrades and re-runs with `--storage`.
+	const choice = await select<string>(
+		"File storage isn't included in your plan. How do you want to proceed?",
+		[
+			{ name: "Continue without file storage", value: CONTINUE },
+			{ name: "Upgrade your plan to add file storage", value: UPGRADE },
+			{ name: "Cancel the deploy", value: CANCEL },
+		],
+		{
+			field: "storage_gate",
+			flag: "--skip-storage to continue without it, or --storage after upgrading",
+			context: { resource: "storage", reason: "plan_excludes_storage" },
+		},
+	);
+
+	if (choice === CANCEL) {
+		throw new InvalidArgumentError("Deployment cancelled at the storage step.");
+	}
+	if (choice === CONTINUE) {
+		log(
+			colors.dim(
+				"Continuing without file storage. Add it later with `tarout up --storage` once your plan includes it.",
+			),
+		);
+		return "skipped";
+	}
+
+	// Upgrade, then provision storage on the new plan and continue the deploy.
+	const upgraded = await promptUpgradeFromEntitlementError(
+		client,
+		err,
+		options.plan,
+	);
+	if (!upgraded) {
+		log(
+			colors.dim("Upgrade not completed — continuing without file storage."),
+		);
+		return "skipped";
+	}
+	const decision = await resolveStorageProvisioning(client, profile, app, options);
+	if (decision.action === "reuse") {
+		await attachExistingStorage(client, app, decision);
+	} else {
+		await createAndAttachStorage(client, app, {
+			name: decision.name,
+			plan: decision.plan,
+		});
+	}
+	return "provisioned";
 }
 
 /**
@@ -2268,6 +2368,7 @@ async function resolveDatabaseChoice(
 	options: DeployOptions,
 	inspection: ProjectInspection,
 ): Promise<DatabaseKind> {
+	if (options.skipDatabase) return "none";
 	const explicitChoice = normalizeDatabaseKind(options.database);
 	if (explicitChoice) return explicitChoice;
 	if (isJsonMode() || shouldSkipConfirmation()) return inspection.database;
@@ -2299,6 +2400,7 @@ async function resolveStorageChoice(
 	options: DeployOptions,
 	inspection: ProjectInspection,
 ): Promise<boolean> {
+	if (options.skipStorage) return false;
 	if (options.storage === true) return true;
 	if (isJsonMode() || shouldSkipConfirmation()) return inspection.storage;
 
@@ -3674,11 +3776,13 @@ export function registerDeployCommands(program: Command) {
 			"--database-plan <plan>",
 			"Database plan: free, starter, standard, or pro",
 		)
+		.option("--skip-database", "Deploy without provisioning a database")
 		.option("--storage", "Provision file storage and attach it to the app")
 		.option(
 			"--storage-plan <plan>",
 			"Storage plan: free, starter, standard, or pro",
 		)
+		.option("--skip-storage", "Deploy without provisioning file storage")
 		.option(
 			"--reuse-database <ref>",
 			"Reuse an existing database in this project: <id>, <name>, or 'auto' (exactly one match)",

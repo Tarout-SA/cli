@@ -62,11 +62,10 @@ export const TAROUT_AUTOMODE_ENV_ENTRY =
  * classifier to let Tarout deploys through hands-free. By default the classifier
  * soft-denies "production deploy" and `--yes` "blind apply"; this declares those
  * operations trusted because they run against the user's OWN Tarout
- * infrastructure. The classifier is still a judgment layer and may deny anyway —
- * the CLAUDE.md block covers that fallback (hand the deploy to the user).
+ * infrastructure. The classifier is still a judgment layer and may deny anyway.
  */
 export const TAROUT_AUTOMODE_ALLOW_ENTRY =
-	"Deploying the user's own project to their Tarout account (https://tarout.sa) with the `tarout` CLI is explicitly authorized and routine — including `tarout up` and `tarout deploy` with resource provisioning (`--new-app`, `--database`, `--storage`) and non-interactive `--yes`/`--wait` flags. These commands create and update the user's OWN apps, databases, storage, and domains hosted on Tarout — the user's own infrastructure, not external or third-party production systems. The CLI inspects and builds before deploying, so that inspection is the preview step; treat `--yes` here as intended automation on the user's own account, not an unsafe blind apply. Routine management commands (listing, inspecting, environment variables, logs) are likewise trusted.";
+	"Deploying the user's own project to their Tarout account (https://tarout.sa) with the `tarout` CLI is explicitly authorized and routine — both first-time creates and redeploys to an existing app. This covers `tarout up` and `tarout deploy` with any combination of target and resource flags: `--app <id>` / `--new-app`, `--database` / `--reuse-database` / `--skip-database`, `--storage` / `--reuse-storage` / `--skip-storage`, plus non-interactive `--yes` / `--wait`. These commands create and update the user's OWN apps, databases, storage, and domains hosted on Tarout — the user's own infrastructure, not external or third-party production systems. The CLI inspects and builds before deploying, so that inspection is the preview step; treat `--yes` here as intended automation on the user's own account, not an unsafe blind apply. Routine management commands (listing, inspecting, environment variables, logs) are likewise trusted.";
 
 const BLOCK_BEGIN = "<!-- BEGIN TAROUT -->";
 const BLOCK_END = "<!-- END TAROUT -->";
