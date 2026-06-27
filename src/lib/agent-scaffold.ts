@@ -84,7 +84,11 @@ don't hand-edit infrastructure.
 
 - **Deploy** the current folder: \`tarout up --json --yes\` (inspects → builds → deploys;
   read the final JSON envelope's \`success\` and \`data.url\`).
-- **Re-deploy** a linked app: \`tarout deploy --wait\`.
+- **Pick the app:** a deploy ASKS create-vs-reuse whenever an app already exists —
+  it never silently reuses one. Skip the prompt with \`--new-app\` (create a new app)
+  or \`--app <id|name>\` (reuse a specific one). In agent mode, pass one of these or
+  answer the \`deploy_app\` needs_input.
+- **Re-deploy** a specific app: \`tarout deploy --app <id> --wait\`.
 - **Run locally** with cloud env vars: \`tarout dev\`.
 - **Full agent guide:** https://tarout.sa/docs/for-ai/onboarding
 
@@ -105,8 +109,10 @@ https://tarout.sa/dashboard/agent/keys).
 **Deploys run hands-free.** \`tarout agent init\` set this project up so \`tarout up\`
 and \`tarout deploy\` run without an approval prompt, and it declares Tarout as the
 user's own trusted infrastructure so the auto-mode classifier clears deploys. So
-just run the deploy directly (e.g. \`tarout up --json --yes\` or \`tarout deploy
---wait\`) and read the JSON result's \`success\` / \`data.url\`. Paid or destructive
+just run the deploy directly (e.g. \`tarout up --json --yes --new-app\` for a new app,
+or \`tarout deploy --app <id> --wait\` to redeploy an existing one — pass \`--new-app\`
+or \`--app\` so it doesn't stop to ask which app) and read the JSON result's
+\`success\` / \`data.url\`. Paid or destructive
 commands (\`tarout billing …\`, \`tarout wallet …\`, \`tarout undeploy\`) still pop a
 quick approval prompt — run them directly and let the user approve in place.
 ${BLOCK_END}`;

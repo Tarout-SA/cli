@@ -6,16 +6,48 @@ import { resolveDeploymentTarget } from "../src/commands/deploy";
 import { setGlobalOptions } from "../src/lib/output";
 
 /**
- * Regression guard for two agent-breaking deploy bugs (reported against 0.8.x):
+ * App-selection behavior:
  *
- *  1. A bare `tarout deploy` on a directory linked via `.tarout/project.json`
- *     must silently redeploy the linked app — NOT emit a create-vs-reuse
- *     needs_input. In an agent (non-TTY/JSON) context the prompt was a hard
- *     halt (exit 6) that broke the documented "redeploy just works" path.
- *  2. When there IS no linked app and the CLI must ask, the re-invoke hint must
- *     point at the real mechanism — the positional arg `tarout deploy <id|name>`
- *     — not the non-existent `--app` flag.
+ *  1. `tarout deploy` NEVER silently reuses an app — even a linked one. When any
+ *     app exists it asks create-vs-reuse (a needs_input in agent mode), listing
+ *     the linked app first as a reuse option. `--app`/`--new-app` skip the prompt.
+ *  2. The re-invoke hint points at the real mechanism — the positional arg
+ *     `tarout deploy <id|name>` — not the non-existent `--app` flag.
  */
+
+function captureNeedsInput(
+	run: () => Promise<unknown>,
+): Promise<Record<string, unknown> | undefined> {
+	return (async () => {
+		const logs: string[] = [];
+		const origLog = console.log;
+		const origExit = process.exit;
+		console.log = (...a: unknown[]) => {
+			logs.push(a.map(String).join(" "));
+		};
+		process.exit = ((code?: number) => {
+			throw new Error(`__EXIT_${code ?? 0}`);
+		}) as never;
+		try {
+			await run();
+			throw new Error("expected needs_input exit, but resolution returned");
+		} catch (err) {
+			expect(String(err)).toContain("__EXIT_6");
+		} finally {
+			console.log = origLog;
+			process.exit = origExit;
+		}
+		return logs
+			.map((l) => {
+				try {
+					return JSON.parse(l);
+				} catch {
+					return null;
+				}
+			})
+			.find((x) => x?.field === "deploy_app");
+	})();
+}
 
 const PROFILE = {
 	token: "t",
@@ -77,37 +109,42 @@ function writeLink() {
 	);
 }
 
-describe("resolveDeploymentTarget — linked app redeploy", () => {
-	it("reuses the linked app without prompting in agent (JSON) mode", async () => {
+describe("resolveDeploymentTarget — linked app no longer auto-reused", () => {
+	it("asks create-vs-reuse (needs_input) instead of silently reusing the linked app", async () => {
+		writeLink();
+		setGlobalOptions({ json: true, nonInteractive: true });
+
+		const needsInput = await captureNeedsInput(() =>
+			resolveDeploymentTarget(
+				fakeClient(),
+				PROFILE,
+				undefined,
+				{ source: "upload" },
+				"upload",
+			),
+		);
+
+		expect(needsInput).toBeTruthy();
+		expect(needsInput?.field).toBe("deploy_app");
+		// The linked app is offered as a reuse option and flagged in context.
+		const choices = (needsInput?.choices ?? []) as Array<{ value: string }>;
+		expect(choices.some((c) => c.value === "app_demo1234")).toBe(true);
+		expect((needsInput?.context as any)?.linkedApp?.id).toBe("app_demo1234");
+	});
+
+	it("an explicit positional app id still reuses without prompting", async () => {
 		writeLink();
 		setGlobalOptions({ json: true, nonInteractive: true });
 
 		const target = await resolveDeploymentTarget(
 			fakeClient(),
 			PROFILE,
-			undefined,
+			"app_demo1234",
 			{ source: "upload" },
 			"upload",
 		);
 
-		expect(target.app.name).toBe("demo");
 		expect(target.app.applicationId).toBe("app_demo1234");
-		expect(target.createdApp).toBe(false);
-	});
-
-	it("reuses the linked app even without --yes and without a TTY", async () => {
-		writeLink();
-		setGlobalOptions({ json: false, nonInteractive: true });
-
-		const target = await resolveDeploymentTarget(
-			fakeClient(),
-			PROFILE,
-			undefined,
-			{},
-			"auto",
-		);
-
-		expect(target.app.name).toBe("demo");
 		expect(target.createdApp).toBe(false);
 	});
 });
