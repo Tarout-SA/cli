@@ -53,6 +53,8 @@ describe("scaffoldAgentConfig — claude", () => {
 		expect(md).not.toContain("Denied by auto mode classifier");
 		expect(md).not.toContain("buy the add-on");
 		expect(md).toContain("Deploys run hands-free");
+		// Auth guidance: the agent must run `tarout login` itself, not delegate.
+		expect(md).toContain("Auth is hands-free");
 
 		const settings = readJson(settingsPath());
 		expect(settings.permissions.allow).toContain(TAROUT_ALLOW_ENTRY);

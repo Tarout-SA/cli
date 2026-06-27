@@ -51,6 +51,8 @@ export class CliError extends Error {
 		message: string,
 		public code: number = ExitCode.GENERAL_ERROR,
 		public suggestions?: string[],
+		/** Structured, agent-facing context surfaced in the `--json` envelope. */
+		public details?: unknown,
 	) {
 		super(message);
 		this.name = "CliError";
@@ -58,12 +60,25 @@ export class CliError extends Error {
 }
 
 /**
+ * Agent-facing guidance attached to every AUTH_ERROR. An agent driving the CLI
+ * can run `tarout login` ITSELF — it opens a browser on the user's machine and
+ * blocks on the local callback until sign-in completes — so the agent should run
+ * it directly and tell the user to finish in the browser, NOT hand the command
+ * back for the user to type. The token path is only for genuinely headless hosts.
+ */
+export const AGENT_LOGIN_HINT =
+	"Run `tarout login` directly to authenticate — it opens a browser on this machine and waits for the user to sign in, then your command works. Do not ask the user to run it for you, and don't treat it as interactive. On a headless/CI host with no browser, use `tarout login --token <key>` (create one at https://tarout.sa/dashboard/agent/keys).";
+
+/**
  * Error thrown when the user is not authenticated.
  * Exit code: 3 (AUTH_ERROR)
  */
 export class AuthError extends CliError {
-	constructor(message = "Not logged in. Run 'tarout login' first.") {
-		super(message, ExitCode.AUTH_ERROR);
+	constructor(message = "Not logged in. Run `tarout login` to authenticate.") {
+		super(message, ExitCode.AUTH_ERROR, undefined, {
+			hint: AGENT_LOGIN_HINT,
+			nextCommand: "tarout login",
+		});
 	}
 }
 
@@ -149,7 +164,12 @@ export function handleError(err: unknown): never {
 	if (err instanceof CliError) {
 		if (isJsonMode()) {
 			outputJson(
-				jsonError(getErrorCode(err.code), err.message, err.suggestions),
+				jsonError(
+					getErrorCode(err.code),
+					err.message,
+					err.suggestions,
+					err.details,
+				),
 			);
 		} else {
 			error(err.message, err.suggestions);
