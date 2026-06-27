@@ -2553,7 +2553,14 @@ function dbTierForAddonKey(addonKey: string): ResourcePlan {
 
 export type DbPlanResolution =
 	| { ok: true; plan: ResourcePlan }
-	| { ok: false; result: BillingChangeResult };
+	| { ok: false; result: BillingChangeResult }
+	/**
+	 * The org needs a paid managed-db add-on but we're in an agent context
+	 * (JSON / non-interactive / --yes) where a checkout must not fire without
+	 * explicit consent. The caller surfaces this as NEEDS_UPGRADE instead of
+	 * silently charging.
+	 */
+	| { ok: false; needsConsent: true; addonKey: string; tier: ResourcePlan };
 
 /**
  * Decide the tier for a NEW database, defaulting to the org's subscribed tier
@@ -2594,14 +2601,24 @@ export async function ensureDatabasePlan(
 	}
 
 	// Paid org with no open DB slot → buy the plan-matched managed db add-on.
-	if (!isJsonMode()) {
-		log("");
-		log(
-			colors.dim(
-				`Your plan has no open database slot — adding the ${addonKey} add-on. Complete payment in the browser to continue.`,
-			),
-		);
+	const tier = dbTierForAddonKey(addonKey as string);
+
+	// Agent context (JSON / non-interactive / --yes): a paid checkout is the
+	// user's consent surface, so we must NOT auto-fire one here — that silently
+	// bills the org a second time (e.g. right after they paid for the plan).
+	// Hand off so the caller emits NEEDS_UPGRADE and the user approves first,
+	// mirroring `clearDeployEntitlementGate` and the storage gate. Interactive
+	// sessions fall through to the inline auto-buy + browser hand-off below.
+	if (isJsonMode() || isNonInteractiveMode() || shouldSkipConfirmation()) {
+		return { ok: false, needsConsent: true, addonKey: addonKey as string, tier };
 	}
+
+	log("");
+	log(
+		colors.dim(
+			`Your plan has no open database slot — adding the ${addonKey} add-on. Complete payment in the browser to continue.`,
+		),
+	);
 	const result = await performBillingChange(client, {
 		kind: "addon",
 		addonKey: addonKey as string,
@@ -2619,7 +2636,7 @@ export async function ensureDatabasePlan(
 		},
 	});
 	if (result.status === "applied" || result.status === "paid") {
-		return { ok: true, plan: dbTierForAddonKey(addonKey as string) };
+		return { ok: true, plan: tier };
 	}
 	return { ok: false, result };
 }
@@ -2637,7 +2654,58 @@ export async function resolveDatabasePlanOrExit(
 ): Promise<ResourcePlan> {
 	const resolution = await ensureDatabasePlan(client, requested);
 	if (resolution.ok) return resolution.plan;
+	if ("needsConsent" in resolution) {
+		await emitDatabaseAddonNeedsConsent(client, resolution.addonKey);
+		exit(ExitCode.PERMISSION_DENIED);
+	}
 	exit(emitBillingResult(resolution.result, { label: "Database add-on" }));
+}
+
+/**
+ * Agent-mode hand-off when a managed database needs a paid add-on the org
+ * doesn't yet own. Emits the same NEEDS_UPGRADE envelope shape as
+ * {@link emitNeedsUpgrade} (buy the add-on, or upgrade the plan) so the agent
+ * presents the choice to the user instead of charging on its own.
+ */
+async function emitDatabaseAddonNeedsConsent(
+	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
+	client: any,
+	addonKey: string,
+): Promise<void> {
+	const [catalog, currentPlanKey] = await Promise.all([
+		fetchCatalogSafely(client) as Promise<Catalog | null>,
+		getCurrentPlanKeySafely(client),
+	]);
+	const buyCommand = `tarout billing addon:buy ${addonKey} --wait`;
+	const upgradePlan = upgradeTargetPlan({ currentPlanKey });
+	const upgradePlanDef = (catalog?.plans ?? []).find(
+		(p) => (p.planKey ?? p.key) === upgradePlan,
+	);
+	const options: RemedyOption[] = [
+		{
+			action: "buy_addon",
+			label: `Buy the ${addonKey} database add-on`,
+			command: buyCommand,
+		},
+		{
+			action: "upgrade_plan",
+			label: `Upgrade to ${upgradePlanDef?.name ?? upgradePlan}`,
+			command: `tarout billing upgrade ${upgradePlan} --wait`,
+		},
+	];
+	outputError(
+		"NEEDS_UPGRADE",
+		`Your plan has no open database slot — adding a managed database requires the ${addonKey} add-on.`,
+		{
+			remedyKind: "addon",
+			suggestedPlan: addonKey,
+			suggestedTarget: addonKey,
+			nextCommand: buyCommand,
+			options,
+			hint: `Two ways to resolve this — ask the user which they prefer, do not choose for them: (1) ${options[0]?.label}: \`${options[0]?.command}\`; (2) ${options[1]?.label}: \`${options[1]?.command}\`. The chosen command opens the payment page and waits until it's confirmed, then retry your deploy.`,
+			permissionHint: AGENT_BILLING_PERMISSION_HINT,
+		},
+	);
 }
 
 async function createAndAttachDatabase(

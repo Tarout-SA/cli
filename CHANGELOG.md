@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.2]
+
+### Fixed
+
+- **`tarout up`/`tarout deploy` could silently charge a second time for a managed
+  database add-on in agent mode.** When a paid org had no open database slot,
+  `ensureDatabasePlan` auto-bought the plan-matched db add-on (`db.standard` on
+  Shared, `db.pro` on Dedicated) — even under `--json` / `--non-interactive` /
+  `--yes`, where a paid checkout has no consent surface. So deploying right after
+  a non-interactive `billing upgrade` (which can't bundle a database) billed the
+  org again with no prompt. The auto-buy now fires **only in interactive
+  sessions**; agent mode emits a `NEEDS_UPGRADE` envelope (buy the add-on, or
+  upgrade the plan) so the user approves the charge first — matching the
+  app-slot and storage gates.
+
 ## [0.18.1]
 
 ### Fixed

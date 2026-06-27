@@ -3,9 +3,12 @@ import { ensureDatabasePlan } from "../src/commands/deploy";
 import { setGlobalOptions } from "../src/lib/output";
 
 /**
- * `ensureDatabasePlan` defaults a new database to the org's subscribed tier and
- * auto-buys the plan-matched managed db add-on when there's no open slot. These
- * tests drive it with a scripted fake tRPC client — no DB, no payment gateway.
+ * `ensureDatabasePlan` defaults a new database to the org's subscribed tier. In
+ * an INTERACTIVE session it auto-buys the plan-matched managed db add-on when
+ * there's no open slot; in JSON / non-interactive / --yes (agent) mode it must
+ * NOT charge — it hands off a `needsConsent` signal so the caller surfaces
+ * NEEDS_UPGRADE instead of silently billing a second time. These tests drive it
+ * with a scripted fake tRPC client — no DB, no payment gateway.
  *
  * Display is forced OFF so the auto-buy path's injected `paymentBrowserOpener()`
  * is `undefined` (canLaunchBrowser() === false) and never spawns a real browser;
@@ -82,8 +85,9 @@ const savedDisplay = process.env.DISPLAY;
 const savedWayland = process.env.WAYLAND_DISPLAY;
 
 beforeEach(() => {
-	// Agent context, no browser → auto-buy never launches a real one.
-	setGlobalOptions({ json: true, nonInteractive: true });
+	// Interactive session by default (no browser → auto-buy never launches a real
+	// one). Agent-mode tests opt into JSON/non-interactive explicitly.
+	setGlobalOptions({ json: false, nonInteractive: false });
 	delete process.env.DISPLAY;
 	delete process.env.WAYLAND_DISPLAY;
 });
@@ -97,7 +101,7 @@ afterEach(() => {
 });
 
 describe("ensureDatabasePlan", () => {
-	it("Starter org with no open DB slot → auto-buys db.standard, resolves STANDARD", async () => {
+	it("interactive Starter org with no open DB slot → auto-buys db.standard, resolves STANDARD", async () => {
 		let purchased: unknown;
 		const client = fakeClient({
 			planKey: "shared",
@@ -118,6 +122,35 @@ describe("ensureDatabasePlan", () => {
 		expect(purchased).toEqual({
 			items: [{ addonKey: "db.standard", quantity: 1 }],
 		});
+	});
+
+	it("agent/non-interactive Starter org with no open DB slot → hands off, NO purchase", async () => {
+		// Regression: `tarout up --json --non-interactive` must not silently fire a
+		// second paid checkout for the db add-on after the user just paid for the
+		// plan. It hands off `needsConsent` so the caller can ask the user first.
+		setGlobalOptions({ json: true, nonInteractive: true });
+		let purchaseCalled = false;
+		const client = fakeClient({
+			planKey: "shared",
+			tiers: [
+				tier("FREE", 0, 0, 0),
+				tier("STARTER", 0, 0, 2900),
+				tier("STANDARD", 0, 0, 4900),
+				tier("PRO", 0, 0, 9900),
+			],
+			onPurchase: () => {
+				purchaseCalled = true;
+			},
+		});
+		const r = await ensureDatabasePlan(client, undefined);
+		expect(purchaseCalled).toBe(false);
+		expect(r.ok).toBe(false);
+		if (r.ok || !("needsConsent" in r)) {
+			throw new Error("expected a needsConsent handoff, got: " + JSON.stringify(r));
+		}
+		expect(r.needsConsent).toBe(true);
+		expect(r.addonKey).toBe("db.standard");
+		expect(r.tier).toBe("STANDARD");
 	});
 
 	it("Dedicated org with a bundled db.standard slot → STANDARD, NO purchase", async () => {
