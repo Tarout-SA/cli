@@ -512,6 +512,108 @@ export function registerBillingCommands(program: Command) {
 			}
 		});
 
+	// Downgrade to a lower plan (deferred to end of billing period)
+	billing
+		.command("downgrade")
+		.argument("[plan]", "Plan key to downgrade to (alias: --plan)")
+		.description("Downgrade to a lower subscription plan (applies at the end of the billing period)")
+		.option("--plan <key>", "Plan key (alias for the positional argument)")
+		.option(
+			"--billing-period <period>",
+			"Billing period: monthly or yearly",
+			parseBillingPeriod,
+		)
+		.action(async (planArg, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Fetching subscription...");
+				const [subscription, catalog] = await Promise.all([
+					client.subscription.getCurrent.query(),
+					client.subscription.getCatalog.query(),
+				]);
+				succeedSpinner();
+				if (!subscription || !subscription.planKey) {
+					throw new CliError("No active subscription to downgrade.", ExitCode.INVALID_ARGUMENTS);
+				}
+				const plans: unknown[] = catalog?.plans || catalog || [];
+				let targetPlan: string | undefined = planArg || options.plan;
+
+				if (!targetPlan) {
+					const lower = plans.filter((p) => {
+						try {
+							return (
+								classifyPlanDirection(plans, subscription.planKey, planKeyOf(p)) === "downgrade"
+							);
+						} catch {
+							return false;
+						}
+					});
+					if (lower.length === 0) {
+						log("You are already on the lowest plan.");
+						return;
+					}
+					targetPlan = await select<string>(
+						"Downgrade to:",
+						lower.map((p) => {
+							const price = (p as { priceHalalas?: number }).priceHalalas;
+							return {
+								name: `${planKeyOf(p)}${price ? ` (${(price / 100).toFixed(2)} SAR/mo)` : " (Free)"}`,
+								value: planKeyOf(p),
+							};
+						}),
+						{
+							field: "plan",
+							flag: "--plan",
+							context: { current: subscription.planKey, available: lower.map((p) => planKeyOf(p)) },
+						},
+					);
+				}
+				if (!targetPlan) {
+					throw new CliError("No plan selected.", ExitCode.INVALID_ARGUMENTS);
+				}
+
+				const direction = classifyPlanDirection(plans, subscription.planKey, targetPlan);
+				if (direction === "same") {
+					log(`Already on plan "${targetPlan}".`);
+					return;
+				}
+				if (direction === "upgrade") {
+					throw new CliError(
+						`"${targetPlan}" is higher than your current plan "${subscription.planKey}". Use \`tarout billing upgrade ${targetPlan}\` to move up.`,
+						ExitCode.INVALID_ARGUMENTS,
+					);
+				}
+
+				if (!shouldSkipConfirmation()) {
+					const confirmed = await confirm(
+						`Downgrade from "${subscription.planKey}" to "${targetPlan}"? Takes effect at the end of the current billing period; no refund for the remainder.`,
+						false,
+						{
+							field: "confirm_downgrade",
+							flag: "--yes",
+							context: { from: subscription.planKey, to: targetPlan },
+						},
+					);
+					if (!confirmed) {
+						log("Cancelled.");
+						return;
+					}
+				}
+
+				const _c = startSpinner("Scheduling downgrade...");
+				const result = await performBillingChange(client, {
+					kind: "plan",
+					planKey: targetPlan,
+					billingPeriod: options.billingPeriod,
+				});
+				succeedSpinner("Downgrade processed.");
+				reportBillingResult(result, `Plan: ${targetPlan}`);
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
 	// Manual confirm escape hatch — useful for headless test runs where the
 	// user cannot complete the browser hand-off (e.g. CI with mock payments).
 	// Calls subscription.confirmCheckout directly.

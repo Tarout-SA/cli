@@ -24,3 +24,20 @@ describe("classifyPlanDirection", () => {
 		expect(() => classifyPlanDirection(PLANS, "shared", "bogus")).toThrow(/Unknown plan/);
 	});
 });
+
+import { Command } from "commander";
+import { registerBillingCommands } from "../src/commands/billing";
+
+describe("billing downgrade command registration", () => {
+	it("registers downgrade with --plan and --billing-period", () => {
+		const program = new Command();
+		program.exitOverride();
+		registerBillingCommands(program);
+		const billing = program.commands.find((c) => c.name() === "billing");
+		const downgrade = billing?.commands.find((c) => c.name() === "downgrade");
+		expect(downgrade, "billing downgrade should exist").toBeTruthy();
+		const longs = downgrade?.options.map((o) => o.long) ?? [];
+		expect(longs).toContain("--plan");
+		expect(longs).toContain("--billing-period");
+	});
+});
