@@ -3,7 +3,7 @@ import { ensureDatabasePlan } from "../src/commands/deploy";
 import { setGlobalOptions } from "../src/lib/output";
 
 /**
- * `ensureDatabasePlan` defaults a new database to the org's subscribed tier. In
+ * `ensureDatabasePlan` defaults a new database to the project's subscribed tier. In
  * an INTERACTIVE session it auto-buys the plan-matched managed db add-on when
  * there's no open slot; in JSON / non-interactive / --yes (agent) mode it must
  * NOT charge — it hands off a `needsConsent` signal so the caller surfaces
@@ -101,7 +101,7 @@ afterEach(() => {
 });
 
 describe("ensureDatabasePlan", () => {
-	it("interactive Starter org with no open DB slot → auto-buys db.standard, resolves STANDARD", async () => {
+	it("interactive Starter project with no open DB slot → auto-buys db.standard, resolves STANDARD", async () => {
 		let purchased: unknown;
 		const client = fakeClient({
 			planKey: "shared",
@@ -124,7 +124,7 @@ describe("ensureDatabasePlan", () => {
 		});
 	});
 
-	it("agent/non-interactive Starter org with no open DB slot → hands off, NO purchase", async () => {
+	it("agent/non-interactive Starter project with no open DB slot → hands off, NO purchase", async () => {
 		// Regression: `tarout up --json --non-interactive` must not silently fire a
 		// second paid checkout for the db add-on after the user just paid for the
 		// plan. It hands off `needsConsent` so the caller can ask the user first.
@@ -153,7 +153,7 @@ describe("ensureDatabasePlan", () => {
 		expect(r.tier).toBe("STANDARD");
 	});
 
-	it("Dedicated org with a bundled db.standard slot → STANDARD, NO purchase", async () => {
+	it("Dedicated project with a bundled db.standard slot → STANDARD, NO purchase", async () => {
 		let purchaseCalled = false;
 		const client = fakeClient({
 			planKey: "dedicated_small",
@@ -172,7 +172,7 @@ describe("ensureDatabasePlan", () => {
 		expect(purchaseCalled).toBe(false); // never buys db.pro when db.standard is free
 	});
 
-	it("Dedicated org with bundled db.standard exhausted → auto-buys db.pro, resolves PRO", async () => {
+	it("Dedicated project with bundled db.standard exhausted → auto-buys db.pro, resolves PRO", async () => {
 		let purchased: unknown;
 		const client = fakeClient({
 			planKey: "dedicated_small",
@@ -187,7 +187,7 @@ describe("ensureDatabasePlan", () => {
 		expect(purchased).toEqual({ items: [{ addonKey: "db.pro", quantity: 1 }] });
 	});
 
-	it("free org with an open free DB slot → FREE, no purchase", async () => {
+	it("free project with an open free DB slot → FREE, no purchase", async () => {
 		let purchaseCalled = false;
 		const client = fakeClient({
 			planKey: "free",
@@ -219,7 +219,7 @@ describe("ensureDatabasePlan", () => {
 		expect(purchaseCalled).toBe(false);
 	});
 
-	it("explicit FREE on a paid org is dropped → resolves the org's real tier", async () => {
+	it("explicit FREE on a paid project is dropped → resolves the project's real tier", async () => {
 		const client = fakeClient({
 			planKey: "shared",
 			tiers: [tier("FREE", 0, 0, 0), tier("STANDARD", 1, 0, 4900)],
@@ -228,7 +228,7 @@ describe("ensureDatabasePlan", () => {
 		expect(r).toEqual({ ok: true, plan: "STANDARD" });
 	});
 
-	it("paid org whose auto-buy checkout does not complete → ok:false with the result", async () => {
+	it("paid project whose auto-buy checkout does not complete → ok:false with the result", async () => {
 		const client = fakeClient({
 			planKey: "shared",
 			tiers: [tier("STANDARD", 0, 0, 4900)],

@@ -14,7 +14,7 @@
  * `grants` include the failed key), with deterministic prefix fallbacks so it
  * still produces a sensible command when the catalog can't be fetched.
  *
- * Plan-upgrade targets follow the org's CURRENT plan family — free → shared,
+ * Plan-upgrade targets follow the project's CURRENT plan family — free → shared,
  * shared → dedicated_small, dedicated_small → _medium → _large — so the
  * "upgrade the plan" path always moves *up* a tier. (`requestedPlan`, the plan
  * the user asked to deploy as, is only a fallback when the current plan is
@@ -86,7 +86,7 @@ export function nextPlanForRequested(requested?: string): string {
 }
 
 /**
- * The next tier *up* from the org's CURRENT plan — this is the "upgrade the
+ * The next tier *up* from the project's CURRENT plan — this is the "upgrade the
  * plan" ladder the user asked for:
  *   free / none    → shared (Starter)
  *   shared family  → dedicated_small (Pro Small)
@@ -112,9 +112,9 @@ export function nextPlanForCurrent(currentPlanKey?: string): string {
 
 /**
  * The plan key the "upgrade the plan" option should target. Prefer the
- * current-plan ladder when the caller knows the org's plan; otherwise fall back
- * to the requested-plan heuristic (keeps behavior stable for callers/tests that
- * don't pass `currentPlanKey`).
+ * current-plan ladder when the caller knows the project's plan; otherwise fall
+ * back to the requested-plan heuristic (keeps behavior stable for callers/tests
+ * that don't pass `currentPlanKey`).
  */
 export function upgradeTargetPlan(opts?: {
 	currentPlanKey?: string;
@@ -192,7 +192,7 @@ export function resolveEntitlementRemedy(
 			targetName: plan?.name,
 			priceHalalas: plan?.priceHalalas,
 			command: `tarout billing upgrade ${target} --wait`,
-			hint: `The free plan includes a single ${resource} for the whole org — delete the existing free ${resource}, or upgrade to ${plan?.name ?? target} to add more.`,
+			hint: `The free plan includes a single ${resource} for this project — delete the existing free ${resource}, or upgrade to ${plan?.name ?? target} to add more.`,
 		};
 	}
 

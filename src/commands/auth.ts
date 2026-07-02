@@ -495,6 +495,13 @@ export function registerAuthCommands(program: Command) {
 							id: profile.organizationId,
 							name: profile.organizationName,
 						},
+						project: profile.projectId
+							? {
+									id: profile.projectId,
+									name: profile.projectName,
+									slug: profile.projectSlug,
+								}
+							: null,
 						environment: {
 							id: profile.environmentId,
 							name: profile.environmentName,
@@ -512,6 +519,14 @@ export function registerAuthCommands(program: Command) {
 					log(`${colors.bold("Organization")}`);
 					log(`  Name: ${profile.organizationName}`);
 					log(`  ID: ${colors.dim(profile.organizationId)}`);
+					log("");
+					log(`${colors.bold("Project")}`);
+					if (profile.projectId) {
+						log(`  Name: ${profile.projectName ?? colors.dim("(unnamed)")}`);
+						log(`  ID: ${colors.dim(profile.projectId)}`);
+					} else {
+						log(`  ${colors.dim("(none — using the org's default project)")}`);
+					}
 					log("");
 					log(`${colors.bold("Environment")}`);
 					log(`  Name: ${profile.environmentName}`);

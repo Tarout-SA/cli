@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import { getApiClient } from "../lib/api.js";
-import { isLoggedIn } from "../lib/config.js";
+import { getCurrentProfile, isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import { colors, isJsonMode, log, outputData } from "../lib/output.js";
 import { failSpinner, startSpinner, succeedSpinner } from "../utils/spinner.js";
@@ -121,30 +121,42 @@ export function registerSettingsCommands(program: Command) {
 		});
 
 	// ── Subscription check ────────────────────────────────────────────────────────
+	// Subscriptions are per-project. This reads the ACTIVE project's subscription
+	// (same source as `tarout billing status`). It used to call
+	// `settings.isUserSubscribed`, which only returns "does the org own any app?"
+	// — a boolean that is NOT plan/billing status and was surfaced misleadingly.
 	settings
 		.command("subscription-status")
-		.description("Check current subscription status")
+		.description("Check the active project's subscription status")
 		.action(async () => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
 				const client = getApiClient();
 				const _spinner = startSpinner("Checking subscription...");
-				const data = await client.settings.isUserSubscribed.query();
+				const sub = await client.subscription.getCurrent.query();
 				succeedSpinner();
 				if (isJsonMode()) {
-					outputData(data);
+					outputData(sub);
 					return;
 				}
-				const sub = data as any;
 				log("");
 				log(colors.bold("Subscription Status"));
-				const isSubscribed = sub?.isSubscribed ?? sub;
-				log(
-					`  Subscribed: ${isSubscribed ? colors.success("yes") : colors.dim("no (free plan)")}`,
-				);
-				if (sub?.planKey) log(`  Plan:       ${colors.cyan(sub.planKey)}`);
-				if (sub?.expiresAt)
-					log(`  Expires:    ${new Date(sub.expiresAt).toLocaleDateString()}`);
+				const profile = getCurrentProfile();
+				if (profile?.projectName) {
+					log(`  ${colors.dim(`Project: ${profile.projectName}`)}`);
+				}
+				if (!sub?.planKey) {
+					log(`  Plan:   ${colors.dim("No active subscription (free tier)")}`);
+				} else {
+					log(`  Plan:   ${colors.cyan(sub.planKey)}`);
+					log(`  Status: ${sub.status || colors.dim("active")}`);
+					if (sub.currentPeriodEnd)
+						log(
+							`  Renews: ${new Date(sub.currentPeriodEnd).toLocaleDateString()}`,
+						);
+				}
+				log("");
+				log(colors.dim("Manage your plan with: tarout billing"));
 				log("");
 			} catch (err) {
 				failSpinner();

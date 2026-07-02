@@ -111,7 +111,7 @@ export function registerStorageCommands(program: Command) {
 		.description("Create a new storage bucket")
 		.option(
 			"-p, --plan <plan>",
-			"Plan: free, starter, standard, or pro (defaults to your org's entitled tier)",
+			"Plan: free, starter, standard, or pro (defaults to this project's entitled tier)",
 		)
 		.option("--public", "Enable public read access")
 		.option("-d, --description <text>", "Bucket description")

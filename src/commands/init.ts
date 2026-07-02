@@ -135,7 +135,7 @@ export function registerInitCommand(program: Command): void {
 		.option("--name <name>", "Application name (defaults to directory name)")
 		.option(
 			"--plan <plan>",
-			"App hosting plan: free, shared, or dedicated (defaults to your org's subscribed tier)",
+			"App hosting plan: free, shared, or dedicated (defaults to this project's subscribed tier)",
 		)
 		.option("-r, --region <region>", "Deployment region", DEFAULT_REGION)
 		.option("--description <text>", "Description for the newly created app")
