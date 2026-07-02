@@ -1014,6 +1014,77 @@ export function registerDbCommands(program: Command) {
 			}
 		});
 
+	// ── Downgrade database ───────────────────────────────────────────────────────
+	db.command("downgrade")
+		.argument("<db>", "Database ID or name")
+		.description("Downgrade a managed PostgreSQL database to a lower tier (applies immediately, no refund)")
+		.option("--plan <plan>", "Target tier (starter, standard)")
+		.action(async (dbIdentifier, options) => {
+			try {
+				if (!isLoggedIn()) throw new AuthError();
+				const client = getApiClient();
+				const _spinner = startSpinner("Finding database...");
+				const allDbs = await getAllDatabases(client);
+				const dbSummary = findDatabase(allDbs, dbIdentifier);
+				if (!dbSummary) {
+					failSpinner();
+					throw new NotFoundError("Database", dbIdentifier);
+				}
+				succeedSpinner();
+				assertPostgresTierChange(dbSummary);
+				const rawPlan =
+					options.plan ||
+					(await input("Target tier (starter, standard):", undefined, {
+						field: "target_plan",
+						flag: "--plan",
+						context: { id: dbSummary.id, name: dbSummary.name, type: dbSummary.type },
+					}));
+				const targetPlan = resolveDbTierTarget("downgrade", rawPlan);
+
+				// Interactive-only preview + confirm. Preview errors are swallowed —
+				// the mutation enforces the same guards and surfaces the real message.
+				if (!isJsonMode() && !isNonInteractiveMode() && !shouldSkipConfirmation()) {
+					const _p = startSpinner("Checking downgrade...");
+					try {
+						await client.subscription.previewDatabaseDowngrade.query({
+							postgresId: dbSummary.id,
+							targetPlan,
+						});
+						succeedSpinner();
+					} catch {
+						failSpinner();
+					}
+					const confirmed = await confirm(
+						`Downgrade "${dbSummary.name}" to ${targetPlan}? Applies immediately; no refund.`,
+						false,
+						{
+							field: "confirm_db_downgrade",
+							flag: "--yes",
+							context: { id: dbSummary.id, name: dbSummary.name, targetPlan },
+						},
+					);
+					if (!confirmed) {
+						log("Cancelled.");
+						return;
+					}
+				}
+
+				const _d = startSpinner(`Downgrading ${dbSummary.name} to ${targetPlan}...`);
+				const result = await runDatabaseTierChange(client, {
+					direction: "downgrade",
+					postgresId: dbSummary.id,
+					targetPlan,
+				});
+				succeedSpinner("Downgrade processed.");
+				const code = emitBillingResult(result, {
+					label: `Database ${dbSummary.name} → ${targetPlan}`,
+				});
+				if (code !== ExitCode.SUCCESS) exit(code);
+			} catch (err) {
+				handleError(err);
+			}
+		});
+
 	// ── Attach to application ────────────────────────────────────────────────────
 	db.command("attach")
 		.argument("<db>", "Database ID or name")

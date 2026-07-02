@@ -89,3 +89,12 @@ describe("db upgrade command registration", () => {
 		expect(longs).toContain("--timeout");
 	});
 });
+
+describe("db downgrade command registration", () => {
+	it("registers downgrade with --plan", () => {
+		const cmd = dbSubcommand("downgrade");
+		expect(cmd, "db downgrade should exist").toBeTruthy();
+		const longs = cmd?.options.map((o) => o.long) ?? [];
+		expect(longs).toContain("--plan");
+	});
+});
