@@ -18,8 +18,10 @@ import {
 } from "../lib/errors.js";
 import {
 	type BillingChangeResult,
+	emitBillingResult,
 	finalizeBillingMutation,
 } from "../lib/billing-upgrade.js";
+import { paymentBrowserOpener, shouldAutoConfirmPaidCheckout } from "../lib/browser.js";
 import {
 	box,
 	colors,
@@ -28,6 +30,7 @@ import {
 	isNonInteractiveMode,
 	log,
 	outputData,
+	outputJsonLine,
 	quietOutput,
 	shouldSkipConfirmation,
 	table,
@@ -905,8 +908,17 @@ export function registerDbCommands(program: Command) {
 	// ── Upgrade database ─────────────────────────────────────────────────────────
 	db.command("upgrade")
 		.argument("<db>", "Database ID or name")
-		.description("Upgrade database to a higher plan")
-		.option("--plan <plan>", "Target plan (standard, pro)")
+		.description("Upgrade a managed PostgreSQL database to a higher tier")
+		.option("--plan <plan>", "Target tier (starter, standard, pro)")
+		.option("--wait", "Wait/poll until the hosted checkout is confirmed (default)")
+		.option("--no-wait", "Return as soon as the hosted checkout opens")
+		.option(
+			"--timeout <seconds>",
+			"Maximum wait time in seconds (default 600)",
+			(v) => Number.parseInt(v, 10),
+			600,
+		)
+		.option("--no-open", "Do not auto-open the payment URL in the browser")
 		.action(async (dbIdentifier, options) => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
@@ -918,32 +930,85 @@ export function registerDbCommands(program: Command) {
 					failSpinner();
 					throw new NotFoundError("Database", dbIdentifier);
 				}
-				const targetPlan =
+				succeedSpinner();
+				assertPostgresTierChange(dbSummary);
+				const rawPlan =
 					options.plan ||
-					(await input("Target plan:", undefined, {
+					(await input("Target tier (starter, standard, pro):", undefined, {
 						field: "target_plan",
 						flag: "--plan",
-						context: {
-							id: dbSummary.id,
-							name: dbSummary.name,
-							type: dbSummary.type,
-						},
+						context: { id: dbSummary.id, name: dbSummary.name, type: dbSummary.type },
 					}));
-				const _upgradeSpinner = startSpinner(`Upgrading to ${targetPlan}...`);
-				if (dbSummary.type === "postgres") {
-					await client.postgres.upgrade.mutate({
-						postgresId: dbSummary.id,
-						targetPlan,
-					} as any);
-				} else {
-					await client.mysql.upgrade.mutate({
-						mysqlId: dbSummary.id,
-						targetPlan,
-					} as any);
+				const targetPlan = resolveDbTierTarget("upgrade", rawPlan);
+
+				// Interactive-only preview + confirm; agent/--json/--yes go straight to
+				// the mutation (fewer round-trips, deterministic).
+				if (!isJsonMode() && !isNonInteractiveMode() && !shouldSkipConfirmation()) {
+					const _p = startSpinner("Calculating change...");
+					// biome-ignore lint/suspicious/noExplicitAny: server preview shape varies.
+					let preview: any = null;
+					try {
+						preview = await client.subscription.previewDatabaseUpgrade.query({
+							postgresId: dbSummary.id,
+							targetPlan,
+						});
+						succeedSpinner();
+					} catch {
+						failSpinner();
+					}
+					const dueHalalas =
+						typeof preview?.proratedChargeHalalas === "number"
+							? preview.proratedChargeHalalas
+							: undefined;
+					if (dueHalalas !== undefined) {
+						log(
+							`Amount due now: ${colors.bold(`${(dueHalalas / 100).toFixed(2)} SAR`)} ${colors.dim("(incl. 15% VAT at checkout)")}`,
+						);
+					}
+					if (shouldAutoConfirmPaidCheckout(dueHalalas)) {
+						log("Opening the secure payment page in your browser to complete the upgrade...");
+					} else {
+						const confirmed = await confirm(
+							`Upgrade "${dbSummary.name}" to ${targetPlan}?`,
+							false,
+							{
+								field: "confirm_db_upgrade",
+								flag: "--yes",
+								context: { id: dbSummary.id, name: dbSummary.name, targetPlan, amountDueHalalas: dueHalalas },
+							},
+						);
+						if (!confirmed) {
+							log("Cancelled.");
+							return;
+						}
+					}
 				}
-				succeedSpinner(`Database upgraded to ${targetPlan}.`);
-				if (isJsonMode())
-					outputData({ upgraded: true, id: dbSummary.id, targetPlan });
+
+				const _u = startSpinner(`Upgrading ${dbSummary.name} to ${targetPlan}...`);
+				const result = await runDatabaseTierChange(client, {
+					direction: "upgrade",
+					postgresId: dbSummary.id,
+					targetPlan,
+					wait: options.wait,
+					timeoutMs: options.timeout * 1000,
+					openBrowser: paymentBrowserOpener({ noOpen: options.open === false }),
+					onCheckoutOpened: ({ orderId, paymentUrl }) => {
+						if (isJsonMode()) {
+							outputJsonLine({ type: "event", event: "checkout_started", orderId, paymentUrl });
+						} else {
+							log("");
+							log("Open this URL to complete payment:");
+							log(`  ${colors.cyan(paymentUrl)}`);
+							log(`Order ID: ${colors.dim(orderId)}`);
+							log(`Polling for confirmation (up to ${options.timeout}s)...`);
+						}
+					},
+				});
+				succeedSpinner("Upgrade processed.");
+				const code = emitBillingResult(result, {
+					label: `Database ${dbSummary.name} → ${targetPlan}`,
+				});
+				if (code !== ExitCode.SUCCESS) exit(code);
 			} catch (err) {
 				handleError(err);
 			}

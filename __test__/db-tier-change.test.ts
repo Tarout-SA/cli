@@ -4,6 +4,16 @@ import {
 	resolveDbTierTarget,
 	runDatabaseTierChange,
 } from "../src/commands/db";
+import { Command } from "commander";
+import { registerDbCommands } from "../src/commands/db";
+
+function dbSubcommand(name: string) {
+	const program = new Command();
+	program.exitOverride();
+	registerDbCommands(program);
+	const db = program.commands.find((c) => c.name() === "db");
+	return db?.commands.find((c) => c.name() === name);
+}
 
 describe("assertPostgresTierChange", () => {
 	it("passes for a postgres database", () => {
@@ -65,5 +75,17 @@ describe("runDatabaseTierChange", () => {
 		expect(captured).toEqual({ postgresId: "pg_2", targetPlan: "STARTER" });
 		expect(r.status).toBe("applied");
 		expect(r.kind).toBe("database");
+	});
+});
+
+describe("db upgrade command registration", () => {
+	it("registers upgrade with --plan and checkout flags", () => {
+		const cmd = dbSubcommand("upgrade");
+		expect(cmd, "db upgrade should exist").toBeTruthy();
+		const longs = cmd?.options.map((o) => o.long) ?? [];
+		expect(longs).toContain("--plan");
+		expect(longs).toContain("--wait");
+		expect(longs).toContain("--no-wait");
+		expect(longs).toContain("--timeout");
 	});
 });
