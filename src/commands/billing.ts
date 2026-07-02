@@ -13,7 +13,7 @@ import {
 	shouldAutoConfirmPaidCheckout,
 } from "../lib/browser.js";
 import { getCurrentProfile, isLoggedIn } from "../lib/config.js";
-import { AuthError, handleError } from "../lib/errors.js";
+import { AuthError, CliError, handleError } from "../lib/errors.js";
 import {
 	buildPlanAddonCart,
 	isPaidFamily,
@@ -51,6 +51,45 @@ function reportBillingResult(
 ): void {
 	const code = emitBillingResult(result, { label });
 	if (code !== ExitCode.SUCCESS) exit(code);
+}
+
+/** Read a plan's key across the catalog's field variants. */
+export function planKeyOf(p: unknown): string {
+	const o = p as { planKey?: string; key?: string; name?: string };
+	return (o?.planKey || o?.key || o?.name || "").toString();
+}
+
+/**
+ * Classify a target plan relative to the current one using catalog `sortOrder`.
+ * Missing keys and `free` rank as the lowest baseline (-1). Throws on an unknown
+ * target so `billing downgrade` fails loudly instead of guessing.
+ */
+export function classifyPlanDirection(
+	plans: unknown[],
+	currentPlanKey: string | null | undefined,
+	targetPlanKey: string,
+): "upgrade" | "same" | "downgrade" {
+	const rankOf = (key: string | null | undefined): number | null => {
+		const k = (key ?? "").toString();
+		if (!k) return -1;
+		const match = plans.find(
+			(x) => planKeyOf(x).toLowerCase() === k.toLowerCase(),
+		) as { sortOrder?: number } | undefined;
+		if (match && typeof match.sortOrder === "number") return match.sortOrder;
+		if (k.toLowerCase() === "free") return -1;
+		return null;
+	};
+	const targetRank = rankOf(targetPlanKey);
+	if (targetRank === null) {
+		throw new CliError(
+			`Unknown plan "${targetPlanKey}". Run \`tarout billing plans\` to see available plans.`,
+			ExitCode.INVALID_ARGUMENTS,
+		);
+	}
+	const currentRank = rankOf(currentPlanKey) ?? -1;
+	if (targetRank > currentRank) return "upgrade";
+	if (targetRank === currentRank) return "same";
+	return "downgrade";
 }
 
 /** True when a tRPC error carries a CONFLICT code (either v10 shape). */
