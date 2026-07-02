@@ -261,7 +261,7 @@ describe("buildRemedyOptions", () => {
 		expect(opts[0]?.action).toBe("upgrade_plan");
 	});
 
-	it("addon gate on a SHARED org → upgrade option climbs to dedicated", () => {
+	it("addon gate on a SHARED plan → upgrade option climbs to dedicated", () => {
 		const remedy: EntitlementRemedy = {
 			kind: "addon",
 			targetKey: "db.standard",
@@ -278,7 +278,7 @@ describe("buildRemedyOptions", () => {
 		expect(opts[1]?.label).toBe("Upgrade to Pro Small");
 	});
 
-	it("app-slot gate on a SHARED org → upgrade option targets dedicated", () => {
+	it("app-slot gate on a SHARED plan → upgrade option targets dedicated", () => {
 		const remedy: EntitlementRemedy = {
 			kind: "plan_quantity",
 			targetKey: "shared",
@@ -366,7 +366,7 @@ describe("buildRemedyOptions", () => {
 });
 
 describe("inferAppSlotKey", () => {
-	it("maps the legacy keyless app-slot gate to the org's plan-family key", () => {
+	it("maps the legacy keyless app-slot gate to the project's plan-family key", () => {
 		const err = new Error(
 			"No app slots available on your current plan. Upgrade to add more.",
 		);
@@ -402,7 +402,7 @@ describe("pickDefaultResourceTier", () => {
 		monthlyHalalas,
 	});
 
-	it("free org with an open free slot → FREE", () => {
+	it("free project with an open free slot → FREE", () => {
 		const tiers = [
 			tier("FREE", 1, 0, 0),
 			tier("STARTER", 0, 0, 2900),
@@ -412,9 +412,9 @@ describe("pickDefaultResourceTier", () => {
 		expect(pickDefaultResourceTier(tiers)).toBe("FREE");
 	});
 
-	it("paid org with a starter addon slot → STARTER, never FREE", () => {
+	it("paid project with a starter addon slot → STARTER, never FREE", () => {
 		const tiers = [
-			tier("FREE", 0, 0, 0), // paid org: no free entitlement
+			tier("FREE", 0, 0, 0), // paid project: no free entitlement
 			tier("STARTER", 1, 0, 2900),
 			tier("STANDARD", 0, 0, 4900),
 			tier("PRO", 0, 0, 9900),
@@ -422,7 +422,7 @@ describe("pickDefaultResourceTier", () => {
 		expect(pickDefaultResourceTier(tiers)).toBe("STARTER");
 	});
 
-	it("paid org with multiple creatable tiers → the cheapest", () => {
+	it("paid project with multiple creatable tiers → the cheapest", () => {
 		const tiers = [
 			tier("FREE", 0, 0, 0),
 			tier("STARTER", 1, 0, 2900),
@@ -431,7 +431,7 @@ describe("pickDefaultResourceTier", () => {
 		expect(pickDefaultResourceTier(tiers)).toBe("STARTER");
 	});
 
-	it("paid org with no db addon (nothing creatable) → STARTER so the gate offers the addon", () => {
+	it("paid project with no db addon (nothing creatable) → STARTER so the gate offers the addon", () => {
 		const tiers = [
 			tier("FREE", 0, 0, 0),
 			tier("STARTER", 0, 0, 2900),
@@ -441,8 +441,8 @@ describe("pickDefaultResourceTier", () => {
 		expect(pickDefaultResourceTier(tiers)).toBe("STARTER");
 	});
 
-	it("org owns db.standard with an OPEN slot → STANDARD (never STARTER)", () => {
-		// The reported case: a SHARED-plan org holding an unused db.standard slot
+	it("project owns db.standard with an OPEN slot → STANDARD (never STARTER)", () => {
+		// The reported case: a SHARED-plan project holding an unused db.standard slot
 		// must not be sent to db.starter (which it doesn't own).
 		const tiers = [
 			tier("FREE", 0, 0, 0),
@@ -453,7 +453,7 @@ describe("pickDefaultResourceTier", () => {
 		expect(pickDefaultResourceTier(tiers)).toBe("STANDARD");
 	});
 
-	it("org owns db.standard but the slot is used → STANDARD, so the gate matches the owned tier (not STARTER)", () => {
+	it("project owns db.standard but the slot is used → STANDARD, so the gate matches the owned tier (not STARTER)", () => {
 		const tiers = [
 			tier("FREE", 0, 0, 0),
 			tier("STARTER", 0, 0, 2900),
@@ -463,7 +463,7 @@ describe("pickDefaultResourceTier", () => {
 		expect(pickDefaultResourceTier(tiers)).toBe("STANDARD");
 	});
 
-	it("free org whose one free slot is used → FREE (server gate then explains the cap)", () => {
+	it("free project whose one free slot is used → FREE (server gate then explains the cap)", () => {
 		const tiers = [
 			tier("FREE", 1, 1, 0), // has the free entitlement, just consumed
 			tier("STARTER", 0, 0, 2900),

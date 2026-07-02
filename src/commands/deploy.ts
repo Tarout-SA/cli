@@ -1139,10 +1139,10 @@ export async function createAppFromCurrentDirectory(
 	};
 }
 
-/** Best-effort "is this org on a paid subscription?" — drives the FREE→paid
+/** Best-effort "is this project on a paid subscription?" — drives the FREE→paid
  * tier reconciliation. A failed lookup is treated as free (the server still
  * enforces the real rule, so we never wrongly suppress a valid FREE create). */
-async function isOrgPaidSafely(client: any): Promise<boolean> {
+async function isProjectPaidSafely(client: any): Promise<boolean> {
 	try {
 		const opts = await client.application.getCreateOptions.query();
 		return opts?.isPaid === true;
@@ -1160,17 +1160,17 @@ async function resolveAppPlanForCreate(
 	// A non-FREE explicit tier is honored as-is.
 	if (explicitPlan && explicitPlan !== "FREE") return explicitPlan;
 
-	// FREE is only valid on a free org — the server rejects `plan: FREE` for a
-	// paid org with FREE_NOT_ALLOWED_ON_PAID_PLAN. So whenever the resolved tier
-	// is FREE (explicit `--plan free`, or `tarout up`'s historical default), we
-	// confirm the org is actually free; if it's paid we send no plan and let the
-	// server auto-pick the org's real (paid) tier instead of erroring.
+	// FREE is only valid on a free project — the server rejects `plan: FREE` for
+	// a paid project with FREE_NOT_ALLOWED_ON_PAID_PLAN. So whenever the resolved
+	// tier is FREE (explicit `--plan free`, or `tarout up`'s historical default),
+	// we confirm the project is actually free; if it's paid we send no plan and
+	// let the server auto-pick the project's real (paid) tier instead of erroring.
 	if (explicitPlan === "FREE") {
-		if (await isOrgPaidSafely(client)) {
+		if (await isProjectPaidSafely(client)) {
 			if (!isJsonMode()) {
 				log(
 					colors.dim(
-						"Your org is on a paid plan — free apps aren't available, so this app will use your paid tier.",
+						"This project is on a paid plan — free apps aren't available, so this app will use your paid tier.",
 					),
 				);
 			}
@@ -1204,7 +1204,7 @@ async function resolveAppPlanForCreate(
 }
 
 /**
- * Free-tier upsell: shown when the org's subscription is `free` (i.e.
+ * Free-tier upsell: shown when the project's subscription is `free` (i.e.
  * `isPaid === false`). User picks one of:
  *   - "Continue with Free"           → returns "FREE", deploy continues on free
  *   - "Upgrade to Shared and deploy" → runs inline billing upgrade, returns SHARED on success
@@ -1346,10 +1346,10 @@ async function getCurrentPlanQuantitySafely(client: any): Promise<number> {
 	}
 }
 
-// The org's current plan key (e.g. "free", "shared", "dedicated_small"), used
-// to compute the "upgrade the plan" ladder (free → shared → dedicated_*). A
-// null subscription means the org is still on the implicit free tier. Never
-// throws — a failed lookup yields undefined and callers fall back to the
+// The project's current plan key (e.g. "free", "shared", "dedicated_small"),
+// used to compute the "upgrade the plan" ladder (free → shared → dedicated_*).
+// A null subscription means the project is still on the implicit free tier.
+// Never throws — a failed lookup yields undefined and callers fall back to the
 // requested-plan heuristic.
 async function getCurrentPlanKeySafely(
 	client: any,
@@ -1683,8 +1683,9 @@ export function extractEntitlementKeyFromError(
  * ("No app slots available on your current plan.") that older servers still
  * send. Newer servers name the key directly (`Plan limit reached for
  * app.<tier>.slots`), which {@link extractEntitlementKeyFromError} parses — so
- * this only kicks in when that returns nothing, deriving the tier from the org's
- * current plan family. Returns undefined when the error isn't the app-slot gate.
+ * this only kicks in when that returns nothing, deriving the tier from the
+ * project's current plan family. Returns undefined when the error isn't the
+ * app-slot gate.
  */
 export function inferAppSlotKey(
 	err: unknown,
@@ -1719,8 +1720,9 @@ const MAX_REUSE_OPTIONS = 5;
  * The list of concrete actions that clear an entitlement gate. A targeted
  * remedy (addon / app-slot) is paired with the full plan upgrade so the caller
  * can present BOTH and let the human choose; a plan-only remedy yields the
- * single upgrade action. For an APP-slot gate, the org's existing apps are also
- * offered as `reuse_app` options — reusing one avoids any charge.
+ * single upgrade action. For an APP-slot gate, the project's existing apps in
+ * the current environment are also offered as `reuse_app` options — reusing
+ * one avoids any charge.
  */
 export function buildRemedyOptions(
 	remedy: EntitlementRemedy,
@@ -1733,7 +1735,7 @@ export function buildRemedyOptions(
 
 	if (remedy.kind === "addon" || remedy.kind === "plan_quantity") {
 		// The "upgrade the plan" alternative follows the current-plan ladder
-		// (free → shared, shared → dedicated_small, …) when we know the org's
+		// (free → shared, shared → dedicated_small, …) when we know the project's
 		// plan; otherwise it falls back to the requested-plan heuristic.
 		const upgradePlan = upgradeTargetPlan({ currentPlanKey, requestedPlan });
 		const planDef = (catalog?.plans ?? []).find(
@@ -1763,7 +1765,8 @@ export function buildRemedyOptions(
 	}
 
 	// App-slot gate → reusing an existing app is the no-charge alternative. List
-	// the org's apps as ready-to-run options (capped; the rest via `apps list`).
+	// the project's apps (current environment) as ready-to-run options (capped;
+	// the rest via `apps list`).
 	if (remedy.failedKey?.startsWith("app.") && existingApps?.length) {
 		for (const app of existingApps.slice(0, MAX_REUSE_OPTIONS)) {
 			options.push({
@@ -1784,7 +1787,7 @@ export function buildRemedyOptions(
 	return options;
 }
 
-/** Map the org's apps to `{id,name}` for reuse options. Best-effort: [] on error. */
+/** Map the project's apps (current environment) to `{id,name}` for reuse options. Best-effort: [] on error. */
 async function listAppsSafely(
 	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
 	client: any,
@@ -1813,7 +1816,7 @@ export async function emitNeedsUpgrade(
 			getCurrentPlanQuantitySafely(client),
 		]);
 	// Newer servers name the key in the message; older ones send a keyless
-	// app-slot gate, so fall back to inferring it from the org's plan family.
+	// app-slot gate, so fall back to inferring it from the project's plan family.
 	const failedKey =
 		extractEntitlementKeyFromError(err) ?? inferAppSlotKey(err, currentPlanKey);
 	const remedy = resolveEntitlementRemedy(failedKey, catalog, {
@@ -1850,7 +1853,7 @@ export async function emitNeedsUpgrade(
 }
 
 // Best-effort lookup of the free-tier databases already holding the single
-// org-wide `db.free.slots` reservation, so the deploy error can name what's
+// project-wide `db.free.slots` reservation, so the deploy error can name what's
 // blocking instead of leaving the user to hunt for it. Never throws — a failed
 // lookup just yields an empty list and a slightly less specific message.
 // Note: `allByOrganization` is scoped to the active environment, so a free DB
@@ -1884,10 +1887,10 @@ async function listFreeDatabasesSafely(
 /**
  * Explain an exhausted free-tier resource slot (`db.free.slots` /
  * `storage.free.slots`). The free plan grants exactly ONE database and ONE
- * storage bucket for the whole org (Postgres + MySQL combined, across every
- * environment), so the fix is almost never "buy an addon" — it's reuse the
- * existing one, delete it, or upgrade. Name the resource holding the slot and
- * list those three concrete paths.
+ * storage bucket for the whole project (Postgres + MySQL combined, across
+ * every environment), so the fix is almost never "buy an addon" — it's reuse
+ * the existing one, delete it, or upgrade. Name the resource holding the slot
+ * and list those three concrete paths.
  */
 async function explainFreeResourceSlotExhaustion(
 	client: any,
@@ -1898,7 +1901,7 @@ async function explainFreeResourceSlotExhaustion(
 	log("");
 	log(
 		colors.warn(
-			`The free plan includes one ${resource} for the whole organization (across all environments).`,
+			`The free plan includes one ${resource} for this project (across all its environments).`,
 		),
 	);
 
@@ -1959,7 +1962,7 @@ export async function promptUpgradeFromEntitlementError(
 		return false;
 	}
 
-	// Recommend the next tier up from the org's current plan (free → Starter,
+	// Recommend the next tier up from the project's current plan (free → Starter,
 	// shared → Pro Small, …). Only when that target isn't an upgradeable plan do
 	// we fall back to a plan whose grants cover the failed entitlement key.
 	const failedKey = extractEntitlementKeyFromError(err);
@@ -2513,8 +2516,8 @@ async function clearDeployEntitlementGate(
 	log("");
 	log(colors.warn(message));
 
-	// Free DB/storage slots are 1-per-org and granted only by the free plan, so
-	// "buy an addon" is a dead end. Name what's holding the slot first.
+	// Free DB/storage slots are 1-per-project and granted only by the free plan,
+	// so "buy an addon" is a dead end. Name what's holding the slot first.
 	const failedKey =
 		extractEntitlementKeyFromError(err) ??
 		inferAppSlotKey(err, await getCurrentPlanKeySafely(client));
@@ -2636,9 +2639,14 @@ const RESOURCE_TIER_LABEL: Record<ResourcePlan, string> = {
 	PRO: "Pro",
 };
 
-// Pull the connected org's per-tier availability for databases or storage.
-// `postgres.getEntitlements` covers both Postgres and MySQL (they share the
-// db.* keys). Best-effort: a failed lookup yields [] and the caller falls back.
+// Pull the connected account's per-tier availability for databases or
+// storage. `postgres.getEntitlements` covers both Postgres and MySQL (they
+// share the db.* keys) and resolves the ACTIVE PROJECT's entitlements
+// (falling back to the org rollup only when no project is active);
+// `storage.getEntitlements` is still resolved at the org level server-side
+// (pending the same per-project migration), so for storage this reflects the
+// whole org rather than just the current project. Best-effort: a failed
+// lookup yields [] and the caller falls back.
 export async function loadResourceTiers(
 	client: any,
 	kind: ResourceKind,
@@ -2666,18 +2674,20 @@ export async function loadResourceTiers(
 }
 
 /**
- * The tier a new resource should default to, derived from the connected org's
- * actual entitlements — so a paid org never silently lands on FREE, and the
- * server is never asked for a tier the org doesn't own (which is what produced
- * `db.starter.slots: 1/0` for an org that actually holds a db.standard slot).
+ * The tier a new resource should default to, derived from the account's
+ * actual entitlements (see {@link loadResourceTiers} for the per-kind
+ * project-vs-org caveat) — so a paid account never silently lands on FREE,
+ * and the server is never asked for a tier it doesn't own (which is what
+ * produced `db.starter.slots: 1/0` for an account that actually holds a
+ * db.standard slot).
  *
- *  1. Cheapest tier with an OPEN slot right now (a paid org's FREE tier has a 0
- *     limit, so it's never creatable and is skipped automatically).
- *  2. No open slot → the most capable tier the org actually OWNS (limit > 0), so
- *     the server gate + entitlement-remedy reflect the org's real plan instead
- *     of a tier it doesn't have.
- *  3. No entitlement at all (e.g. a paid org with no db/storage addon) → the
- *     entry paid tier, so the gate offers the cheapest addon to purchase.
+ *  1. Cheapest tier with an OPEN slot right now (a paid account's FREE tier
+ *     has a 0 limit, so it's never creatable and is skipped automatically).
+ *  2. No open slot → the most capable tier the account actually OWNS
+ *     (limit > 0), so the server gate + entitlement-remedy reflect its real
+ *     plan instead of a tier it doesn't have.
+ *  3. No entitlement at all (e.g. a paid account with no db/storage addon) →
+ *     the entry paid tier, so the gate offers the cheapest addon to purchase.
  */
 export function pickDefaultResourceTier(tiers: ResourceTier[]): ResourcePlan {
 	const creatable = tiers
@@ -2706,13 +2716,13 @@ async function resolveResourcePlan(
 	const def = pickDefaultResourceTier(tiers);
 
 	// Non-interactive (JSON, no TTY, or --yes): auto-pick the plan-aware default
-	// instead of hardcoding FREE. This is what keeps paid orgs off the free tier.
+	// instead of hardcoding FREE. This is what keeps paid projects off the free tier.
 	if (isJsonMode() || isNonInteractiveMode() || shouldSkipConfirmation()) {
 		return def;
 	}
 
 	// Interactive: list the tiers (default first / recommended) with price and
-	// the org's real availability so the choice reflects the account's plan.
+	// the project's real availability so the choice reflects its plan.
 	const byTier = new Map(tiers.map((t) => [t.tier, t]));
 	const order: ResourcePlan[] = [
 		def,
@@ -2758,7 +2768,7 @@ export type DbPlanResolution =
 	| { ok: true; plan: ResourcePlan }
 	| { ok: false; result: BillingChangeResult }
 	/**
-	 * The org needs a paid managed-db add-on but we're in an agent context
+	 * The project needs a paid managed-db add-on but we're in an agent context
 	 * (JSON / non-interactive / --yes) where a checkout must not fire without
 	 * explicit consent. The caller surfaces this as NEEDS_UPGRADE instead of
 	 * silently charging.
@@ -2766,20 +2776,21 @@ export type DbPlanResolution =
 	| { ok: false; needsConsent: true; addonKey: string; tier: ResourcePlan };
 
 /**
- * Decide the tier for a NEW database, defaulting to the org's subscribed tier
- * and AUTO-BUYING the plan-matched managed db add-on when the org has no open
- * slot (Starter→`db.standard`, Pro→`db.pro`). Decision-only and unit-testable:
- * never calls `process.exit`; returns `{ok:false, result}` when an auto-buy
- * checkout didn't complete so the caller can surface it.
+ * Decide the tier for a NEW database, defaulting to the project's subscribed
+ * tier and AUTO-BUYING the plan-matched managed db add-on when the project
+ * has no open slot (Starter→`db.standard`, Pro→`db.pro`). Decision-only and
+ * unit-testable: never calls `process.exit`; returns `{ok:false, result}`
+ * when an auto-buy checkout didn't complete so the caller can surface it.
  *
  * Resolution order:
- *  1. An explicit tier wins — except explicit `FREE` on a paid org (the server
- *     rejects it), which is dropped so we resolve the org's real tier.
+ *  1. An explicit tier wins — except explicit `FREE` on a paid project (the
+ *     server rejects it), which is dropped so we resolve the project's real
+ *     tier.
  *  2. Any creatable/owned slot is used as-is via {@link pickDefaultResourceTier}
- *     — this is what makes a Dedicated org use its BUNDLED `db.standard` slots
- *     (→ STANDARD) with NO purchase, and keeps a free org on FREE.
- *  3. A paid org with NO creatable slot buys the plan-matched add-on (Shared→
- *     `db.standard`), then creates on the granted tier.
+ *     — this is what makes a Dedicated project use its BUNDLED `db.standard`
+ *     slots (→ STANDARD) with NO purchase, and keeps a free project on FREE.
+ *  3. A paid project with NO creatable slot buys the plan-matched add-on
+ *     (Shared→`db.standard`), then creates on the granted tier.
  */
 export async function ensureDatabasePlan(
 	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
@@ -2788,27 +2799,27 @@ export async function ensureDatabasePlan(
 ): Promise<DbPlanResolution> {
 	const currentPlanKey = await getCurrentPlanKeySafely(client);
 	const addonKey = dbAddonKeyForPlanFamily(currentPlanKey);
-	const orgIsPaid = addonKey !== null;
+	const projectIsPaid = addonKey !== null;
 
-	// Explicit tier wins, except explicit FREE on a paid org → drop and resolve.
-	if (requested && !(requested === "FREE" && orgIsPaid)) {
+	// Explicit tier wins, except explicit FREE on a paid project → drop and resolve.
+	if (requested && !(requested === "FREE" && projectIsPaid)) {
 		return { ok: true, plan: requested };
 	}
 
 	const tiers = await loadResourceTiers(client, "database");
 	const hasCreatable = tiers.some((t) => t.canCreate);
-	if (hasCreatable || !orgIsPaid) {
+	if (hasCreatable || !projectIsPaid) {
 		// Creatable/owned slot (incl. Dedicated's bundled db.standard) or a free
-		// org → existing tier picker default; no purchase.
+		// project → existing tier picker default; no purchase.
 		return { ok: true, plan: pickDefaultResourceTier(tiers) };
 	}
 
-	// Paid org with no open DB slot → buy the plan-matched managed db add-on.
+	// Paid project with no open DB slot → buy the plan-matched managed db add-on.
 	const tier = dbTierForAddonKey(addonKey as string);
 
 	// Agent context (JSON / non-interactive / --yes): a paid checkout is the
 	// user's consent surface, so we must NOT auto-fire one here — that silently
-	// bills the org a second time (e.g. right after they paid for the plan).
+	// bills the project a second time (e.g. right after they paid for the plan).
 	// Hand off so the caller emits NEEDS_UPGRADE and the user approves first,
 	// mirroring `clearDeployEntitlementGate` and the storage gate. Interactive
 	// sessions fall through to the inline auto-buy + browser hand-off below.
@@ -2848,7 +2859,7 @@ export async function ensureDatabasePlan(
  * {@link ensureDatabasePlan} + surface-and-exit glue for the create call sites:
  * on an incomplete auto-buy it emits the billing result and exits with the
  * matching code (resumable for a pending checkout, error for a hard failure) so
- * we never create a database the org couldn't pay for.
+ * we never create a database the project couldn't pay for.
  */
 export async function resolveDatabasePlanOrExit(
 	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
@@ -2865,7 +2876,7 @@ export async function resolveDatabasePlanOrExit(
 }
 
 /**
- * Agent-mode hand-off when a managed database needs a paid add-on the org
+ * Agent-mode hand-off when a managed database needs a paid add-on the project
  * doesn't yet own. Emits the same NEEDS_UPGRADE envelope shape as
  * {@link emitNeedsUpgrade} (buy the add-on, or upgrade the plan) so the agent
  * presents the choice to the user instead of charging on its own.
@@ -4037,7 +4048,10 @@ export function registerDeployCommands(program: Command) {
 		.argument("[app]", "Application ID or name")
 		.description("Deploy an application")
 		.option("--api-url <url>", "Custom API URL", "https://tarout.sa")
-		.option("--plan <plan>", "App hosting plan: free, shared, or dedicated")
+		.option(
+			"--plan <plan>",
+			"App hosting plan: free, shared, or dedicated (defaults to this project's tier)",
+		)
 		.option(
 			"--source <source>",
 			"Deployment source: auto, upload, configured, or connect",
@@ -4045,13 +4059,13 @@ export function registerDeployCommands(program: Command) {
 		.option("--database <type>", "Provision a database: none, postgres, or mysql")
 		.option(
 			"--database-plan <plan>",
-			"Database plan: free, starter, standard, or pro",
+			"Database plan: free, starter, standard, or pro (defaults to this project's entitled tier)",
 		)
 		.option("--skip-database", "Deploy without provisioning a database")
 		.option("--storage", "Provision file storage and attach it to the app")
 		.option(
 			"--storage-plan <plan>",
-			"Storage plan: free, starter, standard, or pro",
+			"Storage plan: free, starter, standard, or pro (defaults to this project's entitled tier)",
 		)
 		.option("--skip-storage", "Deploy without provisioning file storage")
 		.option(

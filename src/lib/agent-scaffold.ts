@@ -46,7 +46,6 @@ export const TAROUT_ALLOW_ENTRY = "Bash(tarout:*)";
 export const TAROUT_ASK_ENTRIES: readonly string[] = [
 	"Bash(tarout undeploy*)",
 	"Bash(tarout billing*)",
-	"Bash(tarout subscription*)",
 	"Bash(tarout wallet*)",
 ];
 
@@ -94,8 +93,8 @@ don't hand-edit infrastructure.
 
 Run Tarout commands with \`--json\` for machine-readable output, and run them
 **directly** in your shell (don't wrap them in pipes or redirects like \`2>&1\`, so
-approval rules match the command). New apps and databases automatically use your
-org's **subscribed tier** — don't pass \`--plan free\` / \`--database-plan free\`.
+approval rules match the command). New apps and databases automatically use this
+**project's subscribed tier** — don't pass \`--plan free\` / \`--database-plan free\`.
 
 **Auth is hands-free — run it yourself.** If a command reports you're not logged in
 (\`AUTH_ERROR\` / exit 3), run \`tarout login\` **directly**. It opens a browser on the

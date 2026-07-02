@@ -12,7 +12,7 @@ import {
 	paymentBrowserOpener,
 	shouldAutoConfirmPaidCheckout,
 } from "../lib/browser.js";
-import { isLoggedIn } from "../lib/config.js";
+import { getCurrentProfile, isLoggedIn } from "../lib/config.js";
 import { AuthError, handleError } from "../lib/errors.js";
 import {
 	buildPlanAddonCart,
@@ -123,6 +123,12 @@ export function registerBillingCommands(program: Command) {
 
 				log("");
 				log(colors.bold("Current Subscription"));
+				// Subscriptions are per-project — name the project this plan belongs
+				// to so a multi-project user knows which one they're looking at.
+				const profile = getCurrentProfile();
+				if (profile?.projectName) {
+					log(`  ${colors.dim(`Project: ${profile.projectName}`)}`);
+				}
 				log("");
 
 				if (!subscription || !subscription.planKey) {

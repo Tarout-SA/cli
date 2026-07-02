@@ -51,7 +51,7 @@ function normalizeDbPlan(value: string | undefined): ResourcePlan | undefined {
 	);
 }
 
-// An explicit --plan wins; otherwise default to the org's subscribed tier and
+// An explicit --plan wins; otherwise default to the project's subscribed tier and
 // auto-buy the plan-matched managed db add-on when there's no open slot (the
 // shared resolver handles Free/Starter/Pro + the Dedicated bundled-slot case).
 async function resolveDbPlan(
@@ -159,7 +159,7 @@ export function registerDbCommands(program: Command) {
 		.option("-t, --type <type>", "Database type (postgres, mysql)", "postgres")
 		.option(
 			"-p, --plan <plan>",
-			"Database plan: free, starter, standard, or pro (defaults to your org's entitled tier)",
+			"Database plan: free, starter, standard, or pro (defaults to this project's entitled tier)",
 		)
 		.option("-d, --description <description>", "Database description")
 		.option("--name <name>", "Database name (alternative to positional argument)")

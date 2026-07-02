@@ -438,31 +438,39 @@ export function registerOrgsCommands(program: Command) {
 			}
 		});
 
-	// Get organization subscription
+	// Get organization-level billing status. NOTE: subscription PLANS are
+	// per-project (see `tarout billing status`); this only reports the org-wide
+	// billing opt-in / trial state (`organization.getSubscription` returns just
+	// `{ status, trialEndsAt }` — no plan).
 	orgs
 		.command("subscription")
-		.description("Show subscription details for the current organization")
+		.description(
+			"Show org-level billing status (trial/opt-in). For your plan, use `tarout billing status`.",
+		)
 		.action(async () => {
 			try {
 				if (!isLoggedIn()) throw new AuthError();
 				const client = getApiClient();
-				const _spinner = startSpinner("Fetching subscription...");
+				const _spinner = startSpinner("Fetching billing status...");
 				const sub = await client.organization.getSubscription.query();
 				succeedSpinner();
 				if (isJsonMode()) {
 					outputData(sub);
 					return;
 				}
-				const s = sub as any;
+				const s = sub as { status?: string; trialEndsAt?: string | null };
 				log("");
-				log(colors.bold("Organization Subscription"));
-				log(
-					`  Plan:   ${s?.planKey ? colors.cyan(s.planKey) : colors.dim("free")}`,
-				);
-				log(`  Status: ${s?.status || colors.dim("active")}`);
-				if (s?.currentPeriodEnd) {
-					log(`  Renews: ${new Date(s.currentPeriodEnd).toLocaleDateString()}`);
+				log(colors.bold("Organization Billing Status"));
+				log(`  Status: ${s?.status ? colors.cyan(s.status) : colors.dim("none")}`);
+				if (s?.trialEndsAt) {
+					log(`  Trial ends: ${new Date(s.trialEndsAt).toLocaleDateString()}`);
 				}
+				log("");
+				log(
+					colors.dim(
+						"Plans are per-project — see your plan with: tarout billing status",
+					),
+				);
 				log("");
 			} catch (err) {
 				handleError(err);

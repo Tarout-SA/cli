@@ -52,10 +52,10 @@ describe("nextPlanForRequested", () => {
 });
 
 describe("nextPlanForCurrent", () => {
-	it("climbs the ladder from the org's CURRENT plan (free→shared→dedicated)", () => {
+	it("climbs the ladder from the project's CURRENT plan (free→shared→dedicated)", () => {
 		expect(nextPlanForCurrent(undefined)).toBe("shared");
 		expect(nextPlanForCurrent("free")).toBe("shared");
-		// The key fix: a shared org upgrading goes to dedicated, not stays shared.
+		// The key fix: a shared project upgrading goes to dedicated, not stays shared.
 		expect(nextPlanForCurrent("shared")).toBe("dedicated_small");
 		expect(nextPlanForCurrent("bundle_starter")).toBe("dedicated_small");
 		expect(nextPlanForCurrent("dedicated_small")).toBe("dedicated_medium");
@@ -128,7 +128,7 @@ describe("resolveEntitlementRemedy", () => {
 		expect(r.targetKey).toBe("shared");
 		expect(r.command).toContain("billing upgrade shared");
 		expect(r.command).not.toContain("addon:buy");
-		expect(r.hint).toMatch(/single database for the whole org/i);
+		expect(r.hint).toMatch(/single database for this project/i);
 	});
 
 	it("storage.free.slots → plan upgrade, never a (non-existent) free-storage addon", () => {
@@ -136,7 +136,7 @@ describe("resolveEntitlementRemedy", () => {
 		expect(r.kind).toBe("plan");
 		expect(r.targetKey).toBe("shared");
 		expect(r.command).not.toContain("addon:buy");
-		expect(r.hint).toMatch(/single storage bucket for the whole org/i);
+		expect(r.hint).toMatch(/single storage bucket for this project/i);
 	});
 
 	it("falls back to a plan upgrade when no failed key (e.g. no active subscription)", () => {
@@ -153,8 +153,8 @@ describe("resolveEntitlementRemedy", () => {
 		expect(r.targetKey).toBe("db.standard");
 	});
 
-	it("plan-upgrade gate on a SHARED org → dedicated (not back to shared)", () => {
-		// db.free.slots normally upgrades free→shared; on a shared org the ladder
+	it("plan-upgrade gate on a SHARED plan → dedicated (not back to shared)", () => {
+		// db.free.slots normally upgrades free→shared; on a shared plan the ladder
 		// must climb to dedicated instead.
 		const r = resolveEntitlementRemedy("db.free.slots", catalog, {
 			currentPlanKey: "shared",
@@ -163,7 +163,7 @@ describe("resolveEntitlementRemedy", () => {
 		expect(r.targetKey).toBe("dedicated_small");
 	});
 
-	it("dedicated host gate escalates from the org's current dedicated tier", () => {
+	it("dedicated host gate escalates from the project's current dedicated tier", () => {
 		const r = resolveEntitlementRemedy("app.dedicated.slots", catalog, {
 			currentPlanKey: "dedicated_small",
 		});
@@ -171,7 +171,7 @@ describe("resolveEntitlementRemedy", () => {
 		expect(r.targetKey).toBe("dedicated_medium");
 	});
 
-	it("free org's app.free.slots still upgrades to shared", () => {
+	it("a free project's app.free.slots still upgrades to shared", () => {
 		const r = resolveEntitlementRemedy("app.free.slots", catalog, {
 			currentPlanKey: "free",
 		});

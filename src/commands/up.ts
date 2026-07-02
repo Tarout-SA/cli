@@ -127,7 +127,7 @@ export function registerUpCommand(program: Command): void {
 		.option("--name <name>", "Application name (defaults to directory name)")
 		.option(
 			"--plan <plan>",
-			"App hosting plan: free, shared, or dedicated (defaults to your org's tier)",
+			"App hosting plan: free, shared, or dedicated (defaults to this project's tier)",
 		)
 		.option("--source <source>", "Source: upload (default) or github", "upload")
 		.option(
