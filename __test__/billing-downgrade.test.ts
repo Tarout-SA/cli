@@ -1,5 +1,9 @@
+import { Command } from "commander";
 import { describe, expect, it } from "vitest";
-import { classifyPlanDirection } from "../src/commands/billing";
+import {
+	classifyPlanDirection,
+	registerBillingCommands,
+} from "../src/commands/billing";
 
 const PLANS = [
 	{ planKey: "free", sortOrder: 0, priceHalalas: 0 },
@@ -24,9 +28,6 @@ describe("classifyPlanDirection", () => {
 		expect(() => classifyPlanDirection(PLANS, "shared", "bogus")).toThrow(/Unknown plan/);
 	});
 });
-
-import { Command } from "commander";
-import { registerBillingCommands } from "../src/commands/billing";
 
 describe("billing downgrade command registration", () => {
 	it("registers downgrade with --plan and --billing-period", () => {

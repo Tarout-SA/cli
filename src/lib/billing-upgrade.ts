@@ -350,7 +350,7 @@ export function emitBillingResult(
 	switch (result.status) {
 		case "applied":
 			outputData({ ...envelope, hint: "Applied immediately. Retry your last action." });
-			box("Plan changed", [
+			box(result.kind === "database" ? "Database tier changed" : "Plan changed", [
 				`${label}: ${colors.success("applied immediately")}`,
 				amount ? `Charged: ${amount}` : "",
 			].filter(Boolean));

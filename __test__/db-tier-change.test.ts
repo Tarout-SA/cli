@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { Command } from "commander";
 import {
 	assertPostgresTierChange,
+	registerDbCommands,
 	resolveDbTierTarget,
 	runDatabaseTierChange,
 } from "../src/commands/db";
-import { Command } from "commander";
-import { registerDbCommands } from "../src/commands/db";
 
 function dbSubcommand(name: string) {
 	const program = new Command();
