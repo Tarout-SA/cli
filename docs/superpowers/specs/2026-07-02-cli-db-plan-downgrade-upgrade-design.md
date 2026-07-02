@@ -101,8 +101,10 @@ Rejected alternative: bespoke per-command flows. That duplication is exactly the
   `assertPostgresTierChange(db)`.
 - Resolve `targetPlan`: from `--plan` or interactive/agent `input()` (`NEEDS_INPUT`).
   Normalize to uppercase; validate ∈ `{STARTER, STANDARD, PRO}`.
-- (Optional, recommended) `previewDatabaseUpgrade` to show the prorated charge, then
-  confirm (skipped by `--yes`/non-interactive).
+- **Interactive mode only** (not `--json`, not `--yes`/non-interactive): call
+  `previewDatabaseUpgrade` to show the prorated charge, then confirm. Agent/JSON/`--yes`
+  callers skip the preview and go straight to the mutation (fewer round-trips,
+  deterministic); server errors still surface normally.
 - Mutate `subscription.purchaseDatabaseUpgrade.mutate({ postgresId, targetPlan })`.
 - `finalizeBillingMutation(client, result, { kind: "database", target: targetPlan, wait,
   timeoutMs, openBrowser, onCheckoutOpened })` → `emitBillingResult`.
@@ -116,9 +118,11 @@ Rejected alternative: bespoke per-command flows. That duplication is exactly the
 - Same resolution + Postgres-only guard.
 - Resolve `targetPlan`; validate ∈ `{STARTER, STANDARD}` (reject `PRO` with a hint that
   PRO is the top tier / use `db upgrade`).
-- Call `previewDatabaseDowngrade` first: confirms "applies immediately, free" and lets
-  guard violations (storage doesn't fit, too many linked apps, would raise the bill)
-  surface *before* mutating. Then confirm (it sheds resources; skipped by `--yes`).
+- **Interactive mode only**: call `previewDatabaseDowngrade` to confirm "applies
+  immediately, free" and let guard violations (storage doesn't fit, too many linked
+  apps, would raise the bill) surface *before* mutating; then confirm (it sheds
+  resources). Agent/JSON/`--yes` callers go straight to the mutation — the same guards
+  are enforced server-side and surface via `handleError`.
 - Mutate `subscription.purchaseDatabaseDowngrade.mutate({ postgresId, targetPlan })` →
   `{applied:true}` → `finalizeBillingMutation` (`kind: "database"`) → `emitBillingResult`
   → "applied immediately".
@@ -128,8 +132,8 @@ Rejected alternative: bespoke per-command flows. That duplication is exactly the
 
 - Fetch current subscription status + `subscription.getCatalog` to determine the current
   plan and compare `sortOrder`.
-- Resolve target `planKey` (positional or `--plan`; interactive picker may list only
-  lower plans). Validate **strictly lower**:
+- Resolve target `planKey` (positional or `--plan`; the interactive picker lists only
+  plans strictly lower than the current one). Validate **strictly lower**:
   - equal → "Already on <plan>." (no-op, exit 0)
   - higher → error pointing to `tarout billing upgrade <plan>`.
 - Reuse `performBillingChange({ kind: "plan", planKey, billingPeriod?, wait, timeoutMs,
@@ -141,8 +145,9 @@ Rejected alternative: bespoke per-command flows. That duplication is exactly the
   `billing cancel` stays as-is (distinct `cancelAtPeriodEnd` semantics).
 - Server guard (can't shrink shared plan below current shared-app count) surfaces via
   `handleError`.
-- Flags mirror `billing upgrade` where relevant: `--plan`, `--billing-period`,
-  `--wait/--no-wait`, `--timeout`, `--no-open`, `--json`, `--yes`.
+- Flags: `--plan`, `--billing-period`, `--json`, `--yes`. Downgrades apply at period end
+  with no checkout, so `--wait/--timeout/--no-open` are accepted for symmetry with
+  `billing upgrade` but are no-ops on the deferred path.
 
 ## Error handling summary
 
