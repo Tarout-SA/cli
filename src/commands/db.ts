@@ -17,6 +17,10 @@ import {
 	NotFoundError,
 } from "../lib/errors.js";
 import {
+	type BillingChangeResult,
+	finalizeBillingMutation,
+} from "../lib/billing-upgrade.js";
+import {
 	box,
 	colors,
 	getStatusBadge,
@@ -49,6 +53,76 @@ function normalizeDbPlan(value: string | undefined): ResourcePlan | undefined {
 		`Invalid database plan "${value}". Use free, starter, standard, or pro.`,
 		ExitCode.INVALID_ARGUMENTS,
 	);
+}
+
+export function assertPostgresTierChange(dbSummary: {
+	type: DatabaseType;
+	name: string;
+}): void {
+	if (dbSummary.type !== "postgres") {
+		throw new CliError(
+			`Tier changes are available for PostgreSQL databases only. "${dbSummary.name}" is a ${dbSummary.type} database; MySQL tier changes aren't supported yet.`,
+			ExitCode.INVALID_ARGUMENTS,
+		);
+	}
+}
+
+export function resolveDbTierTarget(
+	direction: "upgrade" | "downgrade",
+	raw: string | undefined,
+): "STARTER" | "STANDARD" | "PRO" {
+	const plan = normalizeDbPlan(raw);
+	if (!plan) {
+		throw new CliError("A target tier is required (--plan).", ExitCode.INVALID_ARGUMENTS);
+	}
+	if (plan === "FREE") {
+		throw new CliError(
+			"FREE is not a paid tier. To stop billing for a database, delete it instead.",
+			ExitCode.INVALID_ARGUMENTS,
+		);
+	}
+	if (direction === "downgrade" && plan === "PRO") {
+		throw new CliError(
+			"PRO is the highest tier — use `tarout db upgrade` to move up.",
+			ExitCode.INVALID_ARGUMENTS,
+		);
+	}
+	return plan as "STARTER" | "STANDARD" | "PRO";
+}
+
+export interface DatabaseTierChangeInput {
+	direction: "upgrade" | "downgrade";
+	postgresId: string;
+	targetPlan: "STARTER" | "STANDARD" | "PRO";
+	wait?: boolean;
+	timeoutMs?: number;
+	openBrowser?: (url: string) => Promise<void>;
+	onCheckoutOpened?: (info: { orderId: string; paymentUrl: string }) => void;
+}
+
+export async function runDatabaseTierChange(
+	// biome-ignore lint/suspicious/noExplicitAny: untyped tRPC proxy client.
+	client: any,
+	input: DatabaseTierChangeInput,
+): Promise<BillingChangeResult> {
+	const result =
+		input.direction === "upgrade"
+			? await client.subscription.purchaseDatabaseUpgrade.mutate({
+					postgresId: input.postgresId,
+					targetPlan: input.targetPlan,
+				})
+			: await client.subscription.purchaseDatabaseDowngrade.mutate({
+					postgresId: input.postgresId,
+					targetPlan: input.targetPlan,
+				});
+	return finalizeBillingMutation(client, result, {
+		kind: "database",
+		target: input.targetPlan,
+		wait: input.wait,
+		timeoutMs: input.timeoutMs,
+		openBrowser: input.openBrowser,
+		onCheckoutOpened: input.onCheckoutOpened,
+	});
 }
 
 // An explicit --plan wins; otherwise default to the project's subscribed tier and
